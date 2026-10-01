@@ -40,6 +40,13 @@ if (vendorOverrideReport.harnessSourceCommit !== expectedCommit
 const packageSourceCommits = new Map((vendorOverrideReport.overrides ?? []).map((item) => [item.package, item.sourceCommit]))
 const wanted = new Map(Object.entries(overlay.packages).filter(([name]) => name.startsWith('@deepseek-ai/')))
 wanted.set(overlay.rootPackage.name, overlay.rootPackage.version)
+// 断言口径是「overlay 是否钉了这个包」，不是「本次导出是否打包了它」。两者必须分开：
+// 生产侧 prepare-harness-vendor-overrides.py 解析每个受审包的 pin 时取 `packages`
+// **或** `vendorTop`，而 @deepseek-ai/cosmokit 合法地只出现在 vendorTop（1.8.5）——
+// 旧口径只查 packages，于是 0.2.0-rc.2 首次把 cosmokit 纳入审计即在此判红，而这条链
+// 自那以后没人跑过。只有 `wanted`（packages + rootPackage）会被打包；vendorTop 成员由
+// 运行时树自己的 vendor 路径装机，从不经本缓存。
+const overlayPins = new Set([...wanted.keys(), ...Object.keys(overlay.vendorTop ?? {})])
 
 const manifests = new Map()
 function walk(dir) {
@@ -57,7 +64,7 @@ function walk(dir) {
 walk(repo)
 
 for (const [name, sourceCommit] of packageSourceCommits) {
-  if (!wanted.has(name)) throw new Error(`source override is not present in the engine overlay: ${name}`)
+  if (!overlayPins.has(name)) throw new Error(`source override is not present in the engine overlay: ${name}`)
   if (!sourceCommit || !/^[0-9a-f]{40}$/.test(sourceCommit)) throw new Error(`invalid source commit for ${name}`)
 }
 
