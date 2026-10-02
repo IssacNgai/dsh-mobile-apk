@@ -202,7 +202,8 @@ class RootGrantTest {
     assertBefore(repair, "RootExecutionFence.maintenance", "readyService(context, applyGate = false)")
     assertBefore(repair, "configureIfNeeded(context)", "remote.repairOwnership(path, maxEntries)")
     val direct = body("ShizukuTransport.kt", "internal fun autoHealOwnershipDirect(")
-    assertTrue(direct.contains("= RootExecutionFence.maintenance"))
+    // 2026-10-01：探测与残留租约清算移到 fence 之前（fence 入口会被残留租约挡住）；修复派发本体仍在 fence 内。
+    assertTrue(direct.contains("return RootExecutionFence.maintenance(context) {"))
     assertTrue(direct.contains("""java.io.File(app.applicationInfo.dataDir, "files")"""))
   }
 

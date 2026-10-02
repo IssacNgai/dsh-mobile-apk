@@ -18,6 +18,8 @@
 
 su helper 必须有完整 JSON 信封（布尔 ok、非负整数 checked/healed/failures/unverifiedMutations、remaining 为 -1/0、布尔 truncated/deadlineExceeded）及已确认 exit0/2，且 transport 完整、未截断。已确认的失败/部分修复信封可以 finish 租约，但仍返回 repair-incomplete/ok=false；“工作已结算”不等于“修复成功”。信封缺失/畸形不 finish。完整成功还须 exit0、failures=unverifiedMutations=remaining=0、无 cap/deadline 截断。
 
+2026-10-01 结算对齐落地（无 root/已撤 root 设备卡「等待属主维护」事故）：Shizuku 修复面以**信封完整性**决定结算——完整 ⇒ finish 并如实回 repair-incomplete/ok=false，缺失/畸形才停 UNKNOWN（此前 `definitive=verified` 未实现本节承诺）。`su-exec-failed`（进程拉不起来，从未派发、零副作用）同样 finish，且 granted 缓存立即降级 denied——缓存不得比 su 本体活得久。残留租约新增唯一非 owner 出口 `RootMaintenanceLease.clearWithoutRootPath`：仅当**所有**真实 root 通道（su 授权、root Shizuku）都不存在时由启动自愈在进入 RootExecutionFence **之前**调用（fence 入口会被残留租约挡住）——隔离没有可串行化的特权对象，留着只会把启动挂到整机重启。
+
 ## 3. 所有权边界与限制
 
 OwnershipRepairCore 在访问前预留预算：上限 200000 entries、64 层、120000ms，默认维护 20000ms；cap/deadline 是变更前约束而非事后统计。Android adapter 用 O_PATH/O_NOFOLLOW pin 元数据，只对普通文件/目录 reopen 已持有 inode；后代经 held directory FD 与校验 basename 访问。fstat 对照身份后 fchown，再 fstat 验证；checked/healed/failures/unverifiedMutations 分别报告，应用 UID 祖先也继续深遍历。
