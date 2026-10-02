@@ -138,7 +138,7 @@ class OwnershipLeaseSettlementFixtureTest {
 
   @Test fun theSingleJudgeUsesARealBindAndNeverUidReadability() {
     val probe = body("ShizukuTransport", "internal fun probeRootChannel(")
-    assertTrue(probe.contains("readyService(app, applyGate = false)"))
+    assertTrue(probe.contains("readyService(app, applyGate = false, requestPermission = false)"))
     assertTrue(probe.contains("remote.uid()"))
     assertTrue(probe.contains("decideNoRootChannel("))
     // review 的核心：撤权后 getUid() 仍返回 0，不能再用它当「已授权」的依据

@@ -164,7 +164,7 @@ class RootGrantTest {
   @Test
   fun allShizukuCommandSurfacesAreFencedAndGatedBeforeDispatch() {
     val ready = body("ShizukuTransport.kt", "private fun readyService(")
-    assertBefore(ready, "if (applyGate) rootGateRefusal(context)", "ensureBound(context)")
+    assertBefore(ready, "if (applyGate) rootGateRefusal(context)", "ensureBound(context, requestPermission)")
     assertBefore(ready, "if (pv < ShizukuUserServiceBridge.PROTOCOL_VERSION)", "configureIfNeeded(context)")
     assertBefore(ready, "configureIfNeeded(context)", "if (applyGate) actualIdentityRefusal(context, remote)")
     assertBefore(ready, "actualIdentityRefusal(context, remote)", "return remote to null")
