@@ -77,5 +77,19 @@ class OwnershipLeaseSettlementFixtureTest {
       .doesNotContain("clearWithoutRootPath"))
   }
 
+  @Test fun staleLeaseIsClearedAtTheJobEntryBeforeTheOutstandingShortCircuit() {
+    // 真机实测（2026-10-02）：只把清算放在 worker 里够不到 start() 的 outstanding 短路，
+    // 启动仍会挂死；清算必须发生在咨询租约之前。
+    val jobs = body("RootOwnershipJobs", "private fun start(")
+    val clear = jobs.indexOf("ShizukuTransport.clearLeaseWhenNoRootChannel(app)")
+    val shortCircuit = jobs.indexOf("RootMaintenanceLease.outstanding(app)")
+    assertTrue(clear >= 0 && shortCircuit > clear)
+    val helper = body("ShizukuTransport", "internal fun clearLeaseWhenNoRootChannel(")
+    assertTrue(helper.contains("uid == RootGrant.ROOT_UID || RootAccess.isGranted(app)"))
+    assertTrue(helper.contains("RootMaintenanceLease.clearWithoutRootPath(app)"))
+    // 有 root 路时不得清（隔离语义保持）。
+    assertTrue(helper.contains("return false"))
+  }
+
   private fun String.doesNotContain(other: String): Boolean = !this.contains(other)
 }

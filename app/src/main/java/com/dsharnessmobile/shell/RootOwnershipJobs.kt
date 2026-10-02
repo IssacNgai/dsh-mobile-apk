@@ -31,6 +31,9 @@ internal object RootOwnershipJobs {
 
   private fun start(context: Context, reuseRecent: Boolean = false): Boolean {
     val app = context.applicationContext
+    // 咨询租约**之前**先做入口级清算：root 路已消失时残留租约只会把启动挂死（真机实测），
+    // 而下面 synchronized 里的 outstanding 短路会绕过 worker 内的任何清算。
+    ShizukuTransport.clearLeaseWhenNoRootChannel(app)
     val done: CountDownLatch
     synchronized(lock) {
       if (running) return false

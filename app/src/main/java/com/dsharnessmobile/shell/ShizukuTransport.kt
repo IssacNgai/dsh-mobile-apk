@@ -420,6 +420,21 @@ object ShizukuTransport {
   /** Bounded deep walk reaches polluted startup leaves even when their ancestors are app-owned. */
   fun autoHealOwnership(context: Context): JSONObject = RootOwnershipJobs.runBlocking(context)
 
+  /**
+   * 残留租约的**入口级**清算：只有「真实 root 通道仍存在」时隔离才有意义。root 路已消失
+   * （无 su 授权、Shizuku 非 root）却还留着租约，就会让 [RootOwnershipJobs.start] 的
+   * outstanding 短路把每次启动挂成「等待属主维护」——真机实测（2026-10-02）：注入同 boot
+   * 残留租约 + 撤掉 root 路后，5 分钟没有任何 boot-start 记录、引擎起不来。清算放在 worker
+   * 里够不到这条路径，所以必须在咨询租约之前先跑。
+   * @returns 是否真的清掉了一条残留租约。
+   */
+  internal fun clearLeaseWhenNoRootChannel(context: Context): Boolean {
+    val app = context.applicationContext
+    val uid = runCatching { Shizuku.getUid() }.getOrDefault(-1)
+    if (uid == RootGrant.ROOT_UID || RootAccess.isGranted(app)) return false
+    return RootMaintenanceLease.clearWithoutRootPath(app)
+  }
+
   /** Shared Activity/Service startup guard; coalesce near-simultaneous completed scans only. */
   fun prepareStartupOwnership(context: Context): JSONObject = RootOwnershipJobs.runBlocking(context, reuseRecent = true)
 
