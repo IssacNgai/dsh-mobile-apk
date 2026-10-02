@@ -60,9 +60,21 @@ for (const candidate of ['build/Release/pty.node', 'build/Debug/pty.node']) {
   }
 }
 mkdirSync(dirname(output), { recursive: true })
+// 复现性（跨构建根不可位的真因，2026-10-02 实测）：`assert()` 展开时会嵌入 `__FILE__`，
+// 即**编译器收到的绝对源路径**；`src/unix/pty.cc:219` 的 `assert(false)` 因此把构建根路径
+// 写进了 .rodata。构建根不同（CI `/home/runner/work/dsh-mobile-apk/dsh-mobile-apk` vs
+// 本机 `/home/zouhaoyu/dsh-mobile-apk`）⇒ 同一份源码产出不同字节。实测隔离：仅把源码放在
+// 路径长 21 字符的目录里重建，产物即大 16 字节、哈希不同——与 CI/本机那 16 字节差值同源。
+// `-ffile-prefix-map` 把 `__FILE__`（及调试信息）里的绝对前缀改写成固定虚拟路径，
+// 使产物与构建根解耦，且**不改任何语义**（assert 行为不变，只是它报的路径变成规范化值）。
+// 映射仓库根覆盖链上的 node-pty/headers（都在仓库内）；另映射 ptyRoot 以覆盖 --direct
+// 用仓库外路径构建的情形（如复现实验）。
+const repoRoot = resolve(import.meta.dirname, '..', '..')
 const compileArgs = [
   '--target=aarch64-linux-android26', '-fPIC', '-shared', '-std=c++17',
   '-O2', '-fvisibility=hidden', '-static-libstdc++',
+  `-ffile-prefix-map=${repoRoot}=/dsh-mobile-apk`,
+  `-ffile-prefix-map=${ptyRoot}=/node-pty`,
   `-I${headersRoot}`, `-I${apiRoot}`, source, '-o', output,
 ]
 function run(executable, runArgs) {
@@ -97,7 +109,7 @@ const report = {
   ndkSourcePropertiesSha256: hash(join(ndkRoot, 'source.properties')),
   compilerSha256: hash(clang),
   target: 'aarch64-linux-android26',
-  command: ['clang++', ...compileArgs.map((item) => item === source ? 'src/unix/pty.cc' : item === output ? 'prebuilds/android-arm64/pty.node' : item.startsWith('-I') ? '-I<authenticated-header-or-package>' : item)],
+  command: ['clang++', ...compileArgs.map((item) => item === source ? 'src/unix/pty.cc' : item === output ? 'prebuilds/android-arm64/pty.node' : item.startsWith('-I') ? '-I<authenticated-header-or-package>' : item.startsWith('-ffile-prefix-map=') ? '-ffile-prefix-map=<build-root-to-fixed-virtual-path>' : item)],
   inputs: {
     ptyCcSha256: hash(source),
     bindingGypSha256: hash(join(ptyRoot, 'binding.gyp')),
