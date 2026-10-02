@@ -80,7 +80,8 @@
 
 | 新模块 | 职责 / 关键入口 |
 |---|---|
-| [RootMaintenanceLease](<dsh-mobile-apk/app/src/main/java/com/dsharnessmobile/shell/RootMaintenanceLease.kt>) | begin/finish/markUnknown/outstanding/newBoot：真正UID0派发前耐久commit；同boot应用重启保留UNKNOWN，仅同epoch方案的真boot变化清除。 |
+| [RootMaintenanceLease](<dsh-mobile-apk/app/src/main/java/com/dsharnessmobile/shell/RootMaintenanceLease.kt>) | begin/finish/markUnknown/outstanding/newBoot：真正UID0派发前耐久commit；同boot应用重启保留UNKNOWN，仅同epoch方案的真boot变化清除；clearWhenNoRootChannel 带锁内 guard + commit 有界重试。 |
+| [LeaseClearProbe](<dsh-mobile-apk/app/src/main/java/com/dsharnessmobile/shell/LeaseClearProbe.kt>) | 残留租约「能不能清」的审计留痕（files/lease-clear-probe.log，有界 8 KiB）：记录三态判定与原始信号（ping/绑定结果/拒绝码/自检），只在存在残留租约时写、异常全吞。 |
 | [BrowserHostProfile](<dsh-mobile-apk/app/src/main/java/com/dsharnessmobile/shell/BrowserHostProfile.kt>) | attach 首操作设置并回读验证 per-session nonDefault profile，再装 cookie/worker策略；失败不回 Default；dispose/limited clear 只触自己profile。 |
 | [ForegroundPageRecoveryPolicy](<dsh-mobile-apk/app/src/main/java/com/dsharnessmobile/shell/ForegroundPageRecoveryPolicy.kt>) | 前台generation、一次load-error retry、后台合并恢复、一次renderer recreate；重复崩溃落native error，user reload可显式重试。 |
 | [SnapshotFingerprintPolicy](<dsh-mobile-apk/app/src/main/java/com/dsharnessmobile/shell/SnapshotFingerprintPolicy.kt>) | 严格64hex SHA及fresh判据；缺失/非法包 metadata 不触发抽取/事务/启动，也不走legacy/degraded旁路。 |

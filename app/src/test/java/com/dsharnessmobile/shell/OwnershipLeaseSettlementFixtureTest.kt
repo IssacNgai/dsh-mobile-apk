@@ -128,9 +128,49 @@ class OwnershipLeaseSettlementFixtureTest {
 
   @Test fun entryClearOnlyFiresOnDefiniteAbsenceAndIsGuardedByTheFence() {
     val entry = body("ShizukuTransport", "internal fun clearLeaseWhenNoRootChannel(")
-    assertTrue(entry.contains("probeRootChannel(app).state != RootChannel.ABSENT"))
-    assertTrue(entry.contains("return false"))
-    assertTrue(entry.contains("RootMaintenanceLease.clearWhenNoRootChannel(app) { !RootExecutionFence.maintenanceActive }"))
+    // 判据必须是**唯一那个决定性探测**（真绑定），不是 getUid 可读性那个替身
+    assertTrue(entry.contains("val probe = probeRootChannel(app)"))
+    assertTrue(entry.contains("if (probe.state != RootChannel.ABSENT) return false"))
+    assertTrue(entry.contains("LeaseClearProbe.record(app, probe, decisive = true)"))
+    assertTrue(entry.contains("!RootExecutionFence.maintenanceActive && !RootAccess.isGranted(app)"))
+    assertTrue(entry.contains("RootMaintenanceLease.clearWhenNoRootChannel(app)"))
+  }
+
+  @Test fun theSingleJudgeUsesARealBindAndNeverUidReadability() {
+    val probe = body("ShizukuTransport", "internal fun probeRootChannel(")
+    assertTrue(probe.contains("readyService(app, applyGate = false)"))
+    assertTrue(probe.contains("remote.uid()"))
+    assertTrue(probe.contains("decideNoRootChannel("))
+    // review 的核心：撤权后 getUid() 仍返回 0，不能再用它当「已授权」的依据
+    assertFalse(probe.contains("getUid()"))
+    // worker 与入口消费的是同一个探测（判据同源）
+    assertTrue(body("ShizukuTransport", "internal fun autoHealOwnershipDirect(").contains("probeRootChannel(app)"))
+  }
+
+  @Test fun forcedClearRefusesWhileMaintenanceIsActive() {
+    val forced = body("ShizukuTransport", "internal fun forceClearMaintenanceLease(")
+    assertTrue(forced.contains("if (RootExecutionFence.maintenanceActive)"))
+    assertTrue(forced.contains("\"maintenance-active\""))
+    assertTrue(forced.contains("RootMaintenanceLease.clearWhenNoRootChannel(app)"))
+  }
+
+  @Test fun leaseClearCommitIsBoundedRetriedInsteadOfLeavingAPermanentLease() {
+    val lease = body("RootMaintenanceLease", "fun clearWhenNoRootChannel(")
+    assertTrue(lease.contains("for (attempt in 1..2)"))
+    assertTrue(lease.contains("if (cleared) break"))
+  }
+
+  @Test fun waitingPhaseHasASlowRecheckAfterTheBoundedBudget() {
+    assertTrue(source("EngineStartFlow").contains("ownershipRetry.nextDelayMs() ?: SLOW_OWNERSHIP_RECHECK_MS"))
+    assertTrue(source("EngineService").contains("SLOW_OWNERSHIP_RECHECK_MS = 300_000L"))
+  }
+
+  @Test fun waitingPhaseOffersAProductExitInsteadOfForcingAReboot() {
+    val guide = source("GuidePageRenderer")
+    assertTrue(guide.contains("confirmClearMaintenanceLease(pending)"))
+    assertTrue(guide.contains("ShizukuTransport.forceClearMaintenanceLease"))
+    assertTrue(guide.contains("setPositiveButton"))
+    assertTrue(guide.contains("清除隔离并重试"))
   }
 
   @Test fun leaseClearEvaluatesItsGuardInsideTheSameCriticalSectionAsBegin() {

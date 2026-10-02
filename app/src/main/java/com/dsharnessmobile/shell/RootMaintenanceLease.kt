@@ -110,8 +110,14 @@ internal object RootMaintenanceLease {
     restore(context)
     if (pendingEpoch == null) return@synchronized true
     if (!guard()) return@synchronized false
-    val cleared = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-      .edit().clear().commit()
+    // commit 失败（存储写不动）会把租约永久留下——正是「无重试即永久等待」的那条路径。
+    // 有界重试一次；仍失败如实返回 false（调用方/引导页可再次触发，绝不假装已清）。
+    var cleared = false
+    for (attempt in 1..2) {
+      cleared = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        .edit().clear().commit()
+      if (cleared) break
+    }
     if (cleared) { pendingEpoch = null; startedAt = 0L; operation = ""; owner = null; unknown = false }
     cleared
   }

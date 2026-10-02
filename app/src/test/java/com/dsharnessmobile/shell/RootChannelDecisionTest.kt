@@ -8,13 +8,9 @@ import org.junit.Test
 /**
  * root 通道判据的**真值表**（纯函数，无设备、无反射）。
  *
- * 为什么要有这一层（review 2026-10-02）：判据此前只有「源码 contains 字符串」的启发式契约测试，
- * 改一个条件都不一定判红；而这条判据决定「要不要不可逆地清掉一条 UNKNOWN 隔离租约」，
- * 必须把每种取值组合钉死。`null` 参数表示对应探测**抛异常/读不到**，不是 false。
- *
- * 2026-10-02 真机二次修正：**能否取到服务端 uid 才是「已授权」的实证**——
- * `checkSelfPermission()` 在本机服务端 v13.6 上恒报 denied，把它当第一判据会导致「服务端 root
- * 且授权有效」被误判为不可用而误清租约（真机 A 例实测踩到）。
+ * 2026-10-02 复审后的口径：判据只有一条，用**真绑定结果**（`bindSucceeded` + `boundServiceUid`）当
+ * 「本应用派发得出去」的实证 —— 本机 Shizuku 服务端 v13.6 上 `getUid()` 撤权后仍返回 0、
+ * `checkSelfPermission()` 恒报 denied，两个廉价信号都不能作为授权依据。
  */
 class RootChannelDecisionTest {
 
@@ -26,11 +22,11 @@ class RootChannelDecisionTest {
     assertTrue(ShizukuTransport.rootChannelAvailable(true, 0, false))
   }
 
-  @Test fun shizukuNeedsBOTHServerRootAndThisAppAuthorization() {
+  @Test fun shizukuNeedsBOTHRootServiceAndConfirmedAvailability() {
     assertTrue(ShizukuTransport.rootChannelAvailable(false, 0, true))
-    // review 指出的缺口：服务端是 root ≠ 本应用能派发 —— 授权被撤时必须判为不可用
+    // 服务端是 root ≠ 本应用能派发
     assertFalse(ShizukuTransport.rootChannelAvailable(false, 0, false))
-    // shell(2000) 服务端即便「已授权」也不是 root 通道
+    // shell(2000) 服务端即便可用也不是 root 通道
     assertFalse(ShizukuTransport.rootChannelAvailable(false, 2000, true))
     assertFalse(ShizukuTransport.rootChannelAvailable(false, 2000, false))
     // 读不到 uid(-1) 不得当成可用
@@ -38,55 +34,59 @@ class RootChannelDecisionTest {
     assertFalse(ShizukuTransport.rootChannelAvailable(false, -1, false))
   }
 
-  // ── classifyRootChannel：三态（未知绝不等于「确定不存在」）─────────────────────
+  // ── decideNoRootChannel：唯一判据（绑定实证 + 三态）────────────────────────────
 
-  @Test fun suGrantShortCircuitsToAvailable() {
+  @Test fun boundRootServiceMeansAvailableBoundShellDoesNot() {
     assertEquals(ShizukuTransport.RootChannel.AVAILABLE,
-      ShizukuTransport.classifyRootChannel(true, false, null, null, false))
+      ShizukuTransport.decideNoRootChannel(true, true, true, 0, "", null))
+    assertEquals(ShizukuTransport.RootChannel.ABSENT,
+      ShizukuTransport.decideNoRootChannel(true, true, true, 2000, "", null))
+    assertEquals(ShizukuTransport.RootChannel.ABSENT,
+      ShizukuTransport.decideNoRootChannel(true, true, true, -1, "", null))
   }
 
-  @Test fun missingShizukuOrStoppedServerIsDefinitelyAbsent() {
+  @Test fun revokedPermissionIsAbsentOnlyWhenTwoSignalsAgree() {
+    // 绑定失败 + 权限被拒 + 自检也明确未授权（两源一致）⇒ 肯定派发不了 ⇒ 允许清算
     assertEquals(ShizukuTransport.RootChannel.ABSENT,
-      ShizukuTransport.classifyRootChannel(false, false, null, null, false))
+      ShizukuTransport.decideNoRootChannel(true, true, false, -1, "shizuku-denied", false))
     assertEquals(ShizukuTransport.RootChannel.ABSENT,
-      ShizukuTransport.classifyRootChannel(false, true, false, null, false))
+      ShizukuTransport.decideNoRootChannel(true, true, false, -1, "shizuku-permission-requested", false))
+    // 权限被拒但自检读不到（矛盾/不可信）⇒ 保守保留隔离
+    assertEquals(ShizukuTransport.RootChannel.UNKNOWN,
+      ShizukuTransport.decideNoRootChannel(true, true, false, -1, "shizuku-denied", null))
+    assertEquals(ShizukuTransport.RootChannel.UNKNOWN,
+      ShizukuTransport.decideNoRootChannel(true, true, false, -1, "shizuku-denied", true))
   }
 
-  @Test fun readableRootUidIsAvailableEvenWhenSelfCheckSaysDenied() {
-    // 真机 A 例：服务端 root、本应用确有授权，但 checkSelfPermission() 恒 denied（服务端版本差异）。
-    // 判据以「取得到 uid」为实证 ⇒ AVAILABLE，绝不能被自检的假阴性带成 ABSENT（那会误清租约）。
-    assertEquals(ShizukuTransport.RootChannel.AVAILABLE,
-      ShizukuTransport.classifyRootChannel(false, true, true, 0, false))
-    // 非 root 服务端即便 uid 读得到也不可用
+  @Test fun definitelyAbsentCodesAllowClearing() {
+    // 未安装 / 服务端没跑 / 版本过低 / UserService 协议过旧 ⇒ 肯定没有这条通道
     assertEquals(ShizukuTransport.RootChannel.ABSENT,
-      ShizukuTransport.classifyRootChannel(false, true, true, 2000, false))
+      ShizukuTransport.decideNoRootChannel(false, null, false, -1, "", null))
     assertEquals(ShizukuTransport.RootChannel.ABSENT,
-      ShizukuTransport.classifyRootChannel(false, true, true, -1, false))
-  }
-
-  @Test fun unreadableUidWithExplicitDenialIsAbsent() {
-    // review 场景：服务端仍以 root 运行，但本应用授权被撤 ⇒ uid 读不到 + 自检明确未授权 ⇒ ABSENT
+      ShizukuTransport.decideNoRootChannel(true, false, false, -1, "", null))
     assertEquals(ShizukuTransport.RootChannel.ABSENT,
-      ShizukuTransport.classifyRootChannel(false, true, true, null, true))
+      ShizukuTransport.decideNoRootChannel(true, true, false, -1, "shizuku-prev11", null))
+    assertEquals(ShizukuTransport.RootChannel.ABSENT,
+      ShizukuTransport.decideNoRootChannel(true, true, false, -1, "shizuku-user-service-too-old", null))
   }
 
   @Test fun probeFailuresStayUnknownAndNeverTurnIntoAbsent() {
-    // 冷启动：binder 尚未就绪（pingBinder 抛异常）⇒ 未知，不得据此清租约
+    // binder 抛异常（冷启动未就绪）⇒ 未知
     assertEquals(ShizukuTransport.RootChannel.UNKNOWN,
-      ShizukuTransport.classifyRootChannel(false, true, null, null, false))
+      ShizukuTransport.decideNoRootChannel(true, null, false, -1, "", null))
+    // 绑定失败但原因不明（未绑定 / 配置未确认）⇒ 未知，保留隔离
     assertEquals(ShizukuTransport.RootChannel.UNKNOWN,
-      ShizukuTransport.classifyRootChannel(false, true, null, null, true))
-    // uid 读不到、自检也没给出「明确未授权」⇒ 未知（保守不清）
+      ShizukuTransport.decideNoRootChannel(true, true, false, -1, "shizuku-user-service-not-bound", false))
     assertEquals(ShizukuTransport.RootChannel.UNKNOWN,
-      ShizukuTransport.classifyRootChannel(false, true, true, null, false))
+      ShizukuTransport.decideNoRootChannel(true, true, false, -1, "shizuku-configuration-required", false))
   }
 
   @Test fun unknownIsDistinctFromAbsentByConstruction() {
-    // 防回归：只要「读不到」被归成 ABSENT，`clearLeaseWhenNoRootChannel` 就会在冷启动窗口里
-    // 做不可逆清算。两条未知路径逐一钉住。
+    // 防回归：只要「读不到/说不清」被归成 ABSENT，`clearLeaseWhenNoRootChannel` 就会做不可逆清算。
     val unknownPaths = listOf(
-      ShizukuTransport.classifyRootChannel(false, true, null, null, false),
-      ShizukuTransport.classifyRootChannel(false, true, true, null, false),
+      ShizukuTransport.decideNoRootChannel(true, null, false, -1, "", null),
+      ShizukuTransport.decideNoRootChannel(true, true, false, -1, "shizuku-denied", null),
+      ShizukuTransport.decideNoRootChannel(true, true, false, -1, "shizuku-user-service-not-bound", false),
     )
     for (state in unknownPaths) {
       assertEquals(ShizukuTransport.RootChannel.UNKNOWN, state)
