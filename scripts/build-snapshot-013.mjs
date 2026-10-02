@@ -312,8 +312,22 @@ for (const entry of OVERLAY.keepUnpublished ?? []) {
   const enginePatches = registry.patches.filter((p) => p.scope === 'engine')
   log(`施加引擎树补丁（${enginePatches.map((p) => p.id).join(', ')}，apply-patches --scope engine）…`)
   // Capture unmodified cache bytes for external regression inputs; this does not execute tests.
+  //
+  // 来源链必须给「摘除前的完整 overlay」：探针的包归属表（owners）是从 overlay 的
+  // packages/vendorTop/pins/nested 建的，而来源链的保护性删除会把**全部** @deepseek-ai/*
+  // 从 packages 摘掉（它们改由源码构建的 deploy 树注入）⇒ 用被摘过的 overlay 调用探针，
+  // 每一条第一方补丁目标都认不出归属（实测 16 条全中，只有第三方目标能活）。
+  // 上游在 build-apk-source.yml:705-707 的失败诊断段已写明正确口径——注释原文
+  // "The full pre-omission overlay is required"，并显式带上 --overlay 与 --source-manifest；
+  // 但快照步内这一处漏了这两个参数，故来源链自该调用引入起必然判红（0.2.0-rc.2 前该调用不存在）。
+  // 摘除前副本在场即说明是来源链，按同一条口径补上；普通链没有该文件，行为逐字节不变。
   const captureScript = join(ROOT, 'scripts', 'probe-engine-anchors.mjs')
-  const captured = execSync(`node "${captureScript}" --fixtures --capture-only`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+  const fullOverlay = join(ROOT, '.deploy-tmp', 'source-build', 'engine-overlay.original.json')
+  const captureArgs = ['--fixtures', '--capture-only']
+  if (existsSync(fullOverlay)) captureArgs.push('--overlay', `"${fullOverlay}"`)
+  const sourceManifestFile = join(ROOT, '.deploy-tmp', 'engine-overlay', 'source-build-manifest.json')
+  if (existsSync(sourceManifestFile)) captureArgs.push('--source-manifest', `"${sourceManifestFile}"`)
+  const captured = execSync(`node "${captureScript}" ${captureArgs.join(' ')}`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
   process.stdout.write(captured)
   const script = join(ROOT, 'scripts', 'patches', 'apply-patches.mjs')
   const out = execSync(`node "${script}" "${stageRoot}" --apply --scope engine`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })

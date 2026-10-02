@@ -864,8 +864,16 @@ jobs:
           # （「发布链的快照输入必须是注入后产物」）的同型复发：**只有这一处跑在注入前**，
           # 其余门禁（build-apk.mjs:304-320）全在 snapIn 上跑。
           # 本步与复核方**做同一件事**：拿 APK → 取 assets/snapshot.tar.xz → 归一化 → 比摘要。
-          apk=$(find out -type f -name '*.apk' | sort | head -1)
+          #
+          # 取**本轮刚产出**的那个 APK，不能取「字典序第一」。本地 out/ 会累积历次版本的产物
+          # （实测：v0.14.2-fx-2 排在 v0.14.3 之前），`find|sort|head -1` 于是挑中最旧那个 ⇒
+          # 公布的摘要描述的是**上一轮**的树，复核方拿本轮发货 APK 复算必然对不上——正是上面这段
+          # 「给外部一个他们复算不出来的值」所警告的情形，只是换了个触发方式（坑 227）。
+          # CI 每轮全新工作区、out/ 只有一个，故从不暴露；与坑 215-218 同族：工作区干净是 CI 的
+          # 隐含前提，不是链的语义。按 mtime 取最新（CI 侧无操作），并把选中的产物打出来留痕。
+          apk=$(find out -type f -name '*.apk' -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)
           test -n "$apk"
+          echo "normalization source APK: $apk"
           work=.deploy-tmp/source-build/normalization
           rm -rf "$work"
           mkdir -p "$work/tree"
