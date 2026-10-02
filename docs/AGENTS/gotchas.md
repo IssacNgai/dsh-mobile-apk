@@ -1342,4 +1342,9 @@
     **真因**：`/**` 不是成员边界——**没有文档注释的相邻成员会被整段吞进切片**，而「同名片段在别处也有」正是这类假绿的温床。
     **修法**：边界取下一个顶层成员声明（与 `RootGrantTest.kt:128` 同口径）：`Regex("(?m)^  (?:(?:private|internal|override) )?fun ").find(text, start + signature.length)?.range?.first ?: text.length`；并顺手**剔除注释行**（`//`、`/*`、`*` 开头）让断言只钉代码，避免文档措辞把契约测试洗绿。
     **复验**：收紧后同一断言在删除真防线时判红（本 PR 的 `suSpawnFailureIsNeverDispatchedAndSettlesLeaseInsteadOfQuarantine` 用例）。
-    **通则**：凡「grep 源码片段」的契约测试，先自问**切片右边界是什么**——按字符数（`{0,900}`）、按文档注释、按空行都是错的；**只认结构**（成员声明 / 花括号配对 / 缩进）。
+    **通则**：凡「grep 源码片段」的契约测试，先自问**切片右边界是什么**——按字符数（`{0,900}`）、按文档注释、按空行都是错的；**只认结构**（成员声明 / 花括号配对 / 缩进）。本 PR 最终版已把边界正则扩到注解/修饰符(`suspend`/`inline`/…)与 `fun|val|var|object|class|interface|enum class`，并用**扫描器**剔注释（字符串字面量保留、行尾 `//` 与块注释剔除），另加 `memberBoundaryDoesNotCrossIntoTheNextMember` 反证用例。
+
+240. **Shizuku 服务端 v13.6：`checkSelfPermission()` 恒 denied、`getUid()` 撤权后仍返回 0 ⇒ 用 API **分不清**「已授权」与「授权被撤」（2026-10-02 真机两轮实测）**：
+    **现象**：同一台机（Shizuku 服务端在跑、uid 0）做对照——①本应用授权 granted：自检报 **false**（假阴性）；②`pm revoke` 撤权后：`getUid()` 仍返回 **0**（服务端不按该权限校验）。⇒ 依赖单一信号的判据必然在某一侧误判：以自检为准会在**已授权**时误判为「不可用」并清掉隔离租约；以 uid 为准则在**撤权**后仍判「可用」而保留租约（那个场景不会被消掉）。
+    **修法（本机取舍）**：判据**保守优先**——uid 读得到就按 uid 判（服务端 root ⇒ AVAILABLE、保留租约）；只有「uid 读不到 + 自检明确未授权」才判 ABSENT；通道**确定消失**（未安装 / 服务端没跑 / 非 root / su 也撤）才清算。要真正区分需要一个**决定性**授权探测（真正尝试 bind/configure 并读回权限码），列为后续项。
+    **复验**：`RootChannelDecisionTest` 真值表（含 `readableRootUidIsAvailableEvenWhenSelfCheckSaysDenied`）；真机两轮对照：授权 granted ⇒ 租约保留 ✓；撤权 ⇒ 租约同样保留（限制如实记录，不粉饰）。

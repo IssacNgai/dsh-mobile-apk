@@ -443,25 +443,30 @@ object ShizukuTransport {
    * 把探测结果归成三态（**纯函数**）。`null` 表示该项**抛异常/读不到**，而不是 false ——
    * 这正是「冷启动早于 Shizuku binder 就绪」时不能误清租约的那条界线。
    *
-   * **判序纪律**：本应用授权（`checkSelfPermission`）先于服务端 uid 判定——服务端是 root
-   * 但本应用授权被撤时，`getUid()` 会因权限被拒而抛异常；若先读 uid 就会把它误归成 UNKNOWN
-   * 从而不清租约（正是 review 指出的那个场景）。读到「未授权」即肯定派发不了 ⇒ ABSENT。
+   * **判据来源与已知限制（2026-10-02 两轮真机实测）**：本机（Shizuku 服务端 v13.6）上两个信号都
+   * **不可信**——`checkSelfPermission()` 恒报 denied（版本差异），`getUid()` 在授权被撤后**仍返回 0**
+   * （服务端不按该权限校验）。因此「服务端 root 但本应用授权被撤」在本机**无法与「已授权」区分**。
+   * **取舍：保守优先**——uid 读得到就按 uid 判（⇒ 服务端 root 视为 AVAILABLE、**保留**残留租约），
+   * 只有「uid 读不到且自检明确未授权」才判 ABSENT。绝不为了消掉那个场景而接受「在确有授权时误清
+   * 隔离」的风险（后者会放行新派发、与 §2 的隔离语义冲突）。通道**确定消失**（未安装 / 服务端没跑 /
+   * 非 root 服务端 / su 也撤了）时才清算，这条路径有真机 + 模拟器双向证据。
    */
   internal fun classifyRootChannel(
     suGranted: Boolean,
     shizukuInstalled: Boolean,
     binderPing: Boolean?,
-    selfPermissionGranted: Boolean?,
     serverUid: Int?,
+    permissionDenied: Boolean,
   ): RootChannel = when {
     suGranted -> RootChannel.AVAILABLE
     !shizukuInstalled -> RootChannel.ABSENT
     binderPing == null -> RootChannel.UNKNOWN
     binderPing == false -> RootChannel.ABSENT
-    selfPermissionGranted == null -> RootChannel.UNKNOWN
-    !selfPermissionGranted -> RootChannel.ABSENT
-    serverUid == null -> RootChannel.UNKNOWN
-    else -> if (rootChannelAvailable(false, serverUid, true)) RootChannel.AVAILABLE else RootChannel.ABSENT
+    // uid 取得到 ⇒ 本应用确实能派发（授权有效），按 uid 是不是 root 判
+    serverUid != null -> if (rootChannelAvailable(false, serverUid, true)) RootChannel.AVAILABLE
+      else RootChannel.ABSENT
+    permissionDenied -> RootChannel.ABSENT
+    else -> RootChannel.UNKNOWN
   }
 
   /** 单次真实探测（含 binder 调用）；判定一律交给 [classifyRootChannel]，保证与真值表同源。 */
@@ -470,15 +475,14 @@ object ShizukuTransport {
     if (RootAccess.isGranted(app)) return RootChannelProbe(RootChannel.AVAILABLE, -1)
     if (!installed(app)) return RootChannelProbe(RootChannel.ABSENT, -1)
     val ping: Boolean? = try { Shizuku.pingBinder() } catch (_: Throwable) { null }
-    if (ping != true) return RootChannelProbe(classifyRootChannel(false, true, ping, null, null), -1)
-    val granted: Boolean? = try {
+    if (ping != true) return RootChannelProbe(classifyRootChannel(false, true, ping, null, false), -1)
+    val uid: Int? = try { Shizuku.getUid() } catch (_: Throwable) { null }
+    if (uid != null) return RootChannelProbe(classifyRootChannel(false, true, true, uid, false), uid)
+    // uid 读不到：只有自检**明确**说未授权才判 ABSENT（review 的撤权场景）；读不到/矛盾一律 UNKNOWN。
+    val selfGranted: Boolean? = try {
       Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
     } catch (_: Throwable) { null }
-    // 未授权（或读不到）时不去读 uid：服务端可能仍是 root，但本应用派发不了。
-    val uid: Int? = if (granted == true) {
-      try { Shizuku.getUid() } catch (_: Throwable) { null }
-    } else null
-    return RootChannelProbe(classifyRootChannel(false, true, true, granted, uid), uid ?: -1)
+    return RootChannelProbe(classifyRootChannel(false, true, true, null, selfGranted == false), -1)
   }
 
   /**
