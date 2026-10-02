@@ -9,6 +9,7 @@
 [![Cloudflare](https://img.shields.io/badge/Cloudflare-www.cloudflare.com-F38020?logo=cloudflare&logoColor=white)](https://www.cloudflare.com)
 
 > **dsh-mobile 生态** · [dsh-shell-termux](https://github.com/kelai141/dsh-shell-termux)（shell）· [dsh-client-ui-responsive](https://github.com/kelai141/dsh-client-ui-responsive)（移动 UI）· [dsh-host-web-compat](https://github.com/kelai141/dsh-host-web-compat)（浏览器兼容）· [dsh-mobile](https://github.com/kelai141/dsh-mobile)（协调仓库，private）
+> 支持开发者：https://d1api.xin/sign-up?aff=mVa0 欢迎大家使用此聚合网站，拥有极低价的国模和不降智的GPT
 
 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的安卓壳：WebView UI 覆盖
 **内嵌 Termux 运行时快照**（解压即跑，无需 Termux app）、SAF 目录桥、保活前台服务、引擎看门狗、
