@@ -31,13 +31,16 @@ internal object RootOwnershipJobs {
 
   private fun start(context: Context, reuseRecent: Boolean = false): Boolean {
     val app = context.applicationContext
-    // 咨询租约**之前**先做入口级清算：root 路已消失时残留租约只会把启动挂死（真机实测），
-    // 而下面 synchronized 里的 outstanding 短路会绕过 worker 内的任何清算。
-    ShizukuTransport.clearLeaseWhenNoRootChannel(app)
     val done: CountDownLatch
     synchronized(lock) {
       if (running) return false
-      if (RootMaintenanceLease.outstanding(app) != null) return false
+      // 入口级清算：只有**确实存在残留租约**时才付探测成本（含 binder 调用）；且此刻本进程
+      // 没有在跑的维护（上面的 running 已挡住在跑的情形，锁内的 fence 复核挡住跨入口的并发）。
+      // 放在本锁内 ⇒ 与下面置 running=true 是一段临界区，不会与别的 start() 交错。
+      if (RootMaintenanceLease.outstanding(app) != null) {
+        ShizukuTransport.clearLeaseWhenNoRootChannel(app)
+        if (RootMaintenanceLease.outstanding(app) != null) return false
+      }
       // Activity and foreground Service can start together; reuse only a very recent settlement.
       if (reuseRecent && result != null && SystemClock.elapsedRealtime() - completedAt < 5_000L) return false
       running = true; startedAt = SystemClock.elapsedRealtime(); completedAt = 0L; result = null

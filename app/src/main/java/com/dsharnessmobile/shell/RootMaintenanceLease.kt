@@ -96,13 +96,20 @@ internal object RootMaintenanceLease {
   }
 
   /**
-   * 残留租约的自救出口：**调用方必须先证实所有真实 root 通道都已不存在**（无 su 授权、Shizuku
-   * 非 root）。此时隔离没有可串行化的特权派发对象，留着只会把启动挂成「等待属主维护」直到
-   * 整机重启。它与 [finish] 不同：不要求原 owner 线程，因为前提已保证不可能有在飞的特权工作。
+   * 残留租约的自救出口，且是**带前提复核的原子清算**：调用方须先证实所有真实 root 通道都
+   * 不存在（[ShizukuTransport.RootChannel.ABSENT]）——此时隔离没有可串行化的特权派发对象，
+   * 留着只会把启动挂成「等待属主维护」直到整机重启。
+   *
+   * 与 [finish] 不同：不要求原 owner 线程，因为前提已保证不可能有「本应用发起的」在飞特权工作。
+   * 但 `guard`（例如「当前没有维护在跑」）在**本模块的锁内**求值，与 `begin()` 共用同一临界区，
+   * 因此「判断—清除」不会与 worker 取租约交错，也不会清掉刚拿到的租约。
+   * @param guard 附加前提；在本临界区内求值，false 则不做任何动作。
+   * @returns 是否真的清掉了一条残留租约。
    */
-  fun clearWithoutRootPath(context: Context): Boolean = synchronized(lock) {
+  fun clearWhenNoRootChannel(context: Context, guard: () -> Boolean = { true }): Boolean = synchronized(lock) {
     restore(context)
     if (pendingEpoch == null) return@synchronized true
+    if (!guard()) return@synchronized false
     val cleared = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
       .edit().clear().commit()
     if (cleared) { pendingEpoch = null; startedAt = 0L; operation = ""; owner = null; unknown = false }

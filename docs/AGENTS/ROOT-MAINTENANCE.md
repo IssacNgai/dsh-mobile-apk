@@ -18,11 +18,11 @@
 
 su helper 必须有完整 JSON 信封（布尔 ok、非负整数 checked/healed/failures/unverifiedMutations、remaining 为 -1/0、布尔 truncated/deadlineExceeded）及已确认 exit0/2，且 transport 完整、未截断。已确认的失败/部分修复信封可以 finish 租约，但仍返回 repair-incomplete/ok=false；“工作已结算”不等于“修复成功”。信封缺失/畸形不 finish。完整成功还须 exit0、failures=unverifiedMutations=remaining=0、无 cap/deadline 截断。
 
-2026-10-01 结算对齐落地（无 root/已撤 root 设备卡「等待属主维护」事故）：Shizuku 修复面以**信封完整性**决定结算——完整 ⇒ finish 并如实回 repair-incomplete/ok=false，缺失/畸形才停 UNKNOWN（此前 `definitive=verified` 未实现本节承诺）。`su-exec-failed`（进程拉不起来，从未派发、零副作用）同样 finish，且 granted 缓存立即降级 denied——缓存不得比 su 本体活得久。残留租约新增唯一非 owner 出口 `RootMaintenanceLease.clearWithoutRootPath`：仅当**所有**真实 root 通道（su 授权、root Shizuku）都不存在时调用——隔离没有可串行化的特权对象，留着只会把启动挂到整机重启。
+2026-10-01 结算对齐落地（无 root/已撤 root 设备卡「等待属主维护」事故）：Shizuku 修复面以**信封完整性**决定结算——完整 ⇒ finish 并如实回 repair-incomplete/ok=false，缺失/畸形才停 UNKNOWN（此前 `definitive=verified` 未实现本节承诺）。`su-exec-failed`（进程拉不起来，从未派发、零副作用）同样 finish，且 granted 缓存立即降级 denied——缓存不得比 su 本体活得久。残留租约新增唯一非 owner 出口 `RootMaintenanceLease.clearWhenNoRootChannel(context, guard)`：仅当**肯定判定**所有真实 root 通道都不存在时调用——隔离没有可串行化的特权对象，留着只会把启动挂到整机重启。
 
-2026-10-02 真机修正（小米 14 Pro，本地 vc45 变体）：清算必须发生在 **`RootOwnershipJobs.start()` 咨询租约之前**（`ShizukuTransport.clearLeaseWhenNoRootChannel`），不能只放在维护 worker 内——`start()` 的 `outstanding` 短路会绕过 worker，启动仍会挂死。A/B：注入同 boot 残留租约 + 撤 root 路后重启，修前 345s 无 boot-start / 引擎不起 / 租约原封不动；修后 15s HTTP 401 且租约被清空。
+2026-10-02 真机修正（小米 14 Pro，本地 vc45 变体）：清算必须发生在 **`RootOwnershipJobs.start()` 咨询租约之前**（`ShizukuTransport.clearLeaseWhenNoRootChannel`），不能只放在维护 worker 内（**worker 内的清算已移除**）——`start()` 的 `outstanding` 短路会绕过 worker，启动仍会挂死。A/B：注入同 boot 残留租约 + 撤 root 路后重启，修前 345s 无 boot-start / 引擎不起 / 租约原封不动；修后 15s HTTP 401 且租约被清空。
 
-2026-10-02（review 收紧）：**「root 路存在」的判据写实**＝`su` 已授权，**或** Shizuku 服务端以 root 运行（`getUid()==0`）**且本应用已获授权**（`Shizuku.checkSelfPermission()`）。只认服务端 uid 会把「服务端 root 但本应用授权被撤」误判成有 root 路——该状态下派发不出任何特权工作，残留租约只会把启动挂死。入口级清算另加一道 `RootExecutionFence.maintenanceActive` 短路：**在飞的维护不参与清算**（否则会把在飞租约抹掉，让 worker 自己的 finish 落成 `lease-clear-failed`）；挂起场景里 worker 从未启动、锁空，不会被这道短路挡住。
+2026-10-02（review 收紧，第二版）——判据与原子性三条纪律：①**判据同源**：入口清算与维护 worker 共用 `ShizukuTransport.probeRootChannel` 与纯函数 `classifyRootChannel`/`rootChannelAvailable`（真值表 `RootChannelDecisionTest`）；「root 路存在」＝`su` 已授权，**或** Shizuku 服务端以 root 运行（`getUid()==0`）**且本应用已获授权**（`checkSelfPermission()`）——只认服务端 uid 会把「服务端 root 但本应用授权被撤」误判成有 root 路。②**三态而非布尔**：探测结果为 AVAILABLE / ABSENT / **UNKNOWN**，只有肯定判定的 ABSENT 允许清算；探测不完备（binder 未就绪、API 抛异常）一律不动，绝不把 UNKNOWN 隔离换成一次不可逆的误清。③**原子清算**：`guard`（在飞维护 `RootExecutionFence.maintenanceActive`）在 `RootMaintenanceLease` 的同一临界区内求值、与 `begin()` 互斥；入口侧清算与本锁内的 `running` 置位同临界区 ⇒ 不会清掉 worker 刚拿到的租约。`autoHealOwnershipDirect` 只有 `RootOwnershipJobs` 一个调用方 ⇒ 不存在绕过入口的路径。
 
 ## 3. 所有权边界与限制
 

@@ -421,37 +421,84 @@ object ShizukuTransport {
   fun autoHealOwnership(context: Context): JSONObject = RootOwnershipJobs.runBlocking(context)
 
   /**
+   * root 通道三态，只描述「本应用此刻能否派发 root 工作」这一件事。
+   * [ABSENT] 是**肯定结论**（探测完整且判定不可用），只有它允许清算残留租约；
+   * [UNKNOWN] 表示探测不完备（binder 未就绪 / API 抛异常），不得据此做不可逆处置。
+   */
+  internal enum class RootChannel { AVAILABLE, ABSENT, UNKNOWN }
+
+  /** 探测结果：三态 + 服务端 uid（供结果如实回报 `channelUid`，避免同一轮里二次探测）。 */
+  internal data class RootChannelProbe(val state: RootChannel, val serverUid: Int)
+
+  /**
+   * 已有真实取值时的可用判定（**纯函数**，真值表用例见 `RootChannelDecisionTest`）：
+   * su 直连已授权，**或** Shizuku 服务端以 root 运行（uid 0）**且本应用已获授权**。
+   * 只认服务端 uid 会把「服务端 root 但本应用授权被撤」误判成有 root 路——那种状态派发不出
+   * 任何特权工作，残留租约只会把启动挂死。
+   */
+  internal fun rootChannelAvailable(suGranted: Boolean, serverUid: Int, selfPermissionGranted: Boolean): Boolean =
+    suGranted || (serverUid == RootGrant.ROOT_UID && selfPermissionGranted)
+
+  /**
+   * 把探测结果归成三态（**纯函数**）。`null` 表示该项**抛异常/读不到**，而不是 false ——
+   * 这正是「冷启动早于 Shizuku binder 就绪」时不能误清租约的那条界线。
+   *
+   * **判序纪律**：本应用授权（`checkSelfPermission`）先于服务端 uid 判定——服务端是 root
+   * 但本应用授权被撤时，`getUid()` 会因权限被拒而抛异常；若先读 uid 就会把它误归成 UNKNOWN
+   * 从而不清租约（正是 review 指出的那个场景）。读到「未授权」即肯定派发不了 ⇒ ABSENT。
+   */
+  internal fun classifyRootChannel(
+    suGranted: Boolean,
+    shizukuInstalled: Boolean,
+    binderPing: Boolean?,
+    selfPermissionGranted: Boolean?,
+    serverUid: Int?,
+  ): RootChannel = when {
+    suGranted -> RootChannel.AVAILABLE
+    !shizukuInstalled -> RootChannel.ABSENT
+    binderPing == null -> RootChannel.UNKNOWN
+    binderPing == false -> RootChannel.ABSENT
+    selfPermissionGranted == null -> RootChannel.UNKNOWN
+    !selfPermissionGranted -> RootChannel.ABSENT
+    serverUid == null -> RootChannel.UNKNOWN
+    else -> if (rootChannelAvailable(false, serverUid, true)) RootChannel.AVAILABLE else RootChannel.ABSENT
+  }
+
+  /** 单次真实探测（含 binder 调用）；判定一律交给 [classifyRootChannel]，保证与真值表同源。 */
+  internal fun probeRootChannel(context: Context): RootChannelProbe {
+    val app = context.applicationContext
+    if (RootAccess.isGranted(app)) return RootChannelProbe(RootChannel.AVAILABLE, -1)
+    if (!installed(app)) return RootChannelProbe(RootChannel.ABSENT, -1)
+    val ping: Boolean? = try { Shizuku.pingBinder() } catch (_: Throwable) { null }
+    if (ping != true) return RootChannelProbe(classifyRootChannel(false, true, ping, null, null), -1)
+    val granted: Boolean? = try {
+      Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+    } catch (_: Throwable) { null }
+    // 未授权（或读不到）时不去读 uid：服务端可能仍是 root，但本应用派发不了。
+    val uid: Int? = if (granted == true) {
+      try { Shizuku.getUid() } catch (_: Throwable) { null }
+    } else null
+    return RootChannelProbe(classifyRootChannel(false, true, true, granted, uid), uid ?: -1)
+  }
+
+  /**
    * 残留租约的**入口级**清算：只有「真实 root 通道仍存在」时隔离才有意义。root 路已消失
    * 却还留着租约，就会让 [RootOwnershipJobs.start] 的 outstanding 短路把每次启动挂成
    * 「等待属主维护」——真机实测（2026-10-02）：注入同 boot 残留租约 + 撤掉 root 路后，
-   * 5 分钟没有任何 boot-start 记录、引擎起不来。清算放在 worker 里够不到这条路径，所以必须
-   * 在咨询租约之前先跑。
+   * 5 分钟没有任何 boot-start 记录、引擎起不来。清算放在 worker 里够不到这条路径（worker
+   * 内的清算已移除），所以必须在咨询租约之前先跑。
    *
-   * **「root 路存在」的定义（review 2026-10-02 收紧）**：`su` 已授权，**或** Shizuku 服务端
-   * 以 root 运行（`getUid()==0`）**且本应用已获授权**（`checkSelfPermission()`）。只认服务端
-   * uid 会把「服务端 root 但本应用授权被撤」误判成有 root 路——那种状态下派发不出任何特权
-   * 工作，残留租约只会把启动挂死（正是本 PR 设备验收第 3 条的场景）。
+   * **只在 [RootChannel.ABSENT] 时清算**：探测不完备（[RootChannel.UNKNOWN]，例如冷启动时
+   * Shizuku binder 尚未就绪）一律不动，不能把 UNKNOWN 隔离语义换成一次不可逆的误清。
    *
-   * **在飞的维护不参与清算**：worker 持写锁跑维护时 `maintenanceActive` 为真，此时清租约会把
-   * 在飞租约抹掉、让 worker 自己的 finish 落成 `lease-clear-failed`。挂起场景里 worker 从未
-   * 启动（锁空），不会被这道短路挡住。
+   * **原子性**：在飞维护（写锁在持）与清除在 [RootMaintenanceLease] 的**同一临界区**内求值，
+   * 且与 `begin()` 互斥——不会清掉 worker 刚拿到的租约。
    * @returns 是否真的清掉了一条残留租约。
    */
   internal fun clearLeaseWhenNoRootChannel(context: Context): Boolean {
     val app = context.applicationContext
-    if (RootExecutionFence.maintenanceActive) return false
-    if (rootChannelAvailable(app)) return false
-    return RootMaintenanceLease.clearWithoutRootPath(app)
-  }
-
-  /** 本应用此刻能否派发特权工作：su 直连已授权，或「Shizuku 服务端 root 且本应用已授权」。 */
-  private fun rootChannelAvailable(context: Context): Boolean {
-    if (RootAccess.isGranted(context)) return true
-    val serverUid = runCatching { Shizuku.getUid() }.getOrDefault(-1)
-    if (serverUid != RootGrant.ROOT_UID) return false
-    return runCatching {
-      Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
-    }.getOrDefault(false)
+    if (probeRootChannel(app).state != RootChannel.ABSENT) return false
+    return RootMaintenanceLease.clearWhenNoRootChannel(app) { !RootExecutionFence.maintenanceActive }
   }
 
   /** Shared Activity/Service startup guard; coalesce near-simultaneous completed scans only. */
@@ -459,19 +506,20 @@ object ShizukuTransport {
 
   internal fun autoHealOwnershipDirect(context: Context): JSONObject {
     val app = context.applicationContext
-    val uid = runCatching { Shizuku.getUid() }.getOrDefault(-1)
-    val viaSu = RootAccess.isGranted(app)
-    if (uid != RootGrant.ROOT_UID && !viaSu) {
-      // 无 root 路的如实回报。残留租约的清算已前移到 RootOwnershipJobs 入口（那里够得到
-      // start() 的 outstanding 短路；worker 内清算永远走不到这条路径）。
-      return JSONObject().put("ok", true)
-        .put("checked", 0).put("healed", 0).put("failures", 0).put("skipped", "no-root-path")
+    // 与入口清算**同一判据**（同一个三态探测 + 同一个纯函数）：判定为不可用或探测不完备
+    // 都不做维护，如实回报。残留租约的清算只发生在 RootOwnershipJobs 入口（那里才够得到
+    // start() 的 outstanding 短路，worker 内清算够不到）。
+    val probe = probeRootChannel(app)
+    if (probe.state != RootChannel.AVAILABLE) {
+      return JSONObject().put("ok", true).put("checked", 0).put("healed", 0).put("failures", 0)
+        .put("skipped", if (probe.state == RootChannel.ABSENT) "no-root-path" else "root-channel-unknown")
     }
+    val viaSu = RootAccess.isGranted(app)
     return RootExecutionFence.maintenance(context) {
       val root = java.io.File(app.applicationInfo.dataDir, "files").path
       val result = if (viaSu) RootAccess.repairOwnership(app, root, OwnershipRepairCore.MAX_ENTRIES, 20_000L)
         else repairOwnership(app, root, OwnershipRepairCore.MAX_ENTRIES)
-      result.put("channelUid", uid).put("transport", if (viaSu) "su" else "shizuku")
+      result.put("channelUid", probe.serverUid).put("transport", if (viaSu) "su" else "shizuku")
     }
   }
 
