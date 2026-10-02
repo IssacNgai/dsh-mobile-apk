@@ -95,6 +95,20 @@ internal object RootMaintenanceLease {
     if (pendingEpoch == null) null else refusalLocked()
   }
 
+  /**
+   * 残留租约的自救出口：**调用方必须先证实所有真实 root 通道都已不存在**（无 su 授权、Shizuku
+   * 非 root）。此时隔离没有可串行化的特权派发对象，留着只会把启动挂成「等待属主维护」直到
+   * 整机重启。它与 [finish] 不同：不要求原 owner 线程，因为前提已保证不可能有在飞的特权工作。
+   */
+  fun clearWithoutRootPath(context: Context): Boolean = synchronized(lock) {
+    restore(context)
+    if (pendingEpoch == null) return@synchronized true
+    val cleared = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+      .edit().clear().commit()
+    if (cleared) { pendingEpoch = null; startedAt = 0L; operation = ""; owner = null; unknown = false }
+    cleared
+  }
+
   private fun refusalLocked(): JSONObject = JSONObject().put("ok", false)
     .put("code", if (unknown) "repair-result-unknown" else "root-maintenance-busy")
     .put("reason", if (unknown) "repair-result-unknown" else "root-maintenance-busy")

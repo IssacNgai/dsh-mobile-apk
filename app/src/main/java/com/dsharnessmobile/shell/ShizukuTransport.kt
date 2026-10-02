@@ -389,10 +389,26 @@ object ShizukuTransport {
         val reply = remote.repairOwnership(path, maxEntries)
         lease.acknowledged()
         val result = bundleJson(reply).put("transport", "shizuku")
-        val verified = reply.getBoolean("ok") && reply.containsKey("checked") && reply.containsKey("healed") &&
-          reply.getInt("failures", -1) == 0 && reply.getInt("unverifiedMutations", -1) == 0 &&
-          reply.getInt("remaining", -1) == 0 && !reply.getBoolean("truncated") && !reply.getBoolean("deadlineExceeded")
-        lease.complete(result, definitive = verified)
+        // ROOT-MAINTENANCE.md §2：拿到**完整信封**的回执（即使修复部分失败/超预算）就算结算，
+        // 租约可以 finish、结果如实回 ok=false/repair-incomplete；只有信封缺失或传输不完整才
+        // 停在 UNKNOWN。此前 definitive=verified 把「已确认的部分修复/超时」也判成结果不明 ⇒
+        // 耐久租约把每次启动都挂成「等待属主维护」，直到整机重启才解。
+        val envelopeComplete = result.opt("ok") is Boolean &&
+          listOf("checked", "healed", "failures", "unverifiedMutations").all {
+            result.opt(it) is Int && result.optInt(it, -1) >= 0
+          } &&
+          result.opt("remaining") is Int && result.optInt("remaining", -2) in setOf(-1, 0) &&
+          result.opt("truncated") is Boolean && result.opt("deadlineExceeded") is Boolean
+        if (!envelopeComplete) return@maintenance lease.complete(result, definitive = false)
+        val verified = result.optBoolean("ok") && result.has("checked") && result.has("healed") &&
+          result.optInt("failures", -1) == 0 && result.optInt("unverifiedMutations", -1) == 0 &&
+          result.optInt("remaining", -1) == 0 && !result.optBoolean("truncated") && !result.optBoolean("deadlineExceeded")
+        val settled = if (verified) result else result.put("ok", false).apply {
+          if (optString("reason").isBlank()) {
+            put("reason", "repair-incomplete").put("code", "repair-incomplete").put("remaining", -1)
+          }
+        }
+        lease.complete(settled, definitive = true)
       } catch (failure: Throwable) {
         lease.complete(JSONObject().put("ok", false).put("transport", "shizuku")
           .put("code", "repair-result-unknown").put("reason", "repair-result-unknown")
@@ -404,19 +420,42 @@ object ShizukuTransport {
   /** Bounded deep walk reaches polluted startup leaves even when their ancestors are app-owned. */
   fun autoHealOwnership(context: Context): JSONObject = RootOwnershipJobs.runBlocking(context)
 
+  /**
+   * 残留租约的**入口级**清算：只有「真实 root 通道仍存在」时隔离才有意义。root 路已消失
+   * （无 su 授权、Shizuku 非 root）却还留着租约，就会让 [RootOwnershipJobs.start] 的
+   * outstanding 短路把每次启动挂成「等待属主维护」——真机实测（2026-10-02）：注入同 boot
+   * 残留租约 + 撤掉 root 路后，5 分钟没有任何 boot-start 记录、引擎起不来。清算放在 worker
+   * 里够不到这条路径，所以必须在咨询租约之前先跑。
+   * @returns 是否真的清掉了一条残留租约。
+   */
+  internal fun clearLeaseWhenNoRootChannel(context: Context): Boolean {
+    val app = context.applicationContext
+    val uid = runCatching { Shizuku.getUid() }.getOrDefault(-1)
+    if (uid == RootGrant.ROOT_UID || RootAccess.isGranted(app)) return false
+    return RootMaintenanceLease.clearWithoutRootPath(app)
+  }
+
   /** Shared Activity/Service startup guard; coalesce near-simultaneous completed scans only. */
   fun prepareStartupOwnership(context: Context): JSONObject = RootOwnershipJobs.runBlocking(context, reuseRecent = true)
 
-  internal fun autoHealOwnershipDirect(context: Context): JSONObject = RootExecutionFence.maintenance(context) {
+  internal fun autoHealOwnershipDirect(context: Context): JSONObject {
     val app = context.applicationContext
     val uid = runCatching { Shizuku.getUid() }.getOrDefault(-1)
     val viaSu = RootAccess.isGranted(app)
-    if (uid != RootGrant.ROOT_UID && !viaSu) return@maintenance JSONObject().put("ok", true)
-      .put("checked", 0).put("healed", 0).put("failures", 0).put("skipped", "no-root-path")
-    val root = java.io.File(app.applicationInfo.dataDir, "files").path
-    val result = if (viaSu) RootAccess.repairOwnership(app, root, OwnershipRepairCore.MAX_ENTRIES, 20_000L)
-      else repairOwnership(app, root, OwnershipRepairCore.MAX_ENTRIES)
-    result.put("channelUid", uid).put("transport", if (viaSu) "su" else "shizuku")
+    if (uid != RootGrant.ROOT_UID && !viaSu) {
+      // 残留租约的自救出口：root 路已经不存在（无 su 授权、Shizuku 非 root）时，隔离没有可
+      // 串行化的特权对象，只会把每次启动挂成「等待属主维护」直到整机重启。探测必须在进入
+      // RootExecutionFence 之前做——fence 入口自己会被残留租约挡住，放在里面永远走不到。
+      RootMaintenanceLease.clearWithoutRootPath(app)
+      return JSONObject().put("ok", true)
+        .put("checked", 0).put("healed", 0).put("failures", 0).put("skipped", "no-root-path")
+    }
+    return RootExecutionFence.maintenance(context) {
+      val root = java.io.File(app.applicationInfo.dataDir, "files").path
+      val result = if (viaSu) RootAccess.repairOwnership(app, root, OwnershipRepairCore.MAX_ENTRIES, 20_000L)
+        else repairOwnership(app, root, OwnershipRepairCore.MAX_ENTRIES)
+      result.put("channelUid", uid).put("transport", if (viaSu) "su" else "shizuku")
+    }
   }
 
 

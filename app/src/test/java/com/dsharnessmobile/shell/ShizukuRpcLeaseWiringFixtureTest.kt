@@ -72,8 +72,12 @@ class ShizukuRpcLeaseWiringFixtureTest {
     assertFalse(Regex("""RootExecutionFence\.(?:command|maintenance)\s*\{""").containsMatchIn(text))
     val repair = text.substringAfter("  fun repairOwnership(").substringBefore("  /** Bounded deep walk")
     assertTrue(repair.contains("lease.beforeRpc(remote)"))
-    assertTrue(repair.contains("lease.complete(result, definitive = verified)"))
-    assertTrue(repair.contains("reply.getInt(\"unverifiedMutations\", -1) == 0"))
-    assertTrue(repair.contains("reply.getInt(\"remaining\", -1) == 0"))
+    // 信封完整即结算：部分修复/超预算 finish 租约并如实回 repair-incomplete；只有信封缺失才是 UNKNOWN。
+    assertTrue(repair.contains("val envelopeComplete = result.opt(\"ok\") is Boolean"))
+    assertTrue(repair.contains("lease.complete(result, definitive = false)"))
+    assertTrue(repair.contains("lease.complete(settled, definitive = true)"))
+    assertFalse(repair.contains("definitive = verified"))
+    assertTrue(repair.contains("result.optInt(\"unverifiedMutations\", -1) == 0"))
+    assertTrue(repair.contains("result.optInt(\"remaining\", -1) == 0"))
   }
 }

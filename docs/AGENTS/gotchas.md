@@ -1331,3 +1331,8 @@
     **为什么`REQUIRED_LIBS`成员刻意不触发自动恢复**：issue原文明确告诫「不要贸然补全该表」——该表只列`usr/bin/node`的8条`DT_NEEDED`，**不含传递依赖**，因此它的命中可能是假阴性（真缺的可能是`libicudata.so.78`那类传递依赖）。自动放宽的代价是每次启动白付一次8-12分钟全量抽取并抹掉现场，比不修更坏；故低置信度条目只记录，用户可在错误页主按钮**显式**重做一次（放行分级、不放行预算）。
     **证据**：`Issue309StartRecoveryTest`13例本轮exit 0（含反证：只有低置信度条目时必须拒绝；注入两处变异后实测2 failed已还原）。真机/模拟器删件冷启动与「只删一个库符号链接」两条外验未做。不改闸门A判据本身，带病的树仍不被spawn。
 
+238. **属主维护「结算过严」把启动挂成「等待属主维护」直到整机重启（2026-10-01 真机截图实锤）**：
+    **现象**：已授权 Shizuku（服务端 root）的设备升级 0.14.3 后，每次启动都停在「正在等待属主维护完成…维护结果尚未结算」；重启设备只清一次，下次开机又复现。AI root 开关无关（应用维护不走 AI 门）。
+    **真因**：三层叠加——①`ShizukuTransport.repairOwnership` 把 `lease.complete(definitive = verified)` 写死：拿到**完整信封**的部分修复/超预算回执（DSH files 树超 20s 预算很常见）也被判「结果不明」⇒ `markUnknown` 耐久租约；②UNKNOWN 租约无产品出口，仅整机重启（boot-id 变化）可清；③`RootAccess` 的 granted 缓存只升不降，su 已拉不起来时启动自愈仍按旧缓存判「有 root 路」反复撞隔离。
+    **修法**：①信封完整（ok 布尔 + checked/healed/failures/unverifiedMutations 非负 + remaining∈{-1,0} + truncated/deadlineExceeded 布尔）⇒ 一律 `finish` 租约，部分修复如实回 `repair-incomplete`/ok=false（对齐 ROOT-MAINTENANCE.md §2 原有承诺）；②`su-exec-failed`（spawn 即失败、零副作用）按「未派发」finish 而非 markUnknown，并在 `execPrivileged` catch 里把 granted 缓存降级 denied；③`autoHealOwnershipDirect` 的探测移到 fence **之前**，无 root 路 ⇒ `clearWithoutRootPath` 清残留租约再回 `no-root-path` skip；④**真机补的第五处（只放 worker 里不够）**：清算必须发生在 `RootOwnershipJobs.start()` **咨询租约之前**（`ShizukuTransport.clearLeaseWhenNoRootChannel`）——`start()` 里的 `outstanding` 短路会绕过 worker 内的任何清算，启动照样挂死。
+    **复验**：`OwnershipLeaseSettlementFixtureTest` 六条源码契约（信封结算/未派发结算/缓存降级/无 root 清算/fence 前探测/**入口级清算**）。**真机 A/B（小米 14 Pro，vc45 本地变体）**：注入「同 boot 残留租约」+ 撤 root 路（Shizuku 未运行、su 缓存 denied）后重启——修前 345s 无任何 boot-start、引擎 HTTP 000、租约原封不动；修后 **15s HTTP 401、租约被清空**；恢复 root 路（su granted）再启亦 15s 起、租约建完即结算。

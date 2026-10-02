@@ -222,7 +222,7 @@ object RootAccess {
       RootMaintenanceLease.begin(app, "su-shell")?.let { return@command it }
       val result = execPrivileged(app, command, timeoutMs, requireAiGrant = true)
       val refusedBeforeDispatch = !result.has("exitCode") && result.optString("code") in
-        setOf("no-su", "root-not-granted", "requesting", "empty-command", "root-grant-required")
+        setOf("no-su", "root-not-granted", "requesting", "empty-command", "root-grant-required", "su-exec-failed")
       val acknowledged = result.has("exitCode") && !result.optBoolean("exitTimedOut") &&
         !result.optBoolean("drainTimedOut") && !result.optBoolean("cleanupIncomplete") && result.optString("readError").isEmpty()
       if (refusedBeforeDispatch || acknowledged) {
@@ -269,6 +269,9 @@ object RootAccess {
     } catch (t: Throwable) {
       // 异常只进日志，不上屏（页面文案一律来自 CALL_REASON 真源）。
       android.util.Log.w("dsh-root", "execRoot failed: " + t.javaClass.simpleName)
+      // granted 缓存不能比 su 本体活得久：进程都拉不起来（二进制损坏/被移除/SELinux 拒绝 exec）
+      // 说明「有 root 路」的前提已失效，立刻降级，否则启动自愈每次都按旧缓存误判并撞进隔离。
+      runCatching { writeState(context.applicationContext, STATE_DENIED, -1) }
       fail("su-exec-failed", "root 命令执行失败——请稍后重试；多次失败可复制日志反馈。")
     }
   }
@@ -310,7 +313,7 @@ object RootAccess {
       "com.dsharnessmobile.shell.RootRepairMain " + args.joinToString(" ") { shq(it) }
     RootMaintenanceLease.begin(app, "su-ownership")?.let { return it }
     val transport = execPrivileged(app, command, budget.toInt(), requireAiGrant = false)
-    if (!transport.has("exitCode") && transport.optString("code") in setOf("no-su", "root-not-granted", "requesting", "empty-command")) {
+    if (!transport.has("exitCode") && transport.optString("code") in setOf("no-su", "root-not-granted", "requesting", "empty-command", "su-exec-failed")) {
       return if (RootMaintenanceLease.finish(app)) transport else RootMaintenanceLease.markUnknown(app, "lease-clear-failed")
     }
     if (transport.optBoolean("exitTimedOut") || transport.optBoolean("drainTimedOut") || transport.optBoolean("truncated") ||
