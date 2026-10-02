@@ -422,17 +422,36 @@ object ShizukuTransport {
 
   /**
    * 残留租约的**入口级**清算：只有「真实 root 通道仍存在」时隔离才有意义。root 路已消失
-   * （无 su 授权、Shizuku 非 root）却还留着租约，就会让 [RootOwnershipJobs.start] 的
-   * outstanding 短路把每次启动挂成「等待属主维护」——真机实测（2026-10-02）：注入同 boot
-   * 残留租约 + 撤掉 root 路后，5 分钟没有任何 boot-start 记录、引擎起不来。清算放在 worker
-   * 里够不到这条路径，所以必须在咨询租约之前先跑。
+   * 却还留着租约，就会让 [RootOwnershipJobs.start] 的 outstanding 短路把每次启动挂成
+   * 「等待属主维护」——真机实测（2026-10-02）：注入同 boot 残留租约 + 撤掉 root 路后，
+   * 5 分钟没有任何 boot-start 记录、引擎起不来。清算放在 worker 里够不到这条路径，所以必须
+   * 在咨询租约之前先跑。
+   *
+   * **「root 路存在」的定义（review 2026-10-02 收紧）**：`su` 已授权，**或** Shizuku 服务端
+   * 以 root 运行（`getUid()==0`）**且本应用已获授权**（`checkSelfPermission()`）。只认服务端
+   * uid 会把「服务端 root 但本应用授权被撤」误判成有 root 路——那种状态下派发不出任何特权
+   * 工作，残留租约只会把启动挂死（正是本 PR 设备验收第 3 条的场景）。
+   *
+   * **在飞的维护不参与清算**：worker 持写锁跑维护时 `maintenanceActive` 为真，此时清租约会把
+   * 在飞租约抹掉、让 worker 自己的 finish 落成 `lease-clear-failed`。挂起场景里 worker 从未
+   * 启动（锁空），不会被这道短路挡住。
    * @returns 是否真的清掉了一条残留租约。
    */
   internal fun clearLeaseWhenNoRootChannel(context: Context): Boolean {
     val app = context.applicationContext
-    val uid = runCatching { Shizuku.getUid() }.getOrDefault(-1)
-    if (uid == RootGrant.ROOT_UID || RootAccess.isGranted(app)) return false
+    if (RootExecutionFence.maintenanceActive) return false
+    if (rootChannelAvailable(app)) return false
     return RootMaintenanceLease.clearWithoutRootPath(app)
+  }
+
+  /** 本应用此刻能否派发特权工作：su 直连已授权，或「Shizuku 服务端 root 且本应用已授权」。 */
+  private fun rootChannelAvailable(context: Context): Boolean {
+    if (RootAccess.isGranted(context)) return true
+    val serverUid = runCatching { Shizuku.getUid() }.getOrDefault(-1)
+    if (serverUid != RootGrant.ROOT_UID) return false
+    return runCatching {
+      Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+    }.getOrDefault(false)
   }
 
   /** Shared Activity/Service startup guard; coalesce near-simultaneous completed scans only. */
@@ -443,10 +462,8 @@ object ShizukuTransport {
     val uid = runCatching { Shizuku.getUid() }.getOrDefault(-1)
     val viaSu = RootAccess.isGranted(app)
     if (uid != RootGrant.ROOT_UID && !viaSu) {
-      // 残留租约的自救出口：root 路已经不存在（无 su 授权、Shizuku 非 root）时，隔离没有可
-      // 串行化的特权对象，只会把每次启动挂成「等待属主维护」直到整机重启。探测必须在进入
-      // RootExecutionFence 之前做——fence 入口自己会被残留租约挡住，放在里面永远走不到。
-      RootMaintenanceLease.clearWithoutRootPath(app)
+      // 无 root 路的如实回报。残留租约的清算已前移到 RootOwnershipJobs 入口（那里够得到
+      // start() 的 outstanding 短路；worker 内清算永远走不到这条路径）。
       return JSONObject().put("ok", true)
         .put("checked", 0).put("healed", 0).put("failures", 0).put("skipped", "no-root-path")
     }

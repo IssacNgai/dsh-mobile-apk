@@ -22,6 +22,8 @@ su helper 必须有完整 JSON 信封（布尔 ok、非负整数 checked/healed/
 
 2026-10-02 真机修正（小米 14 Pro，本地 vc45 变体）：清算必须发生在 **`RootOwnershipJobs.start()` 咨询租约之前**（`ShizukuTransport.clearLeaseWhenNoRootChannel`），不能只放在维护 worker 内——`start()` 的 `outstanding` 短路会绕过 worker，启动仍会挂死。A/B：注入同 boot 残留租约 + 撤 root 路后重启，修前 345s 无 boot-start / 引擎不起 / 租约原封不动；修后 15s HTTP 401 且租约被清空。
 
+2026-10-02（review 收紧）：**「root 路存在」的判据写实**＝`su` 已授权，**或** Shizuku 服务端以 root 运行（`getUid()==0`）**且本应用已获授权**（`Shizuku.checkSelfPermission()`）。只认服务端 uid 会把「服务端 root 但本应用授权被撤」误判成有 root 路——该状态下派发不出任何特权工作，残留租约只会把启动挂死。入口级清算另加一道 `RootExecutionFence.maintenanceActive` 短路：**在飞的维护不参与清算**（否则会把在飞租约抹掉，让 worker 自己的 finish 落成 `lease-clear-failed`）；挂起场景里 worker 从未启动、锁空，不会被这道短路挡住。
+
 ## 3. 所有权边界与限制
 
 OwnershipRepairCore 在访问前预留预算：上限 200000 entries、64 层、120000ms，默认维护 20000ms；cap/deadline 是变更前约束而非事后统计。Android adapter 用 O_PATH/O_NOFOLLOW pin 元数据，只对普通文件/目录 reopen 已持有 inode；后代经 held directory FD 与校验 basename 访问。fstat 对照身份后 fchown，再 fstat 验证；checked/healed/failures/unverifiedMutations 分别报告，应用 UID 祖先也继续深遍历。

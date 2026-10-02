@@ -1336,3 +1336,10 @@
     **真因**：三层叠加——①`ShizukuTransport.repairOwnership` 把 `lease.complete(definitive = verified)` 写死：拿到**完整信封**的部分修复/超预算回执（DSH files 树超 20s 预算很常见）也被判「结果不明」⇒ `markUnknown` 耐久租约；②UNKNOWN 租约无产品出口，仅整机重启（boot-id 变化）可清；③`RootAccess` 的 granted 缓存只升不降，su 已拉不起来时启动自愈仍按旧缓存判「有 root 路」反复撞隔离。
     **修法**：①信封完整（ok 布尔 + checked/healed/failures/unverifiedMutations 非负 + remaining∈{-1,0} + truncated/deadlineExceeded 布尔）⇒ 一律 `finish` 租约，部分修复如实回 `repair-incomplete`/ok=false（对齐 ROOT-MAINTENANCE.md §2 原有承诺）；②`su-exec-failed`（spawn 即失败、零副作用）按「未派发」finish 而非 markUnknown，并在 `execPrivileged` catch 里把 granted 缓存降级 denied；③`autoHealOwnershipDirect` 的探测移到 fence **之前**，无 root 路 ⇒ `clearWithoutRootPath` 清残留租约再回 `no-root-path` skip；④**真机补的第五处（只放 worker 里不够）**：清算必须发生在 `RootOwnershipJobs.start()` **咨询租约之前**（`ShizukuTransport.clearLeaseWhenNoRootChannel`）——`start()` 里的 `outstanding` 短路会绕过 worker 内的任何清算，启动照样挂死。
     **复验**：`OwnershipLeaseSettlementFixtureTest` 六条源码契约（信封结算/未派发结算/缓存降级/无 root 清算/fence 前探测/**入口级清算**）。**真机 A/B（小米 14 Pro，vc45 本地变体）**：注入「同 boot 残留租约」+ 撤 root 路（Shizuku 未运行、su 缓存 denied）后重启——修前 345s 无任何 boot-start、引擎 HTTP 000、租约原封不动；修后 **15s HTTP 401、租约被清空**；恢复 root 路（su granted）再启亦 15s 起、租约建完即结算。
+
+239. **契约测试的成员边界取错 ⇒ 防线被删掉仍然绿（2026-10-02 review 指出）**：
+    **现象**：新增的 `OwnershipLeaseSettlementFixtureTest` 用 `substringAfter(签名).substringBefore("\n  /**")` 切成员体，断言全绿；review 指出这个右边界是**下一个文档注释**而不是下一个成员声明 ⇒ 切片会跨进隔壁函数（实测 `body("RootAccess","fun execRoot(")` 长 3393，把 `execPrivileged` 的 `fail("su-exec-failed")` 也切了进来）⇒ 把 execRoot 自己新增的拒绝集项删掉，断言照样绿（命中的是隔壁函数里的同名片段）。
+    **真因**：`/**` 不是成员边界——**没有文档注释的相邻成员会被整段吞进切片**，而「同名片段在别处也有」正是这类假绿的温床。
+    **修法**：边界取下一个顶层成员声明（与 `RootGrantTest.kt:128` 同口径）：`Regex("(?m)^  (?:(?:private|internal|override) )?fun ").find(text, start + signature.length)?.range?.first ?: text.length`；并顺手**剔除注释行**（`//`、`/*`、`*` 开头）让断言只钉代码，避免文档措辞把契约测试洗绿。
+    **复验**：收紧后同一断言在删除真防线时判红（本 PR 的 `suSpawnFailureIsNeverDispatchedAndSettlesLeaseInsteadOfQuarantine` 用例）。
+    **通则**：凡「grep 源码片段」的契约测试，先自问**切片右边界是什么**——按字符数（`{0,900}`）、按文档注释、按空行都是错的；**只认结构**（成员声明 / 花括号配对 / 缩进）。
