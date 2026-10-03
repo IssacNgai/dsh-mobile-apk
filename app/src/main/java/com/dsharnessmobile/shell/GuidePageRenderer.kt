@@ -394,18 +394,26 @@ internal class GuidePageRenderer(private val activity: MainActivity) {
       // 而此刻看门狗正在自动重试——用户点它只会打断正在进行的恢复，且手册里那句「重试」
       // 与自动流程在同一屏上互相打架（点了之后仍回到「正在自动恢复」）。
       phase == GuidePhase.Recovering
-    chrome.primaryButton.isEnabled = !lockPrimary
-    chrome.primaryButton.alpha = if (lockPrimary) 0.55f else 1f
-    chrome.primaryButton.text = when (phase) {
-      GuidePhase.Closed -> activity.getString(R.string.ds_restart)
+    // 2026-10-03（复审第 3 点）：**维护隔离未结算**时，等待相位必须给用户一条明示出口——
+    // 否则「清租约」只有代码里的入口、屏上点不到，卡住的用户仍然只能重启设备 ✗。
+    // 此时点主按钮不会打断自动恢复：它弹的是**可取消的确认框**（见 confirmClearMaintenanceLease）。
+    val leasePending = phase == GuidePhase.Recovering &&
+      RootMaintenanceLease.outstanding(activity.applicationContext) != null
+    val locked = lockPrimary && !leasePending
+    chrome.primaryButton.isEnabled = !locked
+    chrome.primaryButton.alpha = if (locked) 0.55f else 1f
+    chrome.primaryButton.text = when {
+      leasePending -> activity.getString(R.string.ds_clear_isolation)
+      phase == GuidePhase.Closed -> activity.getString(R.string.ds_restart)
       // 缺陷 D（fx-2）：启动失败时主按钮是「安全模式启动」而不是「重试」。
       // 用户口径：失败的当下，重试往往只是再撞一次同一堵墙；能自救的那条路是带着上下文进安全模式。
-      GuidePhase.Error -> activity.getString(R.string.ds_safe_start)
-      GuidePhase.Recovering -> activity.getString(R.string.ds_recovering)
-      GuidePhase.Starting, GuidePhase.Extracting -> activity.getString(R.string.ds_starting)
-      GuidePhase.Updating -> activity.getString(R.string.ds_updating)
-      GuidePhase.Undoing -> activity.getString(R.string.ds_undoing)
-      GuidePhase.Idle, GuidePhase.Info -> activity.getString(R.string.ds_start_engine)
+      phase == GuidePhase.Error -> activity.getString(R.string.ds_safe_start)
+      phase == GuidePhase.Recovering -> activity.getString(R.string.ds_recovering)
+      phase == GuidePhase.Starting || phase == GuidePhase.Extracting -> activity.getString(R.string.ds_starting)
+      phase == GuidePhase.Updating -> activity.getString(R.string.ds_updating)
+      phase == GuidePhase.Undoing -> activity.getString(R.string.ds_undoing)
+      // 其余（Idle / Info）＝尚未启动或中性事实陈述，主按钮是「启动引擎」
+      else -> activity.getString(R.string.ds_start_engine)
     }
 
     val showProgress = busy

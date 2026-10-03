@@ -223,6 +223,20 @@ class OwnershipLeaseSettlementFixtureTest {
     assertTrue(guide.contains("清除隔离并重试"))
   }
 
+  @Test fun theProductExitIsActuallyReachableWhileTheLeaseIsUnsettled() {
+    // 复审第 3 点的落地判据：出口不能只是「代码里有」——等待相位原本把主按钮**锁死**（S1-3），
+    // 于是用户根本点不到那个确认框（2026-10-03 真机实测：点主按钮无反应）。现在仅当租约未结算时解锁。
+    val guide = source("GuidePageRenderer")
+    assertTrue(guide.contains("val leasePending = phase == GuidePhase.Recovering &&"))
+    assertTrue(guide.contains("RootMaintenanceLease.outstanding(activity.applicationContext) != null"))
+    assertTrue(guide.contains("val locked = lockPrimary && !leasePending"))
+    assertTrue(guide.contains("chrome.primaryButton.isEnabled = !locked"))
+    assertTrue(guide.contains("leasePending -> activity.getString(R.string.ds_clear_isolation)"))
+    val strings = listOf(File("src/main/res/values/strings.xml"), File("app/src/main/res/values/strings.xml"))
+      .first { it.isFile }.readText()
+    assertTrue(strings.contains("ds_clear_isolation"))
+  }
+
   @Test fun leaseClearEvaluatesItsGuardInsideTheSameCriticalSectionAsBegin() {
     // 判断—清除与 begin() 共用同一临界区（review 第 4 点）：guard 必须在锁内、清除之前求值。
     val lease = body("RootMaintenanceLease", "fun clearWhenNoRootChannel(")
