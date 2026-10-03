@@ -142,7 +142,7 @@ internal object RootMaintenanceLease {
    * @param guard 附加前提；在本临界区内求值，false 则不做任何动作。
    * @returns 是否真的清掉了一条残留租约。
    */
-  fun clearWhenNoRootChannel(context: Context, guard: () -> Boolean = { true }): Boolean = synchronized(lock) {
+  fun clearWhenNoRootChannel(context: Context, guard: () -> Boolean): Boolean = synchronized(lock) {
     restore(context)
     if (pendingEpoch == null) return@synchronized true
     if (!guard()) return@synchronized false

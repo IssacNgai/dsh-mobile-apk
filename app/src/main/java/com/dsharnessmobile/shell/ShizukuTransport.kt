@@ -651,7 +651,12 @@ object ShizukuTransport {
     val lease = RootMaintenanceLease.outstanding(app)
     val dispatched = lease?.optBoolean("dispatched") == true
     val leaseUnknown = lease?.optBoolean("unknown") == true || RootMaintenanceLease.unknown(app)
-    val cleared = RootMaintenanceLease.clearWhenNoRootChannel(app)
+    val cleared = RootMaintenanceLease.clearWhenNoRootChannel(app) {
+      // 复审第五轮：人工清算**同样**要锁内最终复核 —— 上面那次检查在锁外，中间有窗口能让另一个入口
+      // 启动维护（maintenanceActive=true 且刚拿到新租约），此时清掉就会破坏在飞结算 ✗。
+      // 用户授权 ≠ 可以拆掉并发保护。
+      !RootExecutionFence.maintenanceActive
+    }
     LeaseClearProbe.record(app, RootChannelProbe(
       if (cleared) RootChannel.ABSENT else RootChannel.UNKNOWN, -1, "manual"), decisive = false,
       // `allowed=false`：**自动清算准入没有通过**（本条是用户显式授权，不是自动判据放行）——

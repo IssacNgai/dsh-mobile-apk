@@ -246,6 +246,32 @@ class OwnershipLeaseSettlementFixtureTest {
     assertTrue(audit.contains(".put(\"detail\", probe.detail)"))
   }
 
+  @Test fun forceClearMaintenanceLeaseRefusesIfMaintenanceStartsAfterInitialCheck() {
+    // 复审第五轮的竞态：人工路径的 maintenanceActive 只在**锁外**查过一次 ⇒ 中间那段窗口里另一个入口
+    // 可以启动维护（拿到新租约）⇒ 不带 guard 的 clear 会把它清掉 ✗。修法＝人工路径也传锁内 guard。
+    val forced = body("ShizukuTransport", "internal fun forceClearMaintenanceLease(")
+    // ① 锁外那次检查保留（给用户一句明确的话），但**不是**唯一保护
+    assertTrue(forced.contains("if (RootExecutionFence.maintenanceActive) {"))
+    // ② 真正的清除必须带锁内 guard（与自动路径同一保护）
+    assertTrue(forced.contains("RootMaintenanceLease.clearWhenNoRootChannel(app) {"))
+    assertTrue(forced.contains("!RootExecutionFence.maintenanceActive"))
+    // ③ 结构性契约：**任何** clearWhenNoRootChannel 调用都必须带 guard（防以后有人再加一条裸调用）
+    val shellSources = listOf("ShizukuTransport", "RootOwnershipJobs", "RootAccess", "GuidePageRenderer",
+      "EngineStartFlow", "EngineService", "RootExecutionFence").joinToString("\n") { source(it) }
+    val unguarded = Regex("""clearWhenNoRootChannel\(app\)(?!\s*\{)""").findAll(shellSources).count()
+    assertTrue("不得存在不带 guard 的 clearWhenNoRootChannel 调用（发现 $unguarded 处）", unguarded == 0)
+    // ④ 租约层：guard 在锁内、且在**任何写盘之前**求值（false 即原样返回、不落任何改动）
+    val lease = body("RootMaintenanceLease", "fun clearWhenNoRootChannel(")
+    assertTrue(lease.contains("if (!guard()) return@synchronized false"))
+    // 更强的一条：guard **不给默认值** ⇒ 「不带 guard 的清除」在编译期就不可能（结构性消除绕过路径）
+    assertTrue(lease.contains("guard: () -> Boolean): Boolean"))
+    val guardAt = lease.indexOf("if (!guard())")
+    val firstWriteAt = lease.indexOf("for (attempt in 1..2)")
+    assertTrue("guard 必须早于任何写盘", guardAt in 0 until firstWriteAt)
+    // ⑤ 拒绝时不得谎报成功
+    assertTrue(forced.contains("put(\"ok\", cleared)"))
+  }
+
   @Test fun waitingPhaseHasASlowRecheckAfterTheBoundedBudget() {
     assertTrue(source("EngineStartFlow").contains("ownershipRetry.nextDelayMs() ?: SLOW_OWNERSHIP_RECHECK_MS"))
     assertTrue(source("EngineService").contains("SLOW_OWNERSHIP_RECHECK_MS = 300_000L"))
