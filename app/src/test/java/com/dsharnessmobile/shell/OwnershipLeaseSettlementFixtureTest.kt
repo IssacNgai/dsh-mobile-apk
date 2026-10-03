@@ -230,7 +230,9 @@ class OwnershipLeaseSettlementFixtureTest {
   @Test fun backgroundSelfHealNeverRaisesAPermissionDialog() {
     // 后台自愈（repairOwnership）必须在取服务时就禁掉授权请求：否则本机假阴性会让维护卡在系统框上
     val repair = body("ShizukuTransport", "fun repairOwnership(")
-    assertTrue(repair.contains("readyService(context, applyGate = false, requestPermission = false)"))
+    // 后台自愈（repairOwnership）两条约束：不弹授权框 + 绕过不可靠的客户端权限预检
+    // （否则本机自检假阴性会让维护卡在系统框上、或永远修不了 —— 复审 B 项）
+    assertTrue(repair.contains("readyService(context, applyGate = false, requestPermission = false, ignoreGranted = true)"))
     assertFalse(repair.contains("Shizuku.requestPermission"))
   }
 

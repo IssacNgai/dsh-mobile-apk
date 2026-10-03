@@ -199,7 +199,7 @@ class RootGrantTest {
     val text = source("ShizukuTransport.kt")
     assertEquals(2, Regex("""readyService\((context|app), applyGate = false""").findAll(text).count())
     val repair = body("ShizukuTransport.kt", "fun repairOwnership(")
-    assertBefore(repair, "RootExecutionFence.maintenance", "readyService(context, applyGate = false, requestPermission = false)")
+    assertBefore(repair, "RootExecutionFence.maintenance", "readyService(context, applyGate = false, requestPermission = false, ignoreGranted = true)")
     assertBefore(repair, "configureIfNeeded(context)", "remote.repairOwnership(path, maxEntries)")
     // 探测面那处豁免必须**只绑定、不执行**（2026-10-03 加：绕过不可信的客户端权限预检才能真正判通道）
     val probeEnv = body("ShizukuTransport.kt", "private class SystemRootProbeEnv(")

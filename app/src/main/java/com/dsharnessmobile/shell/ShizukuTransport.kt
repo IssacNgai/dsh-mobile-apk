@@ -390,9 +390,11 @@ object ShizukuTransport {
    */
   fun repairOwnership(context: Context, path: String, maxEntries: Int = 20_000): JSONObject =
     RootExecutionFence.maintenance(context) {
-      // 后台自愈面：**不弹授权框**（requestPermission=false）——本机 checkSelfPermission() 有假阴性，
-    // 若在这里发起请求，维护会卡在系统确认页上（2026-10-02 真机实测，同一根因见坑位 241）。
-    val (remote, refusal) = readyService(context, applyGate = false, requestPermission = false)
+      // 后台自愈面两条硬约束：**不弹授权框**（requestPermission = false，本机 checkSelfPermission() 有假阴性，
+      // 若在这里发起请求会把维护卡在系统确认页上，2026-10-02 真机实测）＋ **绕过不可靠的客户端权限预检**
+      // （ignoreGranted = true，否则自检假阴性会让自愈永远拿不到 `shizuku-denied` 之外的结论而不修 ✗）。
+      // 这里只归一本应用数据目录里的属主，不构成权限放大（与 `applyGate = false` 的豁免理由同源）。
+      val (remote, refusal) = readyService(context, applyGate = false, requestPermission = false, ignoreGranted = true)
       if (remote == null) return@maintenance refusal ?: unavailableShell()
       if (!configureIfNeeded(context)) return@maintenance JSONObject().put("ok", false)
         .put("code", "repair-configuration-required").put("reason", "repair-configuration-required")
