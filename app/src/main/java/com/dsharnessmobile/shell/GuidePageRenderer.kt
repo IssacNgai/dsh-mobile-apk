@@ -273,9 +273,9 @@ internal class GuidePageRenderer(private val activity: MainActivity) {
    */
   private fun confirmClearMaintenanceLease(pending: org.json.JSONObject?) {
     val ctx = activity.applicationContext
-    val dispatched = pending?.optBoolean("dispatched") == true
-    val terminationNote = if (dispatched) {
-      "\n\n注意：这条隔离记录里有「已派发特权工作」的痕迹。清除它**不能证明**那次特权工作已经结束" +
+    val unproven = pending?.optBoolean("dispatched") == true || pending?.optBoolean("unknown") == true
+    val terminationNote = if (unproven) {
+      "\n\n注意：这条隔离记录的状态不可信（可能留有「已派发特权工作」的痕迹）。清除它**不能证明**那次特权工作已经结束" +
         "（应用侧看不到外部 su 子进程 / Shizuku 服务是否仍在跑）。如果清完之后出现异常，请重启设备再排查。"
     } else {
       ""
