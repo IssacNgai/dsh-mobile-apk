@@ -12,11 +12,15 @@ internal object RootMaintenanceLease {
   private const val KEY_EPOCH = "epoch"
   private const val KEY_STARTED = "startedAt"
   private const val KEY_OPERATION = "operation"
+  private const val KEY_DISPATCHED = "dispatched"
+  private const val KEY_DISPATCHED_AT = "dispatchedAt"
   private val lock = Any()
   private var initialized = false
   private var pendingEpoch: String? = null
   private var startedAt = 0L
   private var operation = ""
+  private var dispatched = ""
+  private var dispatchedAt = 0L
   private var owner: Thread? = null
   private var unknown = false
 
@@ -46,8 +50,10 @@ internal object RootMaintenanceLease {
     pendingEpoch = prefs.getString(KEY_EPOCH, null)
     startedAt = prefs.getLong(KEY_STARTED, 0L)
     operation = prefs.getString(KEY_OPERATION, "privileged-operation").orEmpty()
+    dispatched = prefs.getString(KEY_DISPATCHED, "").orEmpty()
+    dispatchedAt = prefs.getLong(KEY_DISPATCHED_AT, 0L)
     if (pendingEpoch != null && newBoot(pendingEpoch, bootEpoch(context)) && prefs.edit().clear().commit()) {
-      pendingEpoch = null; startedAt = 0L; operation = ""
+      pendingEpoch = null; startedAt = 0L; operation = ""; dispatched = ""; dispatchedAt = 0L
     }
     unknown = pendingEpoch != null
     initialized = true
@@ -68,8 +74,32 @@ internal object RootMaintenanceLease {
         .put("reason", "root-maintenance-lease-unavailable").put("guidance", "特权执行租约不能持久化，本次不派发。")
     }
     pendingEpoch = epoch; startedAt = started; this.operation = operation.take(64)
+    dispatched = ""; dispatchedAt = 0L
     owner = Thread.currentThread(); unknown = false
     null
+  }
+
+  /**
+   * 记录「特权工作已经真正派发出去」——这是**自动清算的唯一否决证据**（2026-10-02 复审第 2 点）：
+   * `synchronized` 只证明本进程内互斥，**证明不了外部 su 子进程 / Shizuku UserService 已经退出**。
+   * 所以租约一旦带上这个标记，就再也不能仅凭「当前通道看起来不存在」被自动清掉，只能走用户显式出口。
+   *
+   * 写不进也**不放行**：标记失败的后果是「以后可能误清」，因此改为把租约置为结果不明（保守方向）。
+   * @returns 标记是否成功落盘。
+   */
+  fun markDispatched(context: Context, transport: String): Boolean = synchronized(lock) {
+    restore(context)
+    if (pendingEpoch == null) return@synchronized true
+    val written = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+      .putString(KEY_DISPATCHED, transport.take(24))
+      .putLong(KEY_DISPATCHED_AT, System.currentTimeMillis())
+      .commit()
+    if (!written) {
+      unknown = true
+      return@synchronized false
+    }
+    dispatched = transport.take(24); dispatchedAt = System.currentTimeMillis()
+    true
   }
 
   /** Only the original acknowledged caller may clear its lease; ordinary timeout/error is not acknowledgement. */
@@ -77,8 +107,10 @@ internal object RootMaintenanceLease {
     restore(context)
     if (pendingEpoch == null || unknown || owner !== Thread.currentThread()) return@synchronized false
     val cleared = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().clear().commit()
-    if (cleared) { pendingEpoch = null; startedAt = 0L; operation = ""; owner = null; unknown = false }
-    else unknown = true
+    if (cleared) {
+      pendingEpoch = null; startedAt = 0L; operation = ""; owner = null; unknown = false
+      dispatched = ""; dispatchedAt = 0L
+    } else unknown = true
     cleared
   }
 
@@ -96,23 +128,60 @@ internal object RootMaintenanceLease {
   }
 
   /**
-   * 残留租约的自救出口：**调用方必须先证实所有真实 root 通道都已不存在**（无 su 授权、Shizuku
-   * 非 root）。此时隔离没有可串行化的特权派发对象，留着只会把启动挂成「等待属主维护」直到
-   * 整机重启。它与 [finish] 不同：不要求原 owner 线程，因为前提已保证不可能有在飞的特权工作。
+   * 残留租约的自救出口，且是**带前提复核的原子清算**：调用方须先证实「通道确实不存在 **且** 这条租约
+   * 从未派发过特权工作」（[ShizukuTransport.autoClearAllowed]）——此时隔离没有可串行化的对象，
+   * 留着只会把启动挂成「等待属主维护」直到整机重启。
+   *
+   * **不能**用它来处理「已派发但结果不明」的租约：本模块的锁只覆盖本进程，**证明不了**外部 su
+   * 子进程或 Shizuku UserService 已经退出（文件头那句就是这个意思）。那种租约只能由用户在明示
+   * 「终止无法证明」后手工清除（[ShizukuTransport.forceClearMaintenanceLease]）。
+   *
+   * 与 [finish] 不同：不要求原 owner 线程，因为前提已保证不可能有「本应用发起的」在飞特权工作。
+   * 但 `guard` 在**本模块的锁内**求值，与 `begin()` 共用同一临界区，因此「判断—清除」不会与
+   * worker 取租约交错，也不会清掉刚拿到的租约。
+   * @param guard 附加前提；在本临界区内求值，false 则不做任何动作。
+   * @returns 是否真的清掉了一条残留租约。
    */
-  fun clearWithoutRootPath(context: Context): Boolean = synchronized(lock) {
+  fun clearWhenNoRootChannel(context: Context, guard: () -> Boolean): Boolean = synchronized(lock) {
     restore(context)
     if (pendingEpoch == null) return@synchronized true
-    val cleared = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-      .edit().clear().commit()
-    if (cleared) { pendingEpoch = null; startedAt = 0L; operation = ""; owner = null; unknown = false }
+    if (!guard()) return@synchronized false
+    // commit 失败（存储写不动）会把租约永久留下——正是「无重试即永久等待」的那条路径。
+    // 有界重试一次；仍失败如实返回 false（调用方/引导页可再次触发，绝不假装已清）。
+    var cleared = false
+    for (attempt in 1..2) {
+      cleared = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        .edit().clear().commit()
+      if (cleared) break
+    }
+    if (cleared) {
+      pendingEpoch = null; startedAt = 0L; operation = ""; owner = null; unknown = false
+      dispatched = ""; dispatchedAt = 0L
+    }
     cleared
+  }
+
+  /** 当前租约是否带「已派发」证据（自动清算的否决项之一）。 */
+  fun dispatched(context: Context): Boolean = synchronized(lock) {
+    restore(context)
+    dispatched.isNotEmpty()
+  }
+
+  /**
+   * 租约自身的**结算/持久化状态是否不可信**（`unknown`）——自动清算的第二个否决项（复审第四轮）：
+   * 「没有派发证据」≠「证明没有派发」。`markDispatched` 写不进（证据没落盘）、或本进程**恢复**了别的
+   * 进程留下的租约，都会让 `dispatched=false` 变得**不可采信** ⇒ 一律不清。
+   */
+  fun unknown(context: Context): Boolean = synchronized(lock) {
+    restore(context)
+    unknown
   }
 
   private fun refusalLocked(): JSONObject = JSONObject().put("ok", false)
     .put("code", if (unknown) "repair-result-unknown" else "root-maintenance-busy")
     .put("reason", if (unknown) "repair-result-unknown" else "root-maintenance-busy")
     .put("operation", operation).put("startedAt", startedAt).put("unknown", unknown)
+    .put("dispatched", dispatched.isNotEmpty()).put("dispatchedVia", dispatched).put("dispatchedAt", dispatchedAt)
     .put("failures", 1).put("remaining", -1)
     .put("guidance", if (unknown) "特权工作结果不明，已暂停新派发与维护；不能以重启应用或杀 su 客户端当作结算。请重启设备后再试。"
       else "特权工作尚未结算，请等待；本次不重复派发。")

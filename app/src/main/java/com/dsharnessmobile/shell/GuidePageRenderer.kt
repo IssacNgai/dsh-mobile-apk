@@ -264,6 +264,54 @@ internal class GuidePageRenderer(private val activity: MainActivity) {
     }, "dsh-root-owner-repair-guide").start()
   }
 
+  /**
+   * 租约挡住启动时的**产品级出口**（2026-10-02 复审：没有它用户只能重启设备）。
+   *
+   * 语义边界：用户点了「清除隔离并重试」＝用户自己判定那条 root 通道已经不存在；我们只丢掉隔离
+   * 标记，**不改动任何文件属主**，也不放行任何特权派发面（那仍受 AI 门与通道身份约束）。维护正在
+   * 运行时拒绝清除（会把在飞 worker 的 finish 变成 lease-clear-failed），并如实说明原因。
+   */
+  private fun confirmClearMaintenanceLease(pending: org.json.JSONObject?) {
+    val ctx = activity.applicationContext
+    val unproven = pending?.optBoolean("dispatched") == true || pending?.optBoolean("unknown") == true
+    val terminationNote = if (unproven) {
+      "\n\n注意：这条隔离记录的状态不可信（可能留有「已派发特权工作」的痕迹）。清除它**不能证明**那次特权工作已经结束" +
+        "（应用侧看不到外部 su 子进程 / Shizuku 服务是否仍在跑）。如果清完之后出现异常，请重启设备再排查。"
+    } else {
+      ""
+    }
+    runCatching {
+      android.app.AlertDialog.Builder(activity)
+        .setTitle("维护隔离尚未结算")
+        .setMessage(
+          (pending?.optString("guidance").orEmpty().ifBlank { "已有特权工作尚未结算，暂不修改运行时。" }) +
+            "\n\n如果那条 root 通道（Shizuku / su）确实已经不存在，可以清除隔离标记后重试启动。" +
+            "清除只会丢掉隔离状态，不会改动任何文件属主。" + terminationNote,
+        )
+        .setPositiveButton("清除隔离并重试") { _, _ ->
+          val result = ShizukuTransport.forceClearMaintenanceLease(ctx)
+          if (result.optBoolean("ok")) {
+            val unproven = result.optBoolean("terminationUnproven")
+            pushHint(
+              if (unproven) "已清除维护隔离，正在重试启动（该记录含已派发痕迹，终止无法证明；若异常请重启设备）。"
+              else "已清除维护隔离，正在重试启动。",
+              HintSource.PHASE, sticky = unproven,
+            )
+            activity.engineFlow.engineRetryCount = 0
+            activity.engineManager.clearRefreshLedger()
+            activity.startEngineFlow()
+          } else {
+            pushHint(
+              result.optString("guidance").ifBlank { "清除未成功，请重试或重启设备。" },
+              HintSource.PHASE, sticky = true,
+            )
+          }
+        }
+        .setNegativeButton("取消", null)
+        .show()
+    }.onFailure { applyGuideHint("无法弹出确认框：" + it.javaClass.simpleName) }
+  }
+
   fun buildGuideView(): LinearLayout {
     chrome = buildGuideChrome(
       activity,
@@ -271,7 +319,7 @@ internal class GuidePageRenderer(private val activity: MainActivity) {
         onStartEngine = {
           val pending = RootMaintenanceLease.outstanding(activity.applicationContext)
           if (pending != null || RootExecutionFence.maintenanceActive) {
-            applyGuideHint(pending?.optString("guidance") ?: "已有特权工作尚未结算，暂不修改运行时；请等待。")
+            confirmClearMaintenanceLease(pending)
           } else {
           // 缺陷 D（fx-2）：同一个主按钮在 **Error 相位**下语义不同——它变成「安全模式启动」。
           // 分叉放在这里而不是换控件：`GuideChrome` 只有一个 primaryButton，
@@ -346,18 +394,26 @@ internal class GuidePageRenderer(private val activity: MainActivity) {
       // 而此刻看门狗正在自动重试——用户点它只会打断正在进行的恢复，且手册里那句「重试」
       // 与自动流程在同一屏上互相打架（点了之后仍回到「正在自动恢复」）。
       phase == GuidePhase.Recovering
-    chrome.primaryButton.isEnabled = !lockPrimary
-    chrome.primaryButton.alpha = if (lockPrimary) 0.55f else 1f
-    chrome.primaryButton.text = when (phase) {
-      GuidePhase.Closed -> activity.getString(R.string.ds_restart)
+    // 2026-10-03（复审第 3 点）：**维护隔离未结算**时，等待相位必须给用户一条明示出口——
+    // 否则「清租约」只有代码里的入口、屏上点不到，卡住的用户仍然只能重启设备 ✗。
+    // 此时点主按钮不会打断自动恢复：它弹的是**可取消的确认框**（见 confirmClearMaintenanceLease）。
+    val leasePending = phase == GuidePhase.Recovering &&
+      RootMaintenanceLease.outstanding(activity.applicationContext) != null
+    val locked = lockPrimary && !leasePending
+    chrome.primaryButton.isEnabled = !locked
+    chrome.primaryButton.alpha = if (locked) 0.55f else 1f
+    chrome.primaryButton.text = when {
+      leasePending -> activity.getString(R.string.ds_clear_isolation)
+      phase == GuidePhase.Closed -> activity.getString(R.string.ds_restart)
       // 缺陷 D（fx-2）：启动失败时主按钮是「安全模式启动」而不是「重试」。
       // 用户口径：失败的当下，重试往往只是再撞一次同一堵墙；能自救的那条路是带着上下文进安全模式。
-      GuidePhase.Error -> activity.getString(R.string.ds_safe_start)
-      GuidePhase.Recovering -> activity.getString(R.string.ds_recovering)
-      GuidePhase.Starting, GuidePhase.Extracting -> activity.getString(R.string.ds_starting)
-      GuidePhase.Updating -> activity.getString(R.string.ds_updating)
-      GuidePhase.Undoing -> activity.getString(R.string.ds_undoing)
-      GuidePhase.Idle, GuidePhase.Info -> activity.getString(R.string.ds_start_engine)
+      phase == GuidePhase.Error -> activity.getString(R.string.ds_safe_start)
+      phase == GuidePhase.Recovering -> activity.getString(R.string.ds_recovering)
+      phase == GuidePhase.Starting || phase == GuidePhase.Extracting -> activity.getString(R.string.ds_starting)
+      phase == GuidePhase.Updating -> activity.getString(R.string.ds_updating)
+      phase == GuidePhase.Undoing -> activity.getString(R.string.ds_undoing)
+      // 其余（Idle / Info）＝尚未启动或中性事实陈述，主按钮是「启动引擎」
+      else -> activity.getString(R.string.ds_start_engine)
     }
 
     val showProgress = busy

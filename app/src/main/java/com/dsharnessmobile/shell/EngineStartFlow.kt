@@ -483,13 +483,14 @@ internal class EngineStartFlow(private val activity: MainActivity) {
         // Pending is not startup failure: no undo, toast, fresh/read or worker replay.
         activity.runOnUiThread {
           if (!isCurrentEngineFlow(generation)) return@runOnUiThread
-          activity.applyGuidePhase(GuidePhase.Recovering, "正在等待属主维护完成…", "维护结果尚未结算，暂不读取或更新运行时；服务会有限次静默重试。")
+          activity.applyGuidePhase(GuidePhase.Recovering, "正在等待属主维护完成…", "维护结果尚未结算，暂不读取或更新运行时；先有限次快速重试，之后每 5 分钟静默复查一次。")
         }
-        ownershipRetry.nextDelayMs()?.let { delay ->
-          engineMonitorHandler.postDelayed({
-            if (isCurrentEngineFlow(generation) && activity.pageUiActive) start()
-          }, delay)
-        }
+        // 预算内快速重试；预算用尽后**不停止**，转为长周期复查——否则临时性的探测不完备
+        // （binder 未就绪等）会把用户卡到重启设备为止（2026-10-02 复审：UNKNOWN 无上限）。
+        val delay = ownershipRetry.nextDelayMs() ?: SLOW_OWNERSHIP_RECHECK_MS
+        engineMonitorHandler.postDelayed({
+          if (isCurrentEngineFlow(generation) && activity.pageUiActive) start()
+        }, delay)
         return@Thread
       }
       if (!ownership.optBoolean("ok")) LogCollector.log("dsh-root", "preboot ownership repair incomplete: " + ownership.optString("reason"))
