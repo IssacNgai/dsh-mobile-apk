@@ -23,7 +23,8 @@ internal object LeaseClearProbe {
    * @param decisive 是否来自决定性探测（`probeRootChannel`）；false = 用户强制清除等
    * @param forced 是否用户显式确认的强制清除
    * @param dispatched 租约是否带「已派发特权工作」痕迹（自动清算的否决项）
-   * @param allowed 自动清算准入判定结果（三条件是否同时满足）
+   * @param allowed 自动清算准入判定结果（四条件是否同时满足）
+   * @param leaseUnknown 租约自身的结算/持久化状态是否不可信（自动清算的第二个否决项）
    */
   fun record(
     context: Context,
@@ -32,6 +33,7 @@ internal object LeaseClearProbe {
     forced: Boolean = false,
     dispatched: Boolean = false,
     allowed: Boolean = false,
+    leaseUnknown: Boolean = false,
   ) {
     runCatching {
       val file = File(context.filesDir, FILE_NAME)
@@ -43,6 +45,7 @@ internal object LeaseClearProbe {
         .put("decisive", decisive)
         .put("forced", forced)
         .put("dispatched", dispatched)
+        .put("leaseUnknown", leaseUnknown)
         .put("allowed", allowed)
         .put("detail", probe.detail)
         .toString()

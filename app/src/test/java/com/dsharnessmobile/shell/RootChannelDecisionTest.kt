@@ -121,23 +121,37 @@ class RootChannelDecisionTest {
     assertEquals(ShizukuTransport.RootChannel.UNKNOWN, d(true, true, null, ShizukuTransport.BindOutcome.TIMEOUT, -1))
   }
 
-  // ── 自动清算准入（复审第 2、5.3、5.5 点）──────────────────────────────────────
+  // ── 自动清算准入（复审第 2、5.3、5.5 点；第四轮加 leaseUnknown）────────────────
 
   @Test fun autoClearNeedsAbsentChannelPlusNoDispatchEvidencePlusNoLiveMaintenance() {
-    assertTrue(ShizukuTransport.autoClearAllowed(ShizukuTransport.RootChannel.ABSENT, false, false))
+    val ABSENT = ShizukuTransport.RootChannel.ABSENT
+    assertTrue(ShizukuTransport.autoClearAllowed(ABSENT, false, false, false))
     // 已派发过 ⇒ 一律否决（外部工作是否结束，本进程证明不了）
-    assertFalse(ShizukuTransport.autoClearAllowed(ShizukuTransport.RootChannel.ABSENT, true, false))
+    assertFalse(ShizukuTransport.autoClearAllowed(ABSENT, true, false, false))
     // 进程内有在飞维护 ⇒ 否决
-    assertFalse(ShizukuTransport.autoClearAllowed(ShizukuTransport.RootChannel.ABSENT, false, true))
+    assertFalse(ShizukuTransport.autoClearAllowed(ABSENT, false, false, true))
     // 通道还在/说不清 ⇒ 否决
-    assertFalse(ShizukuTransport.autoClearAllowed(ShizukuTransport.RootChannel.AVAILABLE, false, false))
-    assertFalse(ShizukuTransport.autoClearAllowed(ShizukuTransport.RootChannel.UNKNOWN, false, false))
+    assertFalse(ShizukuTransport.autoClearAllowed(ShizukuTransport.RootChannel.AVAILABLE, false, false, false))
+    assertFalse(ShizukuTransport.autoClearAllowed(ShizukuTransport.RootChannel.UNKNOWN, false, false, false))
+  }
+
+  @Test fun untrustworthyLeaseStateVetoesAutoClearEvenWithoutDispatchEvidence() {
+    // 复审第四轮的核心：**「没有派发证据」≠「证明没有派发」**。
+    // markDispatched 持久化失败时只置 unknown、dispatched 仍是 false；恢复别的进程的租约同样 unknown
+    // ⇒ 这两种情况下 `dispatched=false` 可能正意味着「证据没落盘」⇒ 绝不能自动清。
+    val ABSENT = ShizukuTransport.RootChannel.ABSENT
+    assertFalse(ShizukuTransport.autoClearAllowed(ABSENT, false, true, false))
+    assertFalse(ShizukuTransport.autoClearAllowed(ABSENT, true, true, false))
+    assertFalse(ShizukuTransport.autoClearAllowed(ABSENT, false, true, true))
   }
 
   @Test fun unknownChannelIsNeverAutoClearedUnderAnyEvidenceCombination() {
     for (dispatched in listOf(false, true)) {
-      for (active in listOf(false, true)) {
-        assertFalse(ShizukuTransport.autoClearAllowed(ShizukuTransport.RootChannel.UNKNOWN, dispatched, active))
+      for (unknown in listOf(false, true)) {
+        for (active in listOf(false, true)) {
+          assertFalse(ShizukuTransport.autoClearAllowed(
+            ShizukuTransport.RootChannel.UNKNOWN, dispatched, unknown, active))
+        }
       }
     }
   }

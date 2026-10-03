@@ -129,15 +129,51 @@ class OwnershipLeaseSettlementFixtureTest {
   @Test fun entryClearOnlyFiresOnDefiniteAbsenceAndIsGuardedByTheFence() {
     val entry = body("ShizukuTransport", "internal fun clearLeaseWhenNoRootChannel(")
     assertTrue(entry.contains("val probe = probeRootChannel(app)"))
-    // 自动清算＝通道被证实不存在 + 租约从未派发 + 无在飞维护（复审第 2 点）
+    // 自动清算＝通道被证实不存在 + 租约从未派发 + **租约状态可信** + 无在飞维护（复审第 2 点 + 第四轮）
     assertTrue(entry.contains("val dispatched = lease?.optBoolean(\"dispatched\") == true"))
-    assertTrue(entry.contains("autoClearAllowed(probe.state, dispatched, RootExecutionFence.maintenanceActive)"))
+    assertTrue(entry.contains("val leaseUnknown = lease?.optBoolean(\"unknown\") == true || RootMaintenanceLease.unknown(app)"))
+    assertTrue(entry.contains("autoClearAllowed(probe.state, dispatched, leaseUnknown, RootExecutionFence.maintenanceActive)"))
     assertTrue(entry.contains("if (!allowed) return false"))
-    assertTrue(entry.contains("LeaseClearProbe.record(app, probe, decisive = true, dispatched = dispatched, allowed = allowed)"))
-    // 锁内复核三条件（判断—清除之间通道可能复活 / 维护可能开始 / 租约可能刚被派发）
+    assertTrue(entry.contains("LeaseClearProbe.record(app, probe, decisive = true, dispatched = dispatched, allowed = allowed,"))
+    // 锁内复核四条件（判断—清除之间：通道可能复活 / 维护可能开始 / 租约可能刚被派发 / 租约状态可能变得不可信）
     assertTrue(entry.contains("!RootExecutionFence.maintenanceActive && !RootAccess.isGranted(app) &&"))
-    assertTrue(entry.contains("!RootMaintenanceLease.dispatched(app)"))
+    assertTrue(entry.contains("!RootMaintenanceLease.dispatched(app) && !RootMaintenanceLease.unknown(app)"))
     assertTrue(entry.contains("RootMaintenanceLease.clearWhenNoRootChannel(app)"))
+  }
+
+  @Test fun markDispatchedPersistenceFailureMustBlockAutomaticLeaseClear() {
+    // 复审第四轮点名的回归：markDispatched 落盘失败 ⇒ 只置 unknown、dispatched 仍是 false
+    // ⇒ 若只看 dispatched 就会放行自动清算（而特权 RPC 其实已经/即将派发）✗ ⇒ 必须被 unknown 明确否决。
+    // ① 纯判据层面：unknown=true 一律否决
+    assertFalse(ShizukuTransport.autoClearAllowed(ShizukuTransport.RootChannel.ABSENT, false, true, false))
+    // ② 失败时确实置 unknown（而不是静默当成功）
+    val mark = body("RootMaintenanceLease", "fun markDispatched(")
+    assertTrue(mark.contains("if (!written) {"))
+    assertTrue(mark.contains("unknown = true"))
+    assertTrue(mark.contains("return@synchronized false"))
+    // ③ 两条派发路径都必须**检查返回值并拒绝派发**（证据落不了盘就不跑特权工作）
+    assertTrue(source("ShizukuTransport").contains("if (!RootMaintenanceLease.markDispatched(context, \"shizuku\")) {"))
+    assertTrue(source("ShizukuTransport").contains("root-lease-evidence-unavailable"))
+    assertTrue(source("RootAccess").contains("!RootMaintenanceLease.markDispatched(context, \"su\")"))
+    assertTrue(source("RootAccess").contains("root-lease-evidence-unavailable"))
+    // ④ 最终清除路径必须把 unknown 带进判据与锁内 guard（不是只改纯函数）
+    val entry = body("ShizukuTransport", "internal fun clearLeaseWhenNoRootChannel(")
+    assertTrue(entry.contains("leaseUnknown"))
+    assertTrue(entry.contains("!RootMaintenanceLease.unknown(app)"))
+    // ⑤ 审计也要留下这个否决项，便于事后复核
+    assertTrue(body("LeaseClearProbe", "fun record(").contains(".put(\"leaseUnknown\", leaseUnknown)"))
+  }
+
+  @Test fun restoredLeaseFromAnotherProcessIsNeverAutoCleared() {
+    // 跨进程/进程重建：新进程恢复旧租约时 restore() 置 unknown=true（结算状态不可信、旧工作终止不可证）
+    val restore = body("RootMaintenanceLease", "private fun restore(")
+    assertTrue(restore.contains("unknown = pendingEpoch != null"))
+    assertFalse(ShizukuTransport.autoClearAllowed(ShizukuTransport.RootChannel.ABSENT, false, true, false))
+    // 但人工出口仍可用，且如实回 terminationUnproven（dispatched 或 unknown 任一为真即不可证）
+    val forced = body("ShizukuTransport", "internal fun forceClearMaintenanceLease(")
+    assertTrue(forced.contains("val unproven = dispatched || leaseUnknown"))
+    assertTrue(forced.contains("put(\"terminationUnproven\", unproven)"))
+    assertTrue(forced.contains("RootMaintenanceLease.clearWhenNoRootChannel(app)"))
   }
 
   @Test fun theSingleJudgeReallyAttemptsABindAndNeverFallsBackToUnreliableSignals() {
@@ -178,8 +214,8 @@ class OwnershipLeaseSettlementFixtureTest {
     assertTrue(forced.contains("\"maintenance-active\""))
     assertTrue(forced.contains("RootMaintenanceLease.clearWhenNoRootChannel(app)"))
     // 复审第 3 点：用户确认不是终止证明 —— 如实回 terminationUnproven 并写进审计
-    assertTrue(forced.contains("put(\"terminationUnproven\", dispatched)"))
-    assertTrue(forced.contains("forced = true, dispatched = dispatched, allowed = true"))
+    assertTrue(forced.contains("val unproven = dispatched || leaseUnknown"))
+    assertTrue(forced.contains("forced = true, dispatched = dispatched, allowed = false, leaseUnknown = leaseUnknown)"))
   }
 
   @Test fun leaseClearCommitIsBoundedRetriedInsteadOfLeavingAPermanentLease() {

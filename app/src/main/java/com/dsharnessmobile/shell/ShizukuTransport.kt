@@ -514,15 +514,23 @@ object ShizukuTransport {
   }
 
   /**
-   * 自动清算的**准入**（纯函数）：三个条件缺一不可 ——
-   * ①通道被**证实不存在**；②这条租约**从未派发**过特权工作（`dispatched=false`）；③进程内没有在飞维护。
+   * 自动清算的**准入**（纯函数）：四个条件缺一不可 ——
+   * ①通道被**证实不存在**；②这条租约**从未派发**过特权工作（`dispatched=false`）；
+   * ③**租约自身的结算/持久化状态可信**（`leaseUnknown=false`）；④进程内没有在飞维护。
    *
-   * ②是关键（复审第 2 点）：本模块的锁只覆盖**本进程**，`synchronized` 证明不了外部 su 子进程 /
-   * Shizuku UserService 已经退出（`RootMaintenanceLease` 文件头那句就是这个意思）。已派发的租约
-   * 一律保留（UNKNOWN），只能由用户在明示「终止无法证明」之后手工清除。
+   * ②③是关键：
+   * - ②（复审第 2 点）：本模块的锁只覆盖**本进程**，`synchronized` 证明不了外部 su 子进程 / Shizuku
+   *   UserService 已经退出。已派发的租约一律保留，只能由用户在明示「终止无法证明」之后手工清除。
+   * - ③（复审第四轮）：**「没有派发证据」≠「证明没有派发」**。`markDispatched` 持久化失败时只置了
+   *   unknown（`dispatched` 仍是 false ✗），本进程**恢复**别的进程留下的租约时 `restore()` 也置 unknown
+   *   ⇒ 这两种情况下 `dispatched=false` 可能意味着「证据没落盘」而不是「没派发过」⇒ 一律否决自动清算。
    */
-  internal fun autoClearAllowed(channel: RootChannel, dispatched: Boolean, maintenanceActive: Boolean): Boolean =
-    channel == RootChannel.ABSENT && !dispatched && !maintenanceActive
+  internal fun autoClearAllowed(
+    channel: RootChannel,
+    dispatched: Boolean,
+    leaseUnknown: Boolean,
+    maintenanceActive: Boolean,
+  ): Boolean = channel == RootChannel.ABSENT && !dispatched && !leaseUnknown && !maintenanceActive
 
   /**
    * 唯一的 root 通道判据（**两条消费面同源**：入口清算与维护 worker 都用它）。
@@ -610,13 +618,18 @@ object ShizukuTransport {
     val lease = RootMaintenanceLease.outstanding(app)
     val probe = probeRootChannel(app)
     val dispatched = lease?.optBoolean("dispatched") == true
-    val allowed = autoClearAllowed(probe.state, dispatched, RootExecutionFence.maintenanceActive)
-    LeaseClearProbe.record(app, probe, decisive = true, dispatched = dispatched, allowed = allowed)
+    // 复审第四轮：`unknown` 是**明确否决项**——「没有派发证据」≠「证明没有派发」
+    // （markDispatched 写不进时只置 unknown；恢复别的进程的租约也会 unknown）。
+    val leaseUnknown = lease?.optBoolean("unknown") == true || RootMaintenanceLease.unknown(app)
+    val allowed = autoClearAllowed(probe.state, dispatched, leaseUnknown, RootExecutionFence.maintenanceActive)
+    LeaseClearProbe.record(app, probe, decisive = true, dispatched = dispatched, allowed = allowed,
+      leaseUnknown = leaseUnknown)
     if (!allowed) return false
     return RootMaintenanceLease.clearWhenNoRootChannel(app) {
-      // 锁内复核（判断—清除之间）：通道可能复活、维护可能刚好开始、租约可能刚好被派发
+      // 锁内复核（判断—清除之间）：通道可能复活、维护可能刚好开始、租约可能刚被派发、
+      // 或租约状态刚变成不可信（unknown）⇒ 任一变化都不得清除。
       !RootExecutionFence.maintenanceActive && !RootAccess.isGranted(app) &&
-        !RootMaintenanceLease.dispatched(app)
+        !RootMaintenanceLease.dispatched(app) && !RootMaintenanceLease.unknown(app)
     }
   }
 
@@ -637,16 +650,22 @@ object ShizukuTransport {
     }
     val lease = RootMaintenanceLease.outstanding(app)
     val dispatched = lease?.optBoolean("dispatched") == true
+    val leaseUnknown = lease?.optBoolean("unknown") == true || RootMaintenanceLease.unknown(app)
     val cleared = RootMaintenanceLease.clearWhenNoRootChannel(app)
     LeaseClearProbe.record(app, RootChannelProbe(
       if (cleared) RootChannel.ABSENT else RootChannel.UNKNOWN, -1, "manual"), decisive = false,
-      forced = true, dispatched = dispatched, allowed = true)
-    return JSONObject().put("ok", cleared).put("cleared", cleared).put("terminationUnproven", dispatched)
+      // `allowed=false`：**自动清算准入没有通过**（本条是用户显式授权，不是自动判据放行）——
+      // 用 forced=true 区分人工；免得日志里出现「allowed 又 unknown」这种自相矛盾的读法。
+      forced = true, dispatched = dispatched, allowed = false, leaseUnknown = leaseUnknown)
+    // 复审第四轮：租约状态不可信时也**无法证明终止**（`dispatched=false` 恰恰可能是「证据没落盘」），
+    // 所以 terminationUnproven 必须把 unknown 也算进去。
+    val unproven = dispatched || leaseUnknown
+    return JSONObject().put("ok", cleared).put("cleared", cleared).put("terminationUnproven", unproven)
       .put("code", if (cleared) "lease-cleared" else "lease-clear-failed")
       .put("reason", if (cleared) "lease-cleared" else "lease-clear-failed")
       .put("guidance", when {
         !cleared -> "清除未成功（存储写入失败），请重试或重启设备。"
-        dispatched -> "已清除维护隔离并重试启动。注意：这条隔离记录里留有「已派发特权工作」的痕迹，本次无法证明那次工作已经结束——若随后出现异常，请重启设备再排查。"
+        unproven -> "已清除维护隔离并重试启动。注意：这条隔离记录的状态不可信（可能留有已派发的特权工作痕迹），本次无法证明那次工作已经结束——若随后出现异常，请重启设备再排查。"
         else -> "已清除维护隔离，正在重试启动。"
       })
   }
@@ -1006,9 +1025,14 @@ object ShizukuTransport {
       if (uid == 0 && !leased) {
         RootMaintenanceLease.begin(context, operation)?.let { return it }
         leased = true
-        // 派发证据（复审第 2 点）：从此这条租约**不能**再被自动清算——外部 UserService 是否退出，
-        // 本进程证明不了。标记写不进由 markDispatched 内部置为结果不明（保守方向）。
-        RootMaintenanceLease.markDispatched(context, "shizuku")
+        // 派发证据（复审第 2、4 点）：这条租约从此**不能**再被自动清算。证据**落不了盘就不派发**——
+        // 与 `begin()` 同一条纪律（"If durability cannot be established, do not launch privileged work"）：
+        // 只置 unknown 而照样派发，会让后续 `dispatched=false` 变成「证据没落盘」的假象 ⇒ 有误清风险 ✗。
+        if (!RootMaintenanceLease.markDispatched(context, "shizuku")) {
+          return complete(JSONObject().put("ok", false)
+            .put("code", "root-lease-evidence-unavailable").put("reason", "root-lease-evidence-unavailable")
+            .put("guidance", "无法把「已派发」证据落盘，本次不派发特权工作（避免以后误判为未派发）。"), definitive = false)
+        }
         // Persisting the lease is local setup: consent/actual identity must be current AFTER it.
         dispatchIdentity(context, remote, applyGate).second?.let { return complete(it) }
       }

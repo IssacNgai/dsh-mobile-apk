@@ -248,10 +248,14 @@ object RootAccess {
         return fail("root-grant-required", "AI root 权限未开启或当前版本的免责确认已失效。")
       }
       // Keep the same merged-output convention as the Shizuku shell route, with a hard byte cap.
-      // 派发证据（复审第 2 点）：只要此刻有维护租约在场，就把「已派发」写进租约 —— 外部 su 子进程
+      // 派发证据（复审第 2、4 点）：只要此刻有维护租约在场，就把「已派发」写进租约 —— 外部 su 子进程
       // 是否随本进程一起死，本进程证明不了，所以此后不允许自动清算（只能用户显式清除）。
-      if (RootMaintenanceLease.outstanding(context) != null) {
-        RootMaintenanceLease.markDispatched(context, "su")
+      // **证据落不了盘就不派发**：只置 unknown 却照样跑 su，会让后续 `dispatched=false` 变成
+      // 「证据没落盘」的假象 ⇒ 有误清风险（与 begin() 的耐久性纪律同源）。
+      if (RootMaintenanceLease.outstanding(context) != null &&
+        !RootMaintenanceLease.markDispatched(context, "su")) {
+        return fail("root-lease-evidence-unavailable",
+          "无法把「已派发」证据落盘，本次不派发特权工作（避免以后误判为未派发）。")
       }
       val process = ProcessBuilder(su, "-c", command).redirectErrorStream(true).start()
       val output = ProcIo.readBoundedMillis(process, timeout.toLong())

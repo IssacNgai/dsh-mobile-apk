@@ -161,10 +161,20 @@ internal object RootMaintenanceLease {
     cleared
   }
 
-  /** 当前租约是否带「已派发」证据（自动清算的唯一否决项）。 */
+  /** 当前租约是否带「已派发」证据（自动清算的否决项之一）。 */
   fun dispatched(context: Context): Boolean = synchronized(lock) {
     restore(context)
     dispatched.isNotEmpty()
+  }
+
+  /**
+   * 租约自身的**结算/持久化状态是否不可信**（`unknown`）——自动清算的第二个否决项（复审第四轮）：
+   * 「没有派发证据」≠「证明没有派发」。`markDispatched` 写不进（证据没落盘）、或本进程**恢复**了别的
+   * 进程留下的租约，都会让 `dispatched=false` 变得**不可采信** ⇒ 一律不清。
+   */
+  fun unknown(context: Context): Boolean = synchronized(lock) {
+    restore(context)
+    unknown
   }
 
   private fun refusalLocked(): JSONObject = JSONObject().put("ok", false)
