@@ -164,7 +164,7 @@ class RootGrantTest {
   @Test
   fun allShizukuCommandSurfacesAreFencedAndGatedBeforeDispatch() {
     val ready = body("ShizukuTransport.kt", "private fun readyService(")
-    assertBefore(ready, "if (applyGate) rootGateRefusal(context)", "ensureBound(context, requestPermission)")
+    assertBefore(ready, "if (applyGate) rootGateRefusal(context)", "ensureBound(context, requestPermission, ignoreGranted)")
     assertBefore(ready, "if (pv < ShizukuUserServiceBridge.PROTOCOL_VERSION)", "configureIfNeeded(context)")
     assertBefore(ready, "configureIfNeeded(context)", "if (applyGate) actualIdentityRefusal(context, remote)")
     assertBefore(ready, "actualIdentityRefusal(context, remote)", "return remote to null")
@@ -197,10 +197,14 @@ class RootGrantTest {
   @Test
   fun onlyFixedNativeOwnershipMaintenanceMayBypassAiGate() {
     val text = source("ShizukuTransport.kt")
-    assertEquals(1, Regex("""readyService\(context, applyGate = false\)""").findAll(text).count())
+    assertEquals(2, Regex("""readyService\((context|app), applyGate = false""").findAll(text).count())
     val repair = body("ShizukuTransport.kt", "fun repairOwnership(")
-    assertBefore(repair, "RootExecutionFence.maintenance", "readyService(context, applyGate = false)")
+    assertBefore(repair, "RootExecutionFence.maintenance", "readyService(context, applyGate = false, requestPermission = false)")
     assertBefore(repair, "configureIfNeeded(context)", "remote.repairOwnership(path, maxEntries)")
+    // 探测面那处豁免必须**只绑定、不执行**（2026-10-03 加：绕过不可信的客户端权限预检才能真正判通道）
+    val probeEnv = body("ShizukuTransport.kt", "private class SystemRootProbeEnv(")
+    assertTrue(probeEnv.contains("readyService(app, applyGate = false, requestPermission = false, ignoreGranted = true)"))
+    assertTrue(!probeEnv.contains("remote.exec(") && !probeEnv.contains("repairOwnership("))
     val direct = body("ShizukuTransport.kt", "internal fun autoHealOwnershipDirect(")
     // 2026-10-01：探测与残留租约清算移到 fence 之前（fence 入口会被残留租约挡住）；修复派发本体仍在 fence 内。
     assertTrue(direct.contains("return RootExecutionFence.maintenance(context) {"))

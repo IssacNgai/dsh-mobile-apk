@@ -273,18 +273,30 @@ internal class GuidePageRenderer(private val activity: MainActivity) {
    */
   private fun confirmClearMaintenanceLease(pending: org.json.JSONObject?) {
     val ctx = activity.applicationContext
+    val dispatched = pending?.optBoolean("dispatched") == true
+    val terminationNote = if (dispatched) {
+      "\n\n注意：这条隔离记录里有「已派发特权工作」的痕迹。清除它**不能证明**那次特权工作已经结束" +
+        "（应用侧看不到外部 su 子进程 / Shizuku 服务是否仍在跑）。如果清完之后出现异常，请重启设备再排查。"
+    } else {
+      ""
+    }
     runCatching {
       android.app.AlertDialog.Builder(activity)
         .setTitle("维护隔离尚未结算")
         .setMessage(
           (pending?.optString("guidance").orEmpty().ifBlank { "已有特权工作尚未结算，暂不修改运行时。" }) +
             "\n\n如果那条 root 通道（Shizuku / su）确实已经不存在，可以清除隔离标记后重试启动。" +
-            "清除只会丢掉隔离状态，不会改动任何文件属主。",
+            "清除只会丢掉隔离状态，不会改动任何文件属主。" + terminationNote,
         )
         .setPositiveButton("清除隔离并重试") { _, _ ->
           val result = ShizukuTransport.forceClearMaintenanceLease(ctx)
           if (result.optBoolean("ok")) {
-            pushHint("已清除维护隔离，正在重试启动。", HintSource.PHASE, sticky = false)
+            val unproven = result.optBoolean("terminationUnproven")
+            pushHint(
+              if (unproven) "已清除维护隔离，正在重试启动（该记录含已派发痕迹，终止无法证明；若异常请重启设备）。"
+              else "已清除维护隔离，正在重试启动。",
+              HintSource.PHASE, sticky = unproven,
+            )
             activity.engineFlow.engineRetryCount = 0
             activity.engineManager.clearRefreshLedger()
             activity.startEngineFlow()

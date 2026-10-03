@@ -6,91 +6,139 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * root 通道判据的**真值表**（纯函数，无设备、无反射）。
+ * 通道判据的真值表**与整条取数链**（复审 2026-10-02 第 5 点：不能只测纯函数）。
  *
- * 2026-10-02 复审后的口径：判据只有一条，用**真绑定结果**（`bindSucceeded` + `boundServiceUid`）当
- * 「本应用派发得出去」的实证 —— 本机 Shizuku 服务端 v13.6 上 `getUid()` 撤权后仍返回 0、
- * `checkSelfPermission()` 恒报 denied，两个廉价信号都不能作为授权依据。
+ * 这里用可注入的 [ShizukuTransport.RootProbeEnv] 跑**真实的 `probeRootChannel` 调用链**：
+ * 假环境记录「有没有真的去绑」「绑成什么样」，从而覆盖「权限面假阴性但通道其实可用」这类回归。
  */
 class RootChannelDecisionTest {
 
-  // ── rootChannelAvailable：已有真实取值时的可用判定 ─────────────────────────────
-
-  @Test fun suGrantAloneIsEnoughRegardlessOfShizuku() {
-    assertTrue(ShizukuTransport.rootChannelAvailable(true, -1, false))
-    assertTrue(ShizukuTransport.rootChannelAvailable(true, 2000, false))
-    assertTrue(ShizukuTransport.rootChannelAvailable(true, 0, false))
+  /** 记录调用痕迹的假环境。 */
+  private class FakeEnv(
+    override val suGranted: Boolean = false,
+    override val suBinaryPresent: Boolean = true,
+    override val shizukuInstalled: Boolean = true,
+    private val ping: Boolean? = true,
+    private val preBoundUid: Int? = null,
+    private val bindResult: ShizukuTransport.BindOutcome = ShizukuTransport.BindOutcome.DENIED,
+    private val postBindUid: Int? = null,
+  ) : ShizukuTransport.RootProbeEnv {
+    var bindCalls = 0
+    override fun binderPing(): Boolean? = ping
+    override fun boundServiceUid(): Int? = if (bindCalls > 0) postBindUid else preBoundUid
+    override fun bindUserService(): ShizukuTransport.BindOutcome { bindCalls++; return bindResult }
   }
 
-  @Test fun shizukuNeedsBOTHRootServiceAndConfirmedAvailability() {
-    assertTrue(ShizukuTransport.rootChannelAvailable(false, 0, true))
-    // 服务端是 root ≠ 本应用能派发
-    assertFalse(ShizukuTransport.rootChannelAvailable(false, 0, false))
-    // shell(2000) 服务端即便可用也不是 root 通道
-    assertFalse(ShizukuTransport.rootChannelAvailable(false, 2000, true))
-    assertFalse(ShizukuTransport.rootChannelAvailable(false, 2000, false))
-    // 读不到 uid(-1) 不得当成可用
-    assertFalse(ShizukuTransport.rootChannelAvailable(false, -1, true))
-    assertFalse(ShizukuTransport.rootChannelAvailable(false, -1, false))
-  }
+  private fun probe(env: ShizukuTransport.RootProbeEnv) = ShizukuTransport.probeRootChannel(env)
 
-  // ── decideNoRootChannel：唯一判据（绑定实证 + 三态）────────────────────────────
+  // ── 整条链：真绑定尝试（复审第 1、5.1、5.2、5.8 点）────────────────────────────
 
-  @Test fun boundRootServiceMeansAvailableBoundShellDoesNot() {
-    assertEquals(ShizukuTransport.RootChannel.AVAILABLE,
-      ShizukuTransport.decideNoRootChannel(true, true, true, 0, "", null))
-    assertEquals(ShizukuTransport.RootChannel.ABSENT,
-      ShizukuTransport.decideNoRootChannel(true, true, true, 2000, "", null))
-    assertEquals(ShizukuTransport.RootChannel.ABSENT,
-      ShizukuTransport.decideNoRootChannel(true, true, true, -1, "", null))
-  }
-
-  @Test fun revokedPermissionIsAbsentOnlyWhenTwoSignalsAgree() {
-    // 绑定失败 + 权限被拒 + 自检也明确未授权（两源一致）⇒ 肯定派发不了 ⇒ 允许清算
-    assertEquals(ShizukuTransport.RootChannel.ABSENT,
-      ShizukuTransport.decideNoRootChannel(true, true, false, -1, "shizuku-denied", false))
-    assertEquals(ShizukuTransport.RootChannel.ABSENT,
-      ShizukuTransport.decideNoRootChannel(true, true, false, -1, "shizuku-permission-requested", false))
-    // 权限被拒但自检读不到（矛盾/不可信）⇒ 保守保留隔离
-    assertEquals(ShizukuTransport.RootChannel.UNKNOWN,
-      ShizukuTransport.decideNoRootChannel(true, true, false, -1, "shizuku-denied", null))
-    assertEquals(ShizukuTransport.RootChannel.UNKNOWN,
-      ShizukuTransport.decideNoRootChannel(true, true, false, -1, "shizuku-denied", true))
-  }
-
-  @Test fun definitelyAbsentCodesAllowClearing() {
-    // 未安装 / 服务端没跑 / 版本过低 / UserService 协议过旧 ⇒ 肯定没有这条通道
-    assertEquals(ShizukuTransport.RootChannel.ABSENT,
-      ShizukuTransport.decideNoRootChannel(false, null, false, -1, "", null))
-    assertEquals(ShizukuTransport.RootChannel.ABSENT,
-      ShizukuTransport.decideNoRootChannel(true, false, false, -1, "", null))
-    assertEquals(ShizukuTransport.RootChannel.ABSENT,
-      ShizukuTransport.decideNoRootChannel(true, true, false, -1, "shizuku-prev11", null))
-    assertEquals(ShizukuTransport.RootChannel.ABSENT,
-      ShizukuTransport.decideNoRootChannel(true, true, false, -1, "shizuku-user-service-too-old", null))
-  }
-
-  @Test fun probeFailuresStayUnknownAndNeverTurnIntoAbsent() {
-    // binder 抛异常（冷启动未就绪）⇒ 未知
-    assertEquals(ShizukuTransport.RootChannel.UNKNOWN,
-      ShizukuTransport.decideNoRootChannel(true, null, false, -1, "", null))
-    // 绑定失败但原因不明（未绑定 / 配置未确认）⇒ 未知，保留隔离
-    assertEquals(ShizukuTransport.RootChannel.UNKNOWN,
-      ShizukuTransport.decideNoRootChannel(true, true, false, -1, "shizuku-user-service-not-bound", false))
-    assertEquals(ShizukuTransport.RootChannel.UNKNOWN,
-      ShizukuTransport.decideNoRootChannel(true, true, false, -1, "shizuku-configuration-required", false))
-  }
-
-  @Test fun unknownIsDistinctFromAbsentByConstruction() {
-    // 防回归：只要「读不到/说不清」被归成 ABSENT，`clearLeaseWhenNoRootChannel` 就会做不可逆清算。
-    val unknownPaths = listOf(
-      ShizukuTransport.decideNoRootChannel(true, null, false, -1, "", null),
-      ShizukuTransport.decideNoRootChannel(true, true, false, -1, "shizuku-denied", null),
-      ShizukuTransport.decideNoRootChannel(true, true, false, -1, "shizuku-user-service-not-bound", false),
+  @Test fun permissionFalseNegativeMustNotBlockTheRealBind() {
+    // 复审第 1 点的回归：权限面读成「未授权」时，**仍然必须真去绑定**；
+    // 绑上了且 uid 0 ⇒ AVAILABLE（而不是仅凭不可靠信号判 ABSENT ⇒ 误清隔离）。
+    val env = FakeEnv(
+      suGranted = false, ping = true,
+      bindResult = ShizukuTransport.BindOutcome.BOUND, postBindUid = 0,
     )
-    for (state in unknownPaths) {
-      assertEquals(ShizukuTransport.RootChannel.UNKNOWN, state)
-      assertFalse(state == ShizukuTransport.RootChannel.ABSENT)
+    val result = probe(env)
+    assertEquals(ShizukuTransport.RootChannel.AVAILABLE, result.state)
+    assertEquals(1, env.bindCalls)          // ★ 真绑过
+    assertTrue(result.detail.contains("bind=BOUND"))
+  }
+
+  @Test fun deniedPermissionSurfaceIsUnknownNotAbsent() {
+    // 复审第 1 点：客户端权限面自相矛盾/被拒 ⇒ **证明不了**通道不存在 ⇒ UNKNOWN（保留隔离）
+    val env = FakeEnv(bindResult = ShizukuTransport.BindOutcome.DENIED)
+    val result = probe(env)
+    assertEquals(ShizukuTransport.RootChannel.UNKNOWN, result.state)
+    assertEquals(1, env.bindCalls)          // 试过了
+    assertTrue(result.detail.contains("bind=DENIED"))
+  }
+
+  @Test fun alreadyBoundServiceShortCircuitsWithoutANewBind() {
+    val env = FakeEnv(preBoundUid = 0)
+    val result = probe(env)
+    assertEquals(ShizukuTransport.RootChannel.AVAILABLE, result.state)
+    assertEquals(0, env.bindCalls)          // 零代价路径：已有活绑定不再绑一次
+  }
+
+  @Test fun boundNonRootServiceIsTheOnlyPositiveAbsenceProofFromBinding() {
+    val env = FakeEnv(bindResult = ShizukuTransport.BindOutcome.BOUND, postBindUid = 2000)
+    val result = probe(env)
+    assertEquals(ShizukuTransport.RootChannel.ABSENT, result.state)
+  }
+
+  @Test fun serverDefinitelyAbsentIsAbsentAndNeverBinds() {
+    val env = FakeEnv(ping = false)
+    val result = probe(env)
+    assertEquals(ShizukuTransport.RootChannel.ABSENT, result.state)
+    assertEquals(0, env.bindCalls)          // 服务端不在 ⇒ 不必绑
+    assertTrue(result.detail.contains("bind=SERVER_ABSENT"))
+  }
+
+  @Test fun binderThrowStaysUnknownAndNeverBinds() {
+    // 复审第 5.7 点：探测过程中 binder 抛异常 ⇒ 绝不能误清
+    val env = FakeEnv(ping = null)
+    val result = probe(env)
+    assertEquals(ShizukuTransport.RootChannel.UNKNOWN, result.state)
+    assertEquals(0, env.bindCalls)
+    assertTrue(result.detail.contains("ping=throw"))
+  }
+
+  @Test fun bindTimeoutOrBinderThrowStaysUnknown() {
+    for (outcome in listOf(
+      ShizukuTransport.BindOutcome.TIMEOUT,
+      ShizukuTransport.BindOutcome.BINDER_THREW,
+      ShizukuTransport.BindOutcome.UNKNOWN,
+      ShizukuTransport.BindOutcome.NOT_ATTEMPTED,
+    )) {
+      assertEquals(outcome.toString(), ShizukuTransport.RootChannel.UNKNOWN, probe(FakeEnv(bindResult = outcome)).state)
+    }
+  }
+
+  @Test fun bothTransportsMissingIsTheStrongestAbsenceProof() {
+    assertEquals(ShizukuTransport.RootChannel.ABSENT,
+      probe(FakeEnv(shizukuInstalled = false, suBinaryPresent = false, ping = null)).state)
+    // 但「没装 Shizuku 却仍有 su 二进制」证明不了 ⇒ UNKNOWN
+    assertEquals(ShizukuTransport.RootChannel.UNKNOWN,
+      probe(FakeEnv(shizukuInstalled = false, suBinaryPresent = true, ping = null)).state)
+  }
+
+  // ── 纯判据真值表 ────────────────────────────────────────────────────────────
+
+  @Test fun decideTableCoversEveryOutcome() {
+    val d = { installed: Boolean, su: Boolean, ping: Boolean?, outcome: ShizukuTransport.BindOutcome, uid: Int ->
+      ShizukuTransport.decideNoRootChannel(installed, su, ping, outcome, uid)
+    }
+    val B = ShizukuTransport.BindOutcome.BOUND
+    assertEquals(ShizukuTransport.RootChannel.AVAILABLE, d(true, false, true, B, 0))
+    assertEquals(ShizukuTransport.RootChannel.ABSENT, d(true, true, true, B, 2000))
+    assertEquals(ShizukuTransport.RootChannel.ABSENT, d(false, false, null, ShizukuTransport.BindOutcome.NOT_ATTEMPTED, -1))
+    assertEquals(ShizukuTransport.RootChannel.UNKNOWN, d(false, true, null, ShizukuTransport.BindOutcome.NOT_ATTEMPTED, -1))
+    assertEquals(ShizukuTransport.RootChannel.ABSENT, d(true, true, false, ShizukuTransport.BindOutcome.SERVER_ABSENT, -1))
+    assertEquals(ShizukuTransport.RootChannel.ABSENT, d(true, true, true, ShizukuTransport.BindOutcome.PROTOCOL_TOO_OLD, -1))
+    assertEquals(ShizukuTransport.RootChannel.UNKNOWN, d(true, true, true, ShizukuTransport.BindOutcome.DENIED, -1))
+    assertEquals(ShizukuTransport.RootChannel.UNKNOWN, d(true, true, null, ShizukuTransport.BindOutcome.TIMEOUT, -1))
+  }
+
+  // ── 自动清算准入（复审第 2、5.3、5.5 点）──────────────────────────────────────
+
+  @Test fun autoClearNeedsAbsentChannelPlusNoDispatchEvidencePlusNoLiveMaintenance() {
+    assertTrue(ShizukuTransport.autoClearAllowed(ShizukuTransport.RootChannel.ABSENT, false, false))
+    // 已派发过 ⇒ 一律否决（外部工作是否结束，本进程证明不了）
+    assertFalse(ShizukuTransport.autoClearAllowed(ShizukuTransport.RootChannel.ABSENT, true, false))
+    // 进程内有在飞维护 ⇒ 否决
+    assertFalse(ShizukuTransport.autoClearAllowed(ShizukuTransport.RootChannel.ABSENT, false, true))
+    // 通道还在/说不清 ⇒ 否决
+    assertFalse(ShizukuTransport.autoClearAllowed(ShizukuTransport.RootChannel.AVAILABLE, false, false))
+    assertFalse(ShizukuTransport.autoClearAllowed(ShizukuTransport.RootChannel.UNKNOWN, false, false))
+  }
+
+  @Test fun unknownChannelIsNeverAutoClearedUnderAnyEvidenceCombination() {
+    for (dispatched in listOf(false, true)) {
+      for (active in listOf(false, true)) {
+        assertFalse(ShizukuTransport.autoClearAllowed(ShizukuTransport.RootChannel.UNKNOWN, dispatched, active))
+      }
     }
   }
 }

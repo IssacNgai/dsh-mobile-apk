@@ -19,11 +19,20 @@ internal object LeaseClearProbe {
 
   /**
    * @param context 应用上下文（写 filesDir）
-   * @param probe 判定结果与原始信号明细
-   * @param decisive 是否来自决定性探测（`decisiveChannelState`）；false = 用户强制清除等
+   * @param probe 判定结果与原始信号明细（含 `bind=` 取值，让「压根没尝试绑定」一眼可见）
+   * @param decisive 是否来自决定性探测（`probeRootChannel`）；false = 用户强制清除等
    * @param forced 是否用户显式确认的强制清除
+   * @param dispatched 租约是否带「已派发特权工作」痕迹（自动清算的否决项）
+   * @param allowed 自动清算准入判定结果（三条件是否同时满足）
    */
-  fun record(context: Context, probe: ShizukuTransport.RootChannelProbe, decisive: Boolean, forced: Boolean = false) {
+  fun record(
+    context: Context,
+    probe: ShizukuTransport.RootChannelProbe,
+    decisive: Boolean,
+    forced: Boolean = false,
+    dispatched: Boolean = false,
+    allowed: Boolean = false,
+  ) {
     runCatching {
       val file = File(context.filesDir, FILE_NAME)
       if (file.length() > MAX_BYTES) file.delete()
@@ -33,6 +42,8 @@ internal object LeaseClearProbe {
         .put("serverUid", probe.serverUid)
         .put("decisive", decisive)
         .put("forced", forced)
+        .put("dispatched", dispatched)
+        .put("allowed", allowed)
         .put("detail", probe.detail)
         .toString()
       file.appendText(line + "\n")

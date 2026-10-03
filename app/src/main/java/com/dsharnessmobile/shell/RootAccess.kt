@@ -248,6 +248,11 @@ object RootAccess {
         return fail("root-grant-required", "AI root 权限未开启或当前版本的免责确认已失效。")
       }
       // Keep the same merged-output convention as the Shizuku shell route, with a hard byte cap.
+      // 派发证据（复审第 2 点）：只要此刻有维护租约在场，就把「已派发」写进租约 —— 外部 su 子进程
+      // 是否随本进程一起死，本进程证明不了，所以此后不允许自动清算（只能用户显式清除）。
+      if (RootMaintenanceLease.outstanding(context) != null) {
+        RootMaintenanceLease.markDispatched(context, "su")
+      }
       val process = ProcessBuilder(su, "-c", command).redirectErrorStream(true).start()
       val output = ProcIo.readBoundedMillis(process, timeout.toLong())
       val exit = if (output.exitTimedOut) -1 else runCatching { process.exitValue() }.getOrDefault(-1)

@@ -276,10 +276,16 @@ object ShizukuTransport {
   }
 
   /** Establish the UserService on an explicit user action. */
-  fun ensureBound(context: Context, requestPermission: Boolean = true): JSONObject {
+  fun ensureBound(
+    context: Context,
+    requestPermission: Boolean = true,
+    ignoreGranted: Boolean = false,
+  ): JSONObject {
     val before = status(context)
     if (!before.optBoolean("installed") || !before.optBoolean("running")) return before
-    if (!before.optBoolean("granted")) {
+    // ignoreGranted=true 只给**探测面**用（复审第 1 点）：`checkSelfPermission()` 在本机恒报 denied，
+    // 若在这里就返回，探测就永远没真绑过，判据只能退回那个已证明不可靠的信号 ⇒ 误清隔离的风险。
+    if (!ignoreGranted && !before.optBoolean("granted")) {
       // requestPermission=false：**只探测、不弹框**（2026-10-02 复审实测：本机 checkSelfPermission()
       // 假阴性恒为 false ⇒ 无脑发请求会把启动卡在系统确认框上；探测面绝不能有 UI 副作用）。
       if (!requestPermission) {
@@ -384,7 +390,9 @@ object ShizukuTransport {
    */
   fun repairOwnership(context: Context, path: String, maxEntries: Int = 20_000): JSONObject =
     RootExecutionFence.maintenance(context) {
-      val (remote, refusal) = readyService(context, applyGate = false)
+      // 后台自愈面：**不弹授权框**（requestPermission=false）——本机 checkSelfPermission() 有假阴性，
+    // 若在这里发起请求，维护会卡在系统确认页上（2026-10-02 真机实测，同一根因见坑位 241）。
+    val (remote, refusal) = readyService(context, applyGate = false, requestPermission = false)
       if (remote == null) return@maintenance refusal ?: unavailableShell()
       if (!configureIfNeeded(context)) return@maintenance JSONObject().put("ok", false)
         .put("code", "repair-configuration-required").put("reason", "repair-configuration-required")
@@ -452,37 +460,69 @@ object ShizukuTransport {
     "shizuku-absent", "shizuku-not-running", "shizuku-prev11", "shizuku-user-service-too-old",
   )
 
-  /** 拒绝码里「权限被拒」的那一组（本应用未获授权）。 */
+  /** 权限面拒绝码——**只用于解释与审计**，不再作为「通道不存在」的证据（复审第 1 点）。 */
   private val PERMISSION_DENIED_CODES = setOf("shizuku-denied", "shizuku-permission-requested")
 
   /**
-   * 残留租约清算的**决定性判据**（纯函数，真值表见 `RootChannelDecisionTest`）。
+   * 真绑定尝试的结果（探测的**原始信号**，不经任何不可靠 API 转述）。
+   * [NOT_ATTEMPTED] 是独立取值——它让「压根没真去绑」在审计里一眼可见（复审第 1、4 点）。
+   */
+  internal enum class BindOutcome { NOT_ATTEMPTED, BOUND, DENIED, SERVER_ABSENT, PROTOCOL_TOO_OLD, TIMEOUT, BINDER_THREW, UNKNOWN }
+
+  /**
+   * 探测环境（**可注入**）：生产实现走 Shizuku binder，测试注入假实现 ⇒「真绑定尝试 → 判据 →
+   * 自动清算准入」整条链能在离线单测里跑（复审第 5.8 点），而不是只测纯函数。
+   */
+  internal interface RootProbeEnv {
+    val suGranted: Boolean
+    val suBinaryPresent: Boolean
+    val shizukuInstalled: Boolean
+    /** null = 抛异常（binder 未就绪）。 */
+    fun binderPing(): Boolean?
+    /** 已有活绑定的 UserService uid（零代价路径）；没有则 null。 */
+    fun boundServiceUid(): Int?
+    /** **真正**尝试绑定 UserService（不弹框、不因 `checkSelfPermission()` 假阴性而跳过）。 */
+    fun bindUserService(): BindOutcome
+  }
+
+  /**
+   * 通道判据（纯函数，真值表 `RootChannelDecisionTest`）——**安全优先**：只有能**证明**通道不存在
+   * 才给 ABSENT；证明不了一律 UNKNOWN。
    *
-   * 与 worker 用的 [classifyRootChannel] 分工不同：worker 只决定「要不要跑维护」（廉价、可保守）；
-   * 这里决定「要不要**不可逆地**清掉隔离」，所以用**真绑定结果**（`bindSucceeded` + `boundServiceUid`）
-   * 当实证——`getUid()` 在本机服务端 v13.6 上撤权后仍返回 0，不能当授权依据。
-   *
-   * 绑定失败时只在「权限被拒 **且** 自检也明确未授权」才判 ABSENT（两源一致）；绑定进行中/原因不明
-   * 一律 UNKNOWN（保留隔离），避免把一次绑定抖动换成误清。
+   * 复审第 1 点的教训：曾经的实现里「`status.granted == false` ⇒ 直接返回 denied、**根本没尝试绑定**」
+   * ⇒ 本机 `checkSelfPermission()` 假阴性时会把**真实存在的 root 通道**判成 ABSENT ⇒ 误清隔离。
+   * 现在 `DENIED` 只算 UNKNOWN（客户端权限面不可信），只有三类算证明：
+   * ①真绑上了且**非 root uid**；②两条通道在场面上都不存在（未装 Shizuku 且无 su 二进制）；
+   * ③服务端明确不在（ping=false）或协议明确不支持。
    */
   internal fun decideNoRootChannel(
     shizukuInstalled: Boolean,
+    suBinaryPresent: Boolean,
     binderPing: Boolean?,
-    bindSucceeded: Boolean,
-    boundServiceUid: Int,
-    bindRefusalCode: String,
-    selfPermissionGranted: Boolean?,
+    bindOutcome: BindOutcome,
+    boundUid: Int,
   ): RootChannel = when {
-    !shizukuInstalled -> RootChannel.ABSENT
+    bindOutcome == BindOutcome.BOUND ->
+      if (boundUid == RootGrant.ROOT_UID) RootChannel.AVAILABLE else RootChannel.ABSENT
+    !shizukuInstalled && !suBinaryPresent -> RootChannel.ABSENT
+    !shizukuInstalled -> RootChannel.UNKNOWN
+    bindOutcome == BindOutcome.SERVER_ABSENT -> RootChannel.ABSENT
+    bindOutcome == BindOutcome.PROTOCOL_TOO_OLD -> RootChannel.ABSENT
+    // DENIED / TIMEOUT / BINDER_THREW / NOT_ATTEMPTED / ping 抛异常：都证明不了 ⇒ 保留隔离
     binderPing == null -> RootChannel.UNKNOWN
-    binderPing == false -> RootChannel.ABSENT
-    // 真绑上了：按服务端实际身份判——uid 0 才算 root 通道，shell(2000) 不具备 root 通道
-    bindSucceeded -> if (boundServiceUid == RootGrant.ROOT_UID) RootChannel.AVAILABLE else RootChannel.ABSENT
-    bindRefusalCode in PERMISSION_DENIED_CODES ->
-      if (selfPermissionGranted == false) RootChannel.ABSENT else RootChannel.UNKNOWN
-    bindRefusalCode in ABSENT_CODES -> RootChannel.ABSENT
     else -> RootChannel.UNKNOWN
   }
+
+  /**
+   * 自动清算的**准入**（纯函数）：三个条件缺一不可 ——
+   * ①通道被**证实不存在**；②这条租约**从未派发**过特权工作（`dispatched=false`）；③进程内没有在飞维护。
+   *
+   * ②是关键（复审第 2 点）：本模块的锁只覆盖**本进程**，`synchronized` 证明不了外部 su 子进程 /
+   * Shizuku UserService 已经退出（`RootMaintenanceLease` 文件头那句就是这个意思）。已派发的租约
+   * 一律保留（UNKNOWN），只能由用户在明示「终止无法证明」之后手工清除。
+   */
+  internal fun autoClearAllowed(channel: RootChannel, dispatched: Boolean, maintenanceActive: Boolean): Boolean =
+    channel == RootChannel.ABSENT && !dispatched && !maintenanceActive
 
   /**
    * 唯一的 root 通道判据（**两条消费面同源**：入口清算与维护 worker 都用它）。
@@ -493,30 +533,58 @@ object ShizukuTransport {
    * `remote.uid()`**（[readyService] 的 `applyGate = false` 面，只在确有需要时调用）。
    * 判定交给纯函数 [decideNoRootChannel]，保证与真值表同源。
    */
-  internal fun probeRootChannel(context: Context): RootChannelProbe {
-    val app = context.applicationContext
-    if (RootAccess.isGranted(app)) return RootChannelProbe(RootChannel.AVAILABLE, -1, "su=granted")
-    if (!installed(app)) return RootChannelProbe(RootChannel.ABSENT, -1, "installed=false")
-    val ping: Boolean? = try { Shizuku.pingBinder() } catch (_: Throwable) { null }
-    if (ping != true) {
-      val state = decideNoRootChannel(true, ping, false, -1, "", null)
-      return RootChannelProbe(state, -1, "installed=true ping=" + (ping?.toString() ?: "throw"))
+  internal fun probeRootChannel(context: Context): RootChannelProbe =
+    probeRootChannel(SystemRootProbeEnv(context.applicationContext))
+
+  internal fun probeRootChannel(env: RootProbeEnv): RootChannelProbe {
+    if (env.suGranted) return RootChannelProbe(RootChannel.AVAILABLE, -1, "su=granted")
+    val ping = env.binderPing()
+    val already = if (ping == true) env.boundServiceUid() else null
+    val outcome = when {
+      already != null -> BindOutcome.BOUND
+      ping == false -> BindOutcome.SERVER_ABSENT
+      ping == null -> BindOutcome.NOT_ATTEMPTED
+      else -> env.bindUserService()
     }
-    // 探测面**不弹框**（requestPermission=false）：本机 checkSelfPermission() 假阴性恒 false，
-    // 若在此发起授权请求，启动会被系统确认框卡死（2026-10-02 真机实测）。
-    val (remote, refusal) = readyService(app, applyGate = false, requestPermission = false)
-    val code = refusal?.optString("code").orEmpty()
-    if (remote != null) {
-      val uid = runCatching { remote.uid() }.getOrDefault(-1)
-      val state = decideNoRootChannel(true, true, true, uid, "", null)
-      return RootChannelProbe(state, uid, "installed=true ping=true bind=true uid=$uid")
+    val uid = if (outcome == BindOutcome.BOUND) (already ?: env.boundServiceUid() ?: -1) else -1
+    val state = decideNoRootChannel(env.shizukuInstalled, env.suBinaryPresent, ping, outcome, uid)
+    return RootChannelProbe(state, uid, "installed=" + env.shizukuInstalled + " suBinary=" + env.suBinaryPresent +
+      " ping=" + (ping?.toString() ?: "throw") + " bind=" + outcome.name + " uid=" + uid)
+  }
+
+  /** 把 `readyService` 的拒绝码归成 [BindOutcome]（原始信号，不做「不可靠 ⇒ 不存在」的转述）。 */
+  private fun classifyBindOutcome(refusal: JSONObject?): BindOutcome {
+    if (refusal == null) return BindOutcome.BOUND
+    val code = refusal.optString("code")
+    return when {
+      code == "shizuku-not-running" || code == "shizuku-absent" -> BindOutcome.SERVER_ABSENT
+      code == "shizuku-prev11" || code == "shizuku-user-service-too-old" -> BindOutcome.PROTOCOL_TOO_OLD
+      code in PERMISSION_DENIED_CODES -> BindOutcome.DENIED
+      code.startsWith("shizuku-user-service-bind-failed:") -> BindOutcome.BINDER_THREW
+      code == ShizukuBindCodes.CONNECTING || code == ShizukuBindCodes.NOT_BOUND ||
+        code == ShizukuBindCodes.BIND_TIMEOUT || code == ShizukuBindCodes.INVALID_BINDER ||
+        code == ShizukuBindCodes.DISCONNECTED -> BindOutcome.TIMEOUT
+      else -> BindOutcome.UNKNOWN
     }
-    val selfGranted: Boolean? = try {
-      Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
-    } catch (_: Throwable) { null }
-    val state = decideNoRootChannel(true, true, false, -1, code, selfGranted)
-    return RootChannelProbe(state, -1, "installed=true ping=true bind=false code=" +
-      (code.ifBlank { "?" }) + " self=" + (selfGranted?.toString() ?: "throw"))
+  }
+
+  /** 生产探测环境：真 binder 调用；**不弹框**、**不因自检假阴性跳过绑定**（复审第 1 点两条硬约束）。 */
+  private class SystemRootProbeEnv(private val app: Context) : RootProbeEnv {
+    override val suGranted: Boolean get() = RootAccess.isGranted(app)
+    override val suBinaryPresent: Boolean get() = RootAccess.suPath() != null
+    override val shizukuInstalled: Boolean get() = installed(app)
+    override fun binderPing(): Boolean? = try { Shizuku.pingBinder() } catch (_: Throwable) { null }
+    override fun boundServiceUid(): Int? {
+      val bound = service ?: return null
+      if (bound.asBinder()?.pingBinder() != true) return null
+      return runCatching { bound.uid() }.getOrNull()
+    }
+    override fun bindUserService(): BindOutcome {
+      // requestPermission=false：探测面绝不弹授权框（真机实测会把启动卡在系统确认页）；
+      // ignoreGranted=true：**绕过不可信的客户端权限预检**，真正去尝试绑定（复审第 1 点的正解）。
+      val (remote, refusal) = readyService(app, applyGate = false, requestPermission = false, ignoreGranted = true)
+      return if (remote == null) classifyBindOutcome(refusal) else BindOutcome.BOUND
+    }
   }
 
   /**
@@ -539,17 +607,26 @@ object ShizukuTransport {
    */
   internal fun clearLeaseWhenNoRootChannel(context: Context): Boolean {
     val app = context.applicationContext
+    val lease = RootMaintenanceLease.outstanding(app)
     val probe = probeRootChannel(app)
-    LeaseClearProbe.record(app, probe, decisive = true)
-    if (probe.state != RootChannel.ABSENT) return false
+    val dispatched = lease?.optBoolean("dispatched") == true
+    val allowed = autoClearAllowed(probe.state, dispatched, RootExecutionFence.maintenanceActive)
+    LeaseClearProbe.record(app, probe, decisive = true, dispatched = dispatched, allowed = allowed)
+    if (!allowed) return false
     return RootMaintenanceLease.clearWhenNoRootChannel(app) {
-      !RootExecutionFence.maintenanceActive && !RootAccess.isGranted(app)
+      // 锁内复核（判断—清除之间）：通道可能复活、维护可能刚好开始、租约可能刚好被派发
+      !RootExecutionFence.maintenanceActive && !RootAccess.isGranted(app) &&
+        !RootMaintenanceLease.dispatched(app)
     }
   }
 
   /**
-   * 用户显式确认后的清除出口（引导页「清除维护隔离并重试」）：**不看通道判据**（用户已判定那条
-   * 通道是死的），但仍拒绝在维护在飞时清除（那会把 worker 的 finish 变成 lease-clear-failed）。
+   * 用户显式确认后的清除出口（引导页「清除维护隔离并重试」）。
+   *
+   * **语义边界（复审第 3 点）**：用户确认**不是**「旧特权任务已结束」的技术证明 —— 本函数只在
+   * 一条证据上把关：进程内确有在飞维护时**拒绝**（那会破坏在飞结算）；对「已派发但结果不明」的
+   * 租约，它照清，但把 `terminationUnproven=true` 如实回给调用方并写进审计，由引导页向用户讲明。
+   * 也就是说：**自动**清算要求证明（[autoClearAllowed]），**人工**清算是明确授权的取舍并留痕。
    */
   internal fun forceClearMaintenanceLease(context: Context): JSONObject {
     val app = context.applicationContext
@@ -558,13 +635,20 @@ object ShizukuTransport {
         .put("reason", "maintenance-active")
         .put("guidance", "维护正在运行，请等它结束再清除隔离（当前清除会破坏在飞结算）。")
     }
+    val lease = RootMaintenanceLease.outstanding(app)
+    val dispatched = lease?.optBoolean("dispatched") == true
     val cleared = RootMaintenanceLease.clearWhenNoRootChannel(app)
     LeaseClearProbe.record(app, RootChannelProbe(
-      if (cleared) RootChannel.ABSENT else RootChannel.UNKNOWN, -1), decisive = false, forced = true)
-    return JSONObject().put("ok", cleared).put("cleared", cleared)
+      if (cleared) RootChannel.ABSENT else RootChannel.UNKNOWN, -1, "manual"), decisive = false,
+      forced = true, dispatched = dispatched, allowed = true)
+    return JSONObject().put("ok", cleared).put("cleared", cleared).put("terminationUnproven", dispatched)
       .put("code", if (cleared) "lease-cleared" else "lease-clear-failed")
       .put("reason", if (cleared) "lease-cleared" else "lease-clear-failed")
-      .put("guidance", if (cleared) "已清除维护隔离，正在重试启动。" else "清除未成功（存储写入失败），请重试或重启设备。")
+      .put("guidance", when {
+        !cleared -> "清除未成功（存储写入失败），请重试或重启设备。"
+        dispatched -> "已清除维护隔离并重试启动。注意：这条隔离记录里留有「已派发特权工作」的痕迹，本次无法证明那次工作已经结束——若随后出现异常，请重启设备再排查。"
+        else -> "已清除维护隔离，正在重试启动。"
+      })
   }
 
   /** Shared Activity/Service startup guard; coalesce near-simultaneous completed scans only. */
@@ -653,6 +737,7 @@ object ShizukuTransport {
     context: Context,
     applyGate: Boolean = true,
     requestPermission: Boolean = true,
+    ignoreGranted: Boolean = false,
   ): Pair<ShizukuUserService?, JSONObject?> {
     // issue #262 方案 A 策略门（runShell/pullFile/pushFile/removeRemote 四个执行面的共同入口）：
     // 通道身份为 root 且未授权时，在**发起任何绑定/执行之前**拒绝——不是按 op 分类放行，
@@ -662,7 +747,7 @@ object ShizukuTransport {
     // 属主修回应用自己的 uid，不是模型能力、也不构成权限放大；被自己的策略门挡住会让
     // 「root 通道 + AI 未授权」这一组合失去自愈能力（文档已如此承诺，实现必须一致）。
     if (applyGate) rootGateRefusal(context)?.let { return null to it }
-    val ready = ensureBound(context, requestPermission)
+    val ready = ensureBound(context, requestPermission, ignoreGranted)
     if (!ready.optBoolean("ok")) return null to ready
     val remote = service
     if (remote == null || remote.asBinder()?.pingBinder() != true) {
@@ -921,6 +1006,9 @@ object ShizukuTransport {
       if (uid == 0 && !leased) {
         RootMaintenanceLease.begin(context, operation)?.let { return it }
         leased = true
+        // 派发证据（复审第 2 点）：从此这条租约**不能**再被自动清算——外部 UserService 是否退出，
+        // 本进程证明不了。标记写不进由 markDispatched 内部置为结果不明（保守方向）。
+        RootMaintenanceLease.markDispatched(context, "shizuku")
         // Persisting the lease is local setup: consent/actual identity must be current AFTER it.
         dispatchIdentity(context, remote, applyGate).second?.let { return complete(it) }
       }

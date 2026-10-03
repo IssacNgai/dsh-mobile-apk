@@ -128,23 +128,48 @@ class OwnershipLeaseSettlementFixtureTest {
 
   @Test fun entryClearOnlyFiresOnDefiniteAbsenceAndIsGuardedByTheFence() {
     val entry = body("ShizukuTransport", "internal fun clearLeaseWhenNoRootChannel(")
-    // 判据必须是**唯一那个决定性探测**（真绑定），不是 getUid 可读性那个替身
     assertTrue(entry.contains("val probe = probeRootChannel(app)"))
-    assertTrue(entry.contains("if (probe.state != RootChannel.ABSENT) return false"))
-    assertTrue(entry.contains("LeaseClearProbe.record(app, probe, decisive = true)"))
-    assertTrue(entry.contains("!RootExecutionFence.maintenanceActive && !RootAccess.isGranted(app)"))
+    // 自动清算＝通道被证实不存在 + 租约从未派发 + 无在飞维护（复审第 2 点）
+    assertTrue(entry.contains("val dispatched = lease?.optBoolean(\"dispatched\") == true"))
+    assertTrue(entry.contains("autoClearAllowed(probe.state, dispatched, RootExecutionFence.maintenanceActive)"))
+    assertTrue(entry.contains("if (!allowed) return false"))
+    assertTrue(entry.contains("LeaseClearProbe.record(app, probe, decisive = true, dispatched = dispatched, allowed = allowed)"))
+    // 锁内复核三条件（判断—清除之间通道可能复活 / 维护可能开始 / 租约可能刚被派发）
+    assertTrue(entry.contains("!RootExecutionFence.maintenanceActive && !RootAccess.isGranted(app) &&"))
+    assertTrue(entry.contains("!RootMaintenanceLease.dispatched(app)"))
     assertTrue(entry.contains("RootMaintenanceLease.clearWhenNoRootChannel(app)"))
   }
 
-  @Test fun theSingleJudgeUsesARealBindAndNeverUidReadability() {
-    val probe = body("ShizukuTransport", "internal fun probeRootChannel(")
-    assertTrue(probe.contains("readyService(app, applyGate = false, requestPermission = false)"))
-    assertTrue(probe.contains("remote.uid()"))
+  @Test fun theSingleJudgeReallyAttemptsABindAndNeverFallsBackToUnreliableSignals() {
+    // 取「吃 RootProbeEnv 的那个实现」——同名重载（Context 版只是委派）不能算数
+    val probe = body("ShizukuTransport", "internal fun probeRootChannel(env: RootProbeEnv): RootChannelProbe {")
+    assertTrue(probe.contains("env.bindUserService()"))
+    assertTrue(probe.contains("env.boundServiceUid()"))
     assertTrue(probe.contains("decideNoRootChannel("))
-    // review 的核心：撤权后 getUid() 仍返回 0，不能再用它当「已授权」的依据
+    // 复审第 1 点：判据不得退回两个已证明不可靠的信号
     assertFalse(probe.contains("getUid()"))
+    assertFalse(probe.contains("checkSelfPermission"))
+    // 真绑定在环境实现里，且必须**绕过**不可信的客户端权限预检、且不弹框
+    val env = body("ShizukuTransport", "private class SystemRootProbeEnv(")
+    assertTrue(env.contains("ignoreGranted = true"))
+    assertTrue(env.contains("requestPermission = false"))
+    assertTrue(env.contains("readyService(app, applyGate = false"))
+    // ensureBound 必须真的支持这条绕过路径（否则又回到「granted=false 就直接返回」）
+    val bound = body("ShizukuTransport", "fun ensureBound(")
+    assertTrue(bound.contains("ignoreGranted: Boolean = false"))
+    assertTrue(bound.contains("if (!ignoreGranted && !before.optBoolean(\"granted\"))"))
     // worker 与入口消费的是同一个探测（判据同源）
     assertTrue(body("ShizukuTransport", "internal fun autoHealOwnershipDirect(").contains("probeRootChannel(app)"))
+  }
+
+  @Test fun dispatchEvidenceIsRecordedOnBothTransports() {
+    // 复审第 2 点：派发过就必须留痕，让自动清算永久让位于「外部工作可能仍在跑」
+    assertTrue(body("RootAccess", "private fun execPrivileged(").contains("RootMaintenanceLease.markDispatched(context, \"su\")"))
+    assertTrue(source("ShizukuTransport").contains("RootMaintenanceLease.markDispatched(context, \"shizuku\")"))
+    val lease = body("RootMaintenanceLease", "fun markDispatched(")
+    assertTrue(lease.contains("putString(KEY_DISPATCHED, transport.take(24))"))
+    // 标记写不进 ⇒ 置为结果不明（保守方向），绝不当作「没派发过」
+    assertTrue(lease.contains("unknown = true"))
   }
 
   @Test fun forcedClearRefusesWhileMaintenanceIsActive() {
@@ -152,12 +177,37 @@ class OwnershipLeaseSettlementFixtureTest {
     assertTrue(forced.contains("if (RootExecutionFence.maintenanceActive)"))
     assertTrue(forced.contains("\"maintenance-active\""))
     assertTrue(forced.contains("RootMaintenanceLease.clearWhenNoRootChannel(app)"))
+    // 复审第 3 点：用户确认不是终止证明 —— 如实回 terminationUnproven 并写进审计
+    assertTrue(forced.contains("put(\"terminationUnproven\", dispatched)"))
+    assertTrue(forced.contains("forced = true, dispatched = dispatched, allowed = true"))
   }
 
   @Test fun leaseClearCommitIsBoundedRetriedInsteadOfLeavingAPermanentLease() {
     val lease = body("RootMaintenanceLease", "fun clearWhenNoRootChannel(")
     assertTrue(lease.contains("for (attempt in 1..2)"))
     assertTrue(lease.contains("if (cleared) break"))
+    // 复审第 5.6 点：commit 失败后内存状态必须仍然「有租约」（否则会出现「盘上还在、内存说清了」的错位）
+    assertTrue(lease.contains("if (cleared) {"))
+    assertTrue(lease.contains("pendingEpoch = null"))
+  }
+
+  @Test fun backgroundSelfHealNeverRaisesAPermissionDialog() {
+    // 后台自愈（repairOwnership）必须在取服务时就禁掉授权请求：否则本机假阴性会让维护卡在系统框上
+    val repair = body("ShizukuTransport", "fun repairOwnership(")
+    assertTrue(repair.contains("readyService(context, applyGate = false, requestPermission = false)"))
+    assertFalse(repair.contains("Shizuku.requestPermission"))
+  }
+
+  @Test fun auditTrailKeepsRawSignalsAndWhetherABindWasEvenAttempted() {
+    // 复审第 4 点：日志要能一眼区分「没尝试 bind / bind 失败 / 权限拒绝 / binder 未就绪 / 真绑成功」
+    val probe = body("ShizukuTransport", "internal fun probeRootChannel(env: RootProbeEnv): RootChannelProbe {")
+    assertTrue(probe.contains("\" bind=\" + outcome.name"))
+    assertTrue(probe.contains("\" ping=\" + (ping?.toString() ?: \"throw\")"))
+    assertTrue(probe.contains("\" suBinary=\" + env.suBinaryPresent"))
+    val audit = body("LeaseClearProbe", "fun record(")
+    assertTrue(audit.contains(".put(\"dispatched\", dispatched)"))
+    assertTrue(audit.contains(".put(\"allowed\", allowed)"))
+    assertTrue(audit.contains(".put(\"detail\", probe.detail)"))
   }
 
   @Test fun waitingPhaseHasASlowRecheckAfterTheBoundedBudget() {
