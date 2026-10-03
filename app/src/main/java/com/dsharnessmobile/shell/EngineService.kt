@@ -398,7 +398,13 @@ class EngineService : Service() {
   }
 }
 
-/** Six delayed retries per Service epoch; exhaustion stays pending instead of spinning/replaying. */
+/**
+ * 快速重试预算用尽后的复查节拍（2026-10-02 复审：UNKNOWN 不能没有上限——临时性的探测不完备
+ * 若不复查，用户只能重启设备）。调用方在预算耗尽后按此节拍继续静默复查。
+ */
+internal const val SLOW_OWNERSHIP_RECHECK_MS = 300_000L
+
+/** Six delayed retries per Service epoch; exhaustion falls back to a slow recheck instead of spinning/replaying. */
 internal class StartupOwnershipRetryBudget {
   private val delaysMs = longArrayOf(2_000L, 4_000L, 8_000L, 16_000L, 30_000L, 30_000L)
   private val used = java.util.concurrent.atomic.AtomicInteger(0)
