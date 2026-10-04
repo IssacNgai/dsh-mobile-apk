@@ -866,7 +866,7 @@ flowchart TD
 - **honest pending**：RootOwnershipJobs合并当前lease与worker，lease未finish则running/pending/completedAt=0/operation/overdue；旧result不盖新UNKNOWN。caller最多30s，cancel只caller，不cancel shared worker、不重复helper；UI立即request，既有poll读实际结果。
 - **immutable IO/capture**：ProcIo独立kill/各stream close daemon与共同cleanup join预算，readError不是EOF，返回partial不随late reader变；ShizukuCaptureIo private .part，writer/flush/close全结束且flags完整才publish，失败spoolReady=false/path空。transfer offset仅acknowledged bytes，partial/noReplay不承诺失败chunk无副作用。
 - **固定维护**：held-FD no-follow、访问前cap/depth/deadline、fstat/fchown/fstat、signed-APK helper五参数；protected_hardlinks不明拒绝，foreign/hardlink/device/root-writable-by-others拒绝；不restorecon、不隔离外部root namespace。详见 [Root维护](<dsh-mobile-apk/docs/AGENTS/ROOT-MAINTENANCE.md>)。
-- **当前锚点**：[lease](<dsh-mobile-apk/app/src/main/java/com/dsharnessmobile/shell/RootMaintenanceLease.kt#L23-L105>)、[fence](<dsh-mobile-apk/app/src/main/java/com/dsharnessmobile/shell/RootExecutionFence.kt#L18-L34>)、[jobs](<dsh-mobile-apk/app/src/main/java/com/dsharnessmobile/shell/RootOwnershipJobs.kt#L18-L79>)、[su ack](<dsh-mobile-apk/app/src/main/java/com/dsharnessmobile/shell/RootAccess.kt#L219-L342>)、[RPC lease](<dsh-mobile-apk/app/src/main/java/com/dsharnessmobile/shell/ShizukuTransport.kt#L727-L800>)、[capture](<dsh-mobile-apk/app/src/main/java/com/dsharnessmobile/shell/ShizukuUserService.kt#L309-L389>)、[IO](<dsh-mobile-apk/app/src/main/java/com/dsharnessmobile/shell/ProcIo.kt#L84-L174>)。
+- **当前锚点**：[lease](<dsh-mobile-apk/app/src/main/java/com/dsharnessmobile/shell/RootMaintenanceLease.kt#L23-L105>)、[fence](<dsh-mobile-apk/app/src/main/java/com/dsharnessmobile/shell/RootExecutionFence.kt#L18-L34>)、[jobs](<dsh-mobile-apk/app/src/main/java/com/dsharnessmobile/shell/RootOwnershipJobs.kt#L21-L91>)、[su ack](<dsh-mobile-apk/app/src/main/java/com/dsharnessmobile/shell/RootAccess.kt#L219-L342>)、[RPC lease](<dsh-mobile-apk/app/src/main/java/com/dsharnessmobile/shell/ShizukuTransport.kt#L727-L800>)、[capture](<dsh-mobile-apk/app/src/main/java/com/dsharnessmobile/shell/ShizukuUserService.kt#L309-L389>)、[IO](<dsh-mobile-apk/app/src/main/java/com/dsharnessmobile/shell/ProcIo.kt#L84-L174>)。
 - **文件边界**：legacy ConfigTransfer未mounted；配置由EngineManager→SnapshotUserData；同文件SAF picker仍在。FileIncoming/PathOpen白名单不随Browser HTTP放宽。新增fixtures未执行，非真实UID0验收。
 
 #### K07 虚拟屏宿主
@@ -1511,6 +1511,7 @@ flowchart TD
   - `html[data-dsh-session-id]` ← `session-marker.ts:67`；消费者：`browser-auto-place.ts:85`（`domCurrentSessionId`）、`dsh-host-web-compat/lib/index.js:480`（随 open-path 请求带 sessionId）。
   - `html[data-dsh-incoming-draft-consumer]` / `-poll` ← `index.ts:444` / `incoming-draft.ts:86-189`；消费者：测试 `dsh-client-ui-responsive/tests/incoming-draft.spec.ts:166`（页面侧标记，壳侧不读）。
   - `dsh-mobile-ledger-raised` / `dsh-mobile-hide-session-log-dialog` class ← `trajectory-panels-observer.ts:43` / `session-log-dialog-observer.ts:56`；消费者 `trajectory-details.css.ts:44` / `session-log-dialog.css.ts:40`。
+  - 快照管理（#288）：`index.ts:142` 安装样式、`:144` attach `SnapshotPanelsObserver`；`snapshot-panels-observer.ts:47` 的 `snapshotOwners` 按 `conversation.header` / `conversation.session.header` / `conversation.session.header.actions` 真实包装链认领。`:111` 同步 header/titleRow 两组租约，`:145` 在最后持有者释放时移除自有 class；`snapshot-panels.css.ts:15` 用包装链抬 header，`:19` 仅解除承载面板的 titleRow 包含约束。打开 → MutationObserver 认领 → 两组 class → 面板 fixed 以视口定位；关闭/移除/插槽重分类 → 释放 → 上游 query container 恢复。覆盖账本已显式登记两源文件；真因与反证见 `docs/AGENTS/gotchas.md` 坑 239。
   - 壳写页读的变量：`--dsh-android-system-top/-bottom/--dsh-android-ime-bottom/-left/-right` ← `MainActivity.kt:923-924`（pushWebInsets）；消费者 `mobile-form.css.ts:21,45,74`、`composer-insets.css.ts:13-17`、`keyboard-boundary.ts:94`。
   - 插件内服务面：`ctx.layout.toggleSidebar`（`index.ts:281`、`back-stack.ts:286`）、`ctx.sidebarRight.openTabIn`（`browser-auto-place.ts:239`）、`ctx.sessions.refresh/open/scope` 与 `ctx.conversation.addFiles`（`index.ts:517-543`）。
   - 端点面：本块自建 `/api/android/dir-pick/*`、`/api/android/open-path`（token 门 `x-dsh-pick-token`，`dsh-host-web-compat/lib/index.js:802`）；页面另有消费 `/api/android/file-incoming*`（`plugins/dsh-android-file-open/src/index.ts:527`）与 `/api/android/runtime-cache/*`（`plugins/dsh-android-linux-env/src/index.ts:388`）。
@@ -2025,6 +2026,7 @@ app/src/main/java/com/dsharnessmobile/shell/GuidePageRenderer.kt
 app/src/main/java/com/dsharnessmobile/shell/SafeMode.kt
 app/src/main/java/com/dsharnessmobile/shell/SafeConsole.kt
 app/src/main/java/com/dsharnessmobile/shell/WebUiChrome.kt
+app/src/main/java/com/dsharnessmobile/shell/WebViewShim.kt
 app/src/main/java/com/dsharnessmobile/shell/ConsoleActivity.kt
 app/src/main/java/com/dsharnessmobile/shell/ConsoleSession.kt
 app/src/main/java/com/dsharnessmobile/shell/BootReceiver.kt
@@ -2160,6 +2162,8 @@ glob:plugins/dsh-model-capability/test/*.mjs
 dsh-client-ui-responsive/src/index.ts
 dsh-client-ui-responsive/src/invariant.ts
 dsh-client-ui-responsive/src/css-modules.d.ts
+dsh-client-ui-responsive/src/client/snapshot-panels-observer.ts
+dsh-client-ui-responsive/src/client/snapshot-panels.css.ts
 glob:dsh-client-ui-responsive/src/client/*.ts
 glob:dsh-client-ui-responsive/src/client/*.tsx
 glob:dsh-client-ui-responsive/src/client/*.module.css
