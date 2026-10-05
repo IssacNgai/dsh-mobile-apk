@@ -1382,3 +1382,9 @@
     **壳侧配套约束（同一个真因的直接推论）**：正因为旧 ready 会被反复发出并**清零重试预算**，壳侧**不得复用 `enginePageFailed` + `claimLoadErrorRetry()`** 来处理这条失败（两者叠加会形成重载环：失败页 → 重试预算被清零 → 又能自动重载 → 又失败）。故客户端插件失败走**独立的 `clientPluginTreeFailed` latch**（`EngineStartFlow.kt:301`、`:317`），并在 `showWeb()`（`MainActivity.kt:252`）、`engineMonitorRunnable`（`EngineStartFlow.kt:52`）、`freezeRunnable`（`EngineStartFlow.kt:118`）三处让路——坏页面不再被前台监控或冻结看门狗弹回。
     **复验证据**：页面侧正反用例（失败页发 fail 行且不发 ready / 健康渲染发 ready 且不发 fail / 失败页不得被判 pending）在 `dsh-host-web-compat/scripts/boot-watchdog.test.mjs:552-790`；设备侧判据 3、4、6 见 `scripts/verify-client-plugin-fail-recovery.mjs`（引导页可见 dump + 文档导航次数 == 1 的有界性反证 + 健康启动回归）。
 
+246. **`gh workflow run -f` 不展开 @file ⇒ 发布说明资产变成字面路径（2026-10-05 发 0.14.4 实锤）**：
+    **现象**：用 `gh workflow run release -R kelai141/dsh-mobile-apk -f version=0.14.4 -f notes=@release/v0.14.4/notes.md` 派发 0.14.4 发布，**发布链成功、12 件资产齐全、CI 全绿**，但产出的 notes.md 资产与 Release body 的内容是 **26 字节的字面字符串** `@release/v0.14.4/notes.md`，而不是 **7767 字节**的发布说明正文。对照 v0.14.3 的 notes 正文以 `# v0.14.3 发布说明 …` 开头，可知**不是历史惯例，是本轮引入的回归**。
+    **真因**：`gh` 的 `-f/--raw-field` 与 `-F/--field` **语义不同**——`-F` 会展开 `@file`（gh 的 @ 语法），`-f` 是 **raw**，把值**原样当字符串**传递、**不展开** `@`。`gh workflow run --help` 明文写着这一条（`-F, --field … respecting @ syntax` vs `-f, --raw-field …`；gh 版本 2.101.0），但按既有命令字面照抄就会踩中。**为什么危险**：所有自动门禁全绿——发布链 exit 0、资产数量与大小正常、签名断言通过、MANIFEST 生成成功、双 ABI 快照与 APK 都在——**没有任何一条门禁校验「notes 资产的内容是否像一份发布说明」**，属「门禁全绿但产物是坏的」形态，只能靠发布后人工核对资产内容发现。
+    **修法**：改用 `gh workflow run … -F notes=@release/v<版本>/notes.md`（`-F` 才展开 @file）；并在发布后**下载 notes.md 资产核对首行**是否为 `# v<版本> 发布说明`。**建议（只登记，未开 issue）**：① 把「下载 notes.md 资产并核对首行」列入**发布后动作清单**——发布链自身不校验 notes 内容，这是当前唯一防线；② 可另立 issue 提出「发布链加一条 notes 非空/首行断言」的门禁改进（开不开由 Lead/用户决定）。
+    **复验证据**：已**删除坏 draft**，改用 `-F` 重派（run **37281961398**），核对 notes 资产为 **7767 字节正文**（Lead 已执行）；本条待核结论以该次 run 的资产首行为准。
+
