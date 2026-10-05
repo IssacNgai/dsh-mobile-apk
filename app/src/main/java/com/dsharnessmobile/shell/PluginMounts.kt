@@ -233,6 +233,70 @@ object PluginMounts {
   }
 
   /**
+   * 纯逻辑（CONTRACT §5，判据经 DEVICE-FINDING-1 修正）：从**客户端失败行列出的 id**里点出唯一可拔的条目。
+   *
+   * 为什么需要它：引擎日志（[failedEntryOf]）只覆盖「引擎自己把 loader entry 报出来」的场景；
+   * 而「页面注入层渲染出 Failed to load plugins」这条终局失败不一定伴随引擎日志点名。页面侧
+   * 契约行的 `failedIds=` 是此时唯一可用的点名来源，但它天然可能**多点名**（级联失败），
+   * 因此这里给出一条比 [removeEntry] 更严的判据：**必须唯一命中**，否则一律 null。
+   *
+   * ## failedIds 里到底是什么（真机取证，修正 CONTRACT §5 的旧口径）
+   *
+   * 每个元素是**浏览器侧 loader entry 的 name**，而 entry name = manifest row id
+   * （`dsh/packages/client/modules/src/client/entries.ts` 里 `const options = { name: id }`，
+   * `id` 取自 `window.__DSH_BOOT__.entries[].id`；`boot-page.ts` 把这个 name 原样渲染成失败项）。
+   * 对**注入集成员**而言，这个 name 就是**包名** —— 设备实读：清单里是
+   * `- id: dsh-client-bad-probe` ＋ `name: '@dsh-android/dsh-client-bad-probe'`，
+   * 页面给的是 `@dsh-android/dsh-client-bad-probe`。
+   *
+   * 所以匹配面必须扩成「**先 id 后 name**」：只匹配 `- id:` 会在真实形态上恒 0 命中
+   * （实测后果 `stage=client-plugin-tree-failed-no-action`，坏插件永远拔不掉）；而「清单 id 与
+   * entry name 同名」的家养插件形态仍然存在，id 轮不能丢。
+   *
+   * 判据（顺序即契约，每一步都必须可反证）：
+   * 1. 每个 id 去空白；`ids` 为空（或去空白后一个都不剩）⇒ null（点不出名，不许猜）；
+   * 2. 用既有 [parseEntryNames] 口径取挂载清单条目 (id, name) —— **不新造解析口径**，
+   *    配置块里的模型显示名因此不会命中；
+   * 3. 两轮点名：第 1 轮 `id in wanted`，第 2 轮 `name in wanted`；
+   *    **唯一性判据必须跨两轮合并计数**（按条目去重）：同一条目被 id 与 name 各命中一次
+   *    仍只算 1 条 —— 两轮命中数相加会把它误判成「多命中」而拒绝，等于换个姿势拔不掉；
+   * 4. 合并计数 != 1 ⇒ null：> 1 是级联失败（分不清是谁，乱拔会删掉用户另一条插件——
+   *    清单式修复的初衷正是不连坐），== 0 是点不出名；
+   * 5. 命中条目的 `name` 在 [hardNames]（硬清单 = 本版本自带、只增不减、绝不外拔）⇒ 不进入候选
+   *    （既有护栏一字不改）。**空集 = 尚未建立硬清单 ⇒ 不加额外保护、照常可拔**（不是拒绝）——
+   *    实测口径，见 ClientRollbackGateTest 的空集用例；调用方须保证硬清单已在「壳侧确认
+   *    健康」的那一拍建立（[ensureHard] 的调用点）。
+   *
+   * 返回值恒是清单**自身**的 (id, name)，调用方不得自造 FailedEntry——否则 [pull] 会在清单里
+   * 找不到对应块而空转。
+   *
+   * @param patchText 挂载清单全文
+   * @param ids 页面契约行 failedIds 解析结果（loader entry name；注入集成员通常是包名）
+   * @param hardNames 硬清单（[hardNames]）；空集 = 不加额外保护（不拒绝），见上方判据第 5 条
+   * @return 唯一命中的条目；不唯一/命中硬清单/定位不到返回 null
+   */
+  internal fun clientPullCandidate(patchText: String, ids: List<String>, hardNames: Set<String>): FailedEntry? {
+    val wanted = ids.map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+    if (wanted.isEmpty()) return null
+    val entries = parseEntryNames(patchText)
+    // 两轮点名（先 id 后 name），按**条目下标**合并去重：同一条目被两轮各命中一次仍只算 1 条。
+    val matched = LinkedHashSet<Int>()
+    for (index in entries.indices) {
+      val (id, name) = entries[index]
+      if (id != null && id in wanted) matched.add(index)
+      if (name != null && name.isNotEmpty() && name in wanted) matched.add(index)
+    }
+    // 硬清单护栏按**命中条目自身的 name** 判（与旧实现同口径，一字不改）。
+    val hits = matched.map { entries[it] }.filter { (_, name) ->
+      name != null && name.isNotEmpty() && name !in hardNames
+    }
+    // 必须唯一：合并计数 >1 直接放弃（级联失败不得乱拔）；== 0 同样返回 null。
+    if (hits.size != 1) return null
+    val (id, name) = hits[0]
+    return FailedEntry(id = id, name = name)
+  }
+
+  /**
    * 纯逻辑：删掉承载指定插件（按包名，退回按 entry id）的**整块**，返回新文本；无法唯一定位返回 null。
    *
    * 块边界：从该 `name:` 行向上找到最近的一条**顶层条目**（`- insert:` / `- id: x`，列 0 起），
@@ -330,7 +394,9 @@ object PluginMounts {
 
   // ── 清单读写 ────────────────────────────────────────────────────────────
 
-  /** 硬清单里的插件名（读不到/损坏返回空集：空集时外科修复会拒绝拔任何东西，fail-closed）。 */
+  /** 硬清单里的插件名（读不到/损坏返回空集）。
+   *  空集语义是**无保护名单**，不是「拒绝一切」：[clientPullCandidate] 与 [removeEntry] 在空集时
+   *  仍可拔；保护只来自名单命中，故调用方须保证名单已在健康拍建立（[ensureHard]）。 */
   fun hardNames(context: Context): Set<String> = readNames(hardFile(context))
 
   /** 软清单里的插件名（无软清单返回 null——「从没确认过健康状态」与「确认过且为空」必须可区分）。 */
@@ -418,6 +484,21 @@ object PluginMounts {
       false
     }
   }
+
+  /**
+   * 外科拔除的**客户端点名**入口（CONTRACT §5）：语义与副作用必须与 [pull] 完全一致。
+   *
+   * 与 [pull] 的唯一区别是调用来源（页面契约行点名 ⇒ clientPullCandidate ⇒ 这里），而不是行为：
+   * 同样读盘 → [removeEntry] 删掉承载该条目的整块 → 写回；点不出块 / 内容没变 / 写回失败一律
+   * 返回 false 且**不落任何改动**。因此调用方可以照 [pull] 的既有方式判成败，不需要两套口径。
+   *
+   * 独立成入口（而不是让调用方直接调 [pull]）是为了把「页面侧点名」这条路固化成一个可被
+   * 单测钉住的接线点：它必须是 [pull] 的等价物，任何一边的语义漂移都要被测试抓住。
+   *
+   * @return true = 已拔掉并写回（调用方随后重启引擎）；false = 没有改动
+   */
+  fun pullByClientIds(context: Context, patch: File, failed: FailedEntry): Boolean =
+    pull(context, patch, failed)
 
   /** 引擎日志尾部 4KB（loader 失败原文只在这份日志里；与 `WatchdogV2` 同口径）。 */
   fun readEngineLogTail(context: Context, bytes: Int = 4096): String {

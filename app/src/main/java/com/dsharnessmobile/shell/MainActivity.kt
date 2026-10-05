@@ -81,6 +81,14 @@ class MainActivity : ComponentActivity() {
   /** 跨类 ::isInitialized 形式（EngineStartFlow 监控/冻结看门狗用；语义等价原 lambda 内检查）。 */
   private val pageRecovery = ForegroundPageRecoveryPolicy()
   private var pendingWebPresentation = false
+  /**
+   * 非前台期间收到插件装配失败契约行时挂起的前台呈现（CONTRACT §4），由 [onResume] 消费。
+   *
+   * 语义与 [pendingWebPresentation] 完全同款、方向相反：那条是「该显示 WebUI 但此刻没前台」，
+   * 这条是「该显示错误页但此刻没前台」。挂起而不是原地切相位，是因为非前台时切 UI 既看不见、
+   * 又会在真正回前台时被 onResume 的既有路径覆盖——用户就永远不会知道界面死在一棵坏插件树上。
+   */
+  @Volatile private var pendingClientPluginFailurePresentation = false
   private var pendingAuthRejectedUrl: String? = null
   private var pendingEngineCookie: String? = null
   private var initialAuthRecoveryDeadline = 0L
@@ -199,6 +207,9 @@ class MainActivity : ComponentActivity() {
   /** 引擎启动流（委托 EngineStartFlow.start）。 */
   internal fun startEngineFlow() {
     if (isFinishing || isDestroyed) return
+    // CONTRACT §4：显式启动出口（用户点「重试」/错误页的「安全模式启动」）先解除插件失败 latch，
+    // 否则刚被 latch 挡下的 showWeb 会让这一次显式启动看不到任何结果。
+    engineFlow.clearClientPluginTreeFailureLatch()
     // Automatic callers already exclude userClosedEngine. Only the explicit
     // start outlet may clear a saved/persisted user shutdown.
     if (userClosedEngine) {
@@ -231,6 +242,14 @@ class MainActivity : ComponentActivity() {
   internal fun showWeb() {
     if (userClosedEngine || EngineService.userShutdown || isFinishing || isDestroyed || !webViewReady) return
     if (engineManager.snapshotFingerprintProblem() != null) return
+    // 插件装配失败 latch（CONTRACT §4）：latch 期内**不得**把坏页面推回前台。
+    //
+    // 为什么必须挡在这里（而不是复用 enginePageFailed）：latch 说明「页面装不上插件」这件事
+    // 本轮已定性；而 enginePageFailed 那条路会 claimLoadErrorRetry() 然后 reloadEnginePage()，
+    // 正是 CONTRACT §0 点名的**重载环**（页面每次渲染完毕就再次发 ready → 又回到同一页）。
+    // 用户显式动作（重试/安全模式）会先 clear latch，出口仍然存在。
+    // 位置：放在既有早退之后、展示之前——不改变任何既有早退的判据。
+    if (engineFlow.clientPluginTreeFailedLatch) return
     if (!pageUiActive) { pendingWebPresentation = true; return }
     pendingWebPresentation = false
     if (enginePageFailed) {
@@ -242,6 +261,27 @@ class MainActivity : ComponentActivity() {
     }
     guideRenderer.showWeb()
     engineFlow.startFreezeWatchdog()
+  }
+
+  /**
+   * 呈现「客户端插件装配失败」错误页（CONTRACT §4 步骤 4 的壳侧落点）。
+   *
+   * 前台：立刻切引导页 Error 相位（Error 相位的主按钮本来就是「安全模式启动」，无需改动）。
+   * 非前台：只挂起 [pendingClientPluginFailurePresentation]，由 onResume 消费——理由见该字段注释。
+   *
+   * 幂等：latch 已清（用户显式重试/安全模式已放行）时直接返回，不把人按回错误页。
+   */
+  internal fun presentClientPluginFailure() {
+    if (isDestroyed || isFinishing) return
+    if (!engineFlow.clientPluginTreeFailedLatch) return
+    if (!pageUiActive) { pendingClientPluginFailurePresentation = true; return }
+    pendingClientPluginFailurePresentation = false
+    showGuide()
+    applyGuidePhase(
+      GuidePhase.Error,
+      getString(R.string.ds_client_plugin_fail_title),
+      getString(R.string.ds_client_plugin_fail_hint, engineFlow.clientPluginFailureReason),
+    )
   }
 
   /** Automatic page refreshes coalesce while paused and never issue background navigation. */
@@ -502,6 +542,20 @@ class MainActivity : ComponentActivity() {
       return // A dead renderer is never reused, even by a liveness callback.
     }
     if (pendingWebPresentation) showWeb()
+    // CONTRACT §4：非前台挂起的插件装配失败呈现，回前台时消费一次（与上一条同款）。
+    // latch 仍为真才呈现——若期间用户已显式重试/进了安全模式（latch 已清），这里就不该再
+    // 把人按回错误页；那时后续的启动路径会给出新的相位。
+    if (pendingClientPluginFailurePresentation) {
+      pendingClientPluginFailurePresentation = false
+      if (engineFlow.clientPluginTreeFailedLatch) {
+        showGuide()
+        applyGuidePhase(
+          GuidePhase.Error,
+          getString(R.string.ds_client_plugin_fail_title),
+          getString(R.string.ds_client_plugin_fail_hint, engineFlow.clientPluginFailureReason),
+        )
+      }
+    }
     pendingAuthRejectedUrl?.let { url ->
       pendingAuthRejectedUrl = null
       scheduleEngineAuthRecovery(url)
@@ -970,9 +1024,12 @@ class MainActivity : ComponentActivity() {
        * 于是 `files/boot-diag.log` 的 `source=page-console` 恒 0 行、`pageSideRuntime` 恒
        * `unavailable`——那是**永远不可得**而不是「当前不可得」。本方法补上这一半。
        *
-       * 两种前缀（契约与页面侧逐字对应，改动须两侧同步，见 LogCollector 的常量）：
+       * 三个自有前缀（契约与页面侧逐字对应，改动须两侧同步，见 LogCollector 的常量），
+       * 分支顺序即契约（ready → stall → client-fail → render-error）：
        *  - `[dsh-boot-ready]`：页面首次渲染成功（L-1 的判据真源）→ 停止本 epoch 的 stall 计时；
-       *  - `[dsh-boot-stall]`：页面自报卡住（带 §6.2 四字段）→ 落 `source=page-console`。
+       *  - `[dsh-boot-stall]`：页面自报卡住（带 §6.2 四字段）→ 落 `source=page-console`；
+       *  - `[dsh-boot-failed]`：页面判定插件装配**终局失败**（CONTRACT §1）→ 落诊断并交给
+       *    失败面编排（落 boot-fail + 退到错误页 + 有界回滚），本支**消费**该行。
        *
        * 返回 `true` = 已消费，不再走默认 console 行为。**只拦我们自己的前缀**，其余一律
        * 返回 false 交给默认处理（不改变第三方页面的既有日志行为，也不吞掉真正的页面报错）。
@@ -988,6 +1045,18 @@ class MainActivity : ComponentActivity() {
             }
             LogCollector.isPageStallMessage(text) -> {
               engineFlow.onPageStallReported(text)
+              true
+            }
+            // 客户端插件装配失败（CONTRACT §3）：页面注入层判定「终局失败」后发布的契约行。
+            // 顺序即契约——ready → stall → **client-fail** → render-error；本支必须排在
+            // render-error 之前，否则这条 ERROR 级别的契约行会被当成普通页面报错落进
+            // console-error（只见诊断、不触发失败面编排）。
+            //
+            // 返回 true = 已消费：这是我们自己的契约行，不再走默认 console 行为
+            // （否则 logcat 里会出现一条与产品语义无关的「页面报错」噪声）。
+            LogCollector.isClientPluginTreeFailureMessage(text) -> {
+              LogCollector.writeBootDiag(this@MainActivity, "page-console", text.replace('\n', ' '))
+              engineFlow.onClientPluginTreeFailed(text)
               true
             }
             // §2.3（0.14.1 块C）：既有两个自有前缀之外，**补收页面 JS 错误**。老设备白屏的
@@ -1707,7 +1776,11 @@ class MainActivity : ComponentActivity() {
    */
   internal fun isRenderErrorMessage(message: ConsoleMessage): Boolean {
     val text = message.message() ?: return false
-    if (LogCollector.isPageReadyMessage(text) || LogCollector.isPageStallMessage(text)) return false
+    // 排除集 = 三个自有前缀（CONTRACT §3）：它们各有专门分支消费，绝不能重复落成
+    // console-error——契约行本身是 ERROR 级别，漏排就会在诊断面留下一条语义错误的记录。
+    if (LogCollector.isPageReadyMessage(text) || LogCollector.isPageStallMessage(text) ||
+      LogCollector.isClientPluginTreeFailureMessage(text)
+    ) return false
     return message.messageLevel() == ConsoleMessage.MessageLevel.ERROR
   }
 

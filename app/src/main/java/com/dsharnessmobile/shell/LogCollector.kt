@@ -741,6 +741,28 @@ object LogCollector {
   /** 页面**就绪**前缀（L-1 的判据来源）：页面首次 rendered() 为真时报一条。 */
   const val PAGE_READY_PREFIX = "[dsh-boot-ready]"
 
+  /**
+   * 页面**插件装配失败**前缀（CONTRACT §1，与页面侧 BOOT_FAILED_PREFIX='[dsh-boot-failed]'
+   * 逐字一致）。页面注入层判定「终局失败」后经 **console.error** 发布契约行：
+   *
+   * ```
+   * [dsh-boot-failed] dsh-boot-diag source=page-plugin-fail detail=<折叠k=v> failedIds=<逗号分隔|-> pageSideRuntime=<JSON>
+   * ```
+   *
+   * 与 ready/stall 同族（同一条 console 通道），但语义相反：它宣告页面**不会**再自愈到就绪，
+   * 壳侧据此落失败终态并退出到引导页错误相位。两侧常量必须字节一致，改动须跨仓同步。
+   */
+  const val PAGE_PLUGIN_FAIL_PREFIX = "[dsh-boot-failed]"
+
+  /** failedIds= 里单条 id 的合法形状（CONTRACT §1 第 5 条，与页面侧过滤口径同源）。 */
+  private val CLIENT_FAILED_ID = Regex("^[@A-Za-z0-9][@A-Za-z0-9._/-]*\$")
+
+  /** failedIds= 最多保留的条目数（CONTRACT §1 第 5 条：页面侧最多 8 项）。 */
+  private const val MAX_CLIENT_FAILED_IDS = 8
+
+  /** 单条 id 的最大长度（CONTRACT §1 第 5 条：≤120）。 */
+  private const val MAX_CLIENT_FAILED_ID_CHARS = 120
+
   /** 页面控制台行的分流结果（`null` = 与本插件无关，直接透传原日志行为）。 */
   internal data class PageConsoleRoute(val source: String, val detail: String)
 
@@ -760,6 +782,9 @@ object LogCollector {
     val folded = text.replace('\n', ' ').replace('\r', ' ').trim()
     if (folded.startsWith(PAGE_STALL_PREFIX)) return PageConsoleRoute("page-console", folded)
     if (folded.startsWith(PAGE_READY_PREFIX)) return PageConsoleRoute("page-console", folded)
+    // 第三分支（CONTRACT §3）：页面宣告插件装配终局失败。source 仍是 page-console（同一条
+    // 控制台通道的家族），排在 ready/stall 之后——顺序即契约，前两条必须先生效。
+    if (folded.startsWith(PAGE_PLUGIN_FAIL_PREFIX)) return PageConsoleRoute("page-console", folded)
     return null
   }
 
@@ -770,6 +795,46 @@ object LogCollector {
   /** 该页面控制台行是否表示「页面自报卡住」（L-2 的诊断载荷）。 */
   internal fun isPageStallMessage(message: String): Boolean =
     (message ?: "").trimStart().startsWith(PAGE_STALL_PREFIX)
+
+  /**
+   * 该页面控制台行是否表示「客户端插件装配终局失败」（CONTRACT §1/§3）。
+   *
+   * 判据是**行首前缀**（trimStart 后 startsWith），与 ready/stall 同款：页面侧保证前缀在行首
+   * 且无前导空白。只认前缀，不做任何字段解析——解析交给 [clientFailedIdsOf]，两者各自可反证。
+   */
+  internal fun isClientPluginTreeFailureMessage(message: String): Boolean =
+    (message ?: "").trimStart().startsWith(PAGE_PLUGIN_FAIL_PREFIX)
+
+  /**
+   * 纯函数：从契约行取出 failedIds= 字段 → split(",") → 过滤 "-" / 空 / 不合法项（CONTRACT §3）。
+   *
+   * 合法性口径与页面侧发布时的过滤**同源**（CONTRACT §1 第 5 条）：id 必须匹配
+   * [@A-Za-z0-9] 起头、其余为 [@A-Za-z0-9._/-]，长度 ≤120，且最多 8 项。
+   * 页面侧已经把不合法的项滤掉了，壳侧**必须再滤一遍**——跨仓契约的任一侧都可能被单独改坏，
+   * 而把垃圾 id 传进外科拔除的代价是误删用户插件，宁可两边都严。
+   *
+   * 截断行为（fold 有 2048 字符上限）：字段缺失 / 被截断成半截 id / 写成 "-" 时，
+   * 解析结果是「更少的 id」或空列表，**绝不臆造**——空列表让上层退回「整份回滚或如实拒绝」。
+   *
+   * @param message 页面 console 原文（可能含换行）
+   * @return 合法 id 列表（最多 8 项；无字段/全不合法返回空列表）
+   */
+  internal fun clientFailedIdsOf(message: String): List<String> {
+    val text = message ?: return emptyList()
+    val key = "failedIds="
+    val at = text.indexOf(key)
+    if (at < 0) return emptyList()
+    val rest = text.substring(at + key.length)
+    // 字段值到下一个空白或行尾；契约保证值是「无引号无空格」的逗号分隔串。
+    // 被 fold 截断时 rest 里可能没有空白，整体即（半截）值——半截 id 会被下面的形状过滤掉。
+    val end = rest.indexOfFirst { it.isWhitespace() }
+    val value = (if (end < 0) rest else rest.substring(0, end)).trim()
+    if (value.isEmpty() || value == "-") return emptyList()
+    return value.split(",")
+      .map { it.trim() }
+      .filter { it.isNotEmpty() && it != "-" && it.length <= MAX_CLIENT_FAILED_ID_CHARS && CLIENT_FAILED_ID.matches(it) }
+      .take(MAX_CLIENT_FAILED_IDS)
+  }
 
   /** 当前分段判据快照（诊断行/自检面共用；未知一律 -1）。 */
   internal fun bootSegmentsSnapshot(): String =
