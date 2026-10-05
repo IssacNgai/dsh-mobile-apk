@@ -147,6 +147,42 @@ object UndoGate {
   }
 
   /**
+   * 浏览器侧插件装配失败的**一次性入口**（CONTRACT §5；调用方 EngineStartFlow §4）。
+   *
+   * 语义来自 [decide] 的 SUPPRESS/EXECUTE 两态，但**刻意不走 ARM→WAIT 观察窗**：
+   * 调用方已经把「只花一次预算」花在自己身上（clientPluginTreeRecoverySpent），这里只回答
+   * 「现在能不能动手」。
+   *
+   * 为什么不能照搬 [onProbeFailure] 的 arm → wait：引擎**健康**时看门狗每 5s 一拍走 IDLE 分支并
+   * 调用 [disarm]（见 EngineService 的 TickAction.IDLE），arm 文件被逐拍清掉 ⇒ 下一次进来
+   * armedAt 仍是 null ⇒ [decide] 永远返回 ARM ⇒ 永远到不了 EXECUTE。页面失败不是「引擎半死」——
+   * 它是页面注入层给出的终局判据，引擎本身还在跑，观察窗在这条路上只会变成一道永不打开的闸门，
+   * 把唯一的自动恢复路径静默掐死（该反证见 ClientRollbackGateTest）。
+   *
+   * @param detail 失败原文/原因短句（进观测面，供设备侧归因；不参与判定）
+   * @return true = 现在就执行回滚；false = 距上次成功回滚不足 [RETRY_WINDOW_MS]，防循环抑制
+   */
+  fun onClientPluginTreeFailure(context: Context, detail: String): Boolean {
+    val now = System.currentTimeMillis()
+    val decision = decide(TRIGGER_CONSEC_FAILURES, now, lastUndoAt(context), armedAt(context))
+    record(context, "client-plugin-tree-failed decision=" + decision + " detail=" + detail.take(160).replace('\n', ' '))
+    return clientPluginFailureDecision(decision)
+  }
+
+  /**
+   * 一次性入口的两态映射（纯函数，JVM 直接可测）。
+   *
+   * - [GateDecision.SUPPRESS]（距上次成功回滚不足 [RETRY_WINDOW_MS]）⇒ false：不放行，防循环；
+   * - 其余（IDLE / ARM / WAIT / EXECUTE）⇒ true：**ARM 与 WAIT 不再被当成「等待」**，理由见
+   *   [onClientPluginTreeFailure]（观察窗在这条路上永远走不到 EXECUTE）。
+   *
+   * 于是「EXECUTE → true / SUPPRESS → false」这一对契约语义被原样保留，同时把
+   * 「不得用 ARM→WAIT 观察窗」这条约束固化成一个可被单测反证的纯函数。
+   */
+  internal fun clientPluginFailureDecision(decision: GateDecision): Boolean =
+    decision != GateDecision.SUPPRESS
+
+  /**
    * 自动回撤闸门的**纯决策**（JVM 可直接单测，不依赖 Context / 文件系统）。
    *
    * 抽出来的理由：本闸门是「自动 undo 到底会不会跑」的唯一判据，而它原先整体依赖
@@ -321,7 +357,11 @@ object UndoGate {
    * 2. 写 .undo-auto-done 标记（幂等 + 供启动页显示）
    * 3. 返回是否执行了回滚（+ 摘要）
    */
-  fun execute(context: Context, engine: EngineManager): UndoResult {
+  fun execute(
+    context: Context,
+    engine: EngineManager,
+    clientFailure: PluginMounts.FailedEntry? = null,
+  ): UndoResult {
     if (!autoUndoRunning.compareAndSet(false, true)) return UndoResult(false, "自动回撤已在执行", null)
     try {
       val dsh = File(engine.homeDir, ".dsh")
@@ -350,7 +390,12 @@ object UndoGate {
       // 故顺序是：能点名 → 只拔它；点不出名但清单没变 → 才允许走 known-good 整份回滚；
       // 清单变了又点不出名 → 什么都不做（宁可不动，也不吞用户插件）。
       val patch = PluginMounts.patchFile(engine)
-      val failed = PluginMounts.failedEntryOf(PluginMounts.readEngineLogTail(context))
+      // 失败条目来源（CONTRACT §5）：**引擎日志优先**，日志点不出名时退到调用方给的 clientFailure
+      // （页面契约行 failedIds → PluginMounts.clientPullCandidate 的产物）。
+      // 为什么日志优先：引擎原文 'failed to import loader entry <id> (<包名>)' 带括号包名，
+      // 比页面侧文本可靠；两者都不成立时行为与改动前一字不差（failed == null，继续走整份
+      // 回滚或如实拒绝）。
+      val failed = PluginMounts.failedEntryOf(PluginMounts.readEngineLogTail(context)) ?: clientFailure
       val hard = PluginMounts.hardNames(context)
       if (failed != null && failed.name != null && failed.name !in hard) {
         if (PluginMounts.pull(context, patch, failed)) {

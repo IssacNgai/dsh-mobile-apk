@@ -1,6 +1,6 @@
 {
   "$comment": "Kotlin 单测基线（0.14.1）：只许升不许降。键=测试类名（=源文件名去 .kt），值=用例数。逐类记录而非只记总数——防「删 A 类用例 + 加 B 类用例」净零抵消。升档：node scripts/check-kotlin-test-count.mjs --update-baseline（会拒绝降档）。",
-  "totalTests": 1012,
+  "totalTests": 1063,
   "testsByClass": {
     "AcceptRoutingTest": 7,
     "AdbLiveProbeTest": 4,
@@ -16,6 +16,8 @@
     "BrowserOverlayContractTest": 4,
     "BrowserOverlayPolicyTest": 9,
     "CallSiteContractTest": 28,
+    "ClientPluginFailRouteTest": 26,
+    "ClientRollbackGateTest": 24,
     "ControlAuditTest": 7,
     "ControlProtocolV2Test": 4,
     "CoordBasisPolicyTest": 6,
@@ -56,7 +58,7 @@
     "OverlayPendingCardTest": 13,
     "OverlayReportBarTest": 10,
     "OverlayReportExpandTest": 7,
-    "OwnershipLeaseSettlementFixtureTest": 21,
+    "OwnershipLeaseSettlementFixtureTest": 22,
     "OwnershipRepairCoreTest": 22,
     "PluginMountsTest": 12,
     "ProcIoSettlementFixtureTest": 4,
@@ -96,10 +98,10 @@
     "VdisplayArbitrationTest": 4,
     "VdisplayLaunchLandingTest": 6,
     "W3ShellContractTest": 20,
-    "WebViewShimTest": 11,
     "WatchdogLadderTest": 24,
     "WatchdogMarkerConsumeTest": 10,
     "WatchdogPluginTreeTest": 5,
+    "WebViewShimTest": 11,
     "WindowPickTest": 5
   }
 }
