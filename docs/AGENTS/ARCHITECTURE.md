@@ -47,7 +47,7 @@
 | UndoGate.kt | 看门狗/启动失败恢复：先清单式拔除可点名的非 Hard 插件；整份恢复仅使用壳侧 HEALTHY 探活记录且匹配当前 `.snapshot-fingerprint` 的 known-good ID | EngineService、EngineStartFlow |
 | SnapshotExtractor.kt | xz tar 流式解压（commons-compress）+ security.android.exec xattr 补章 + zip-slip 防护 | EngineManager、UpdateManager |
 | SnapshotTransaction.kt | 运行时替换事务：暂存解压→原子交换→指纹提交；中断恢复（前滚/回滚/丢弃） | EngineManager |
-| SnapshotFs.kt / SnapshotFileMode.kt / SnapshotUserData.kt / SnapshotFingerprintPolicy.kt / UserDataBackupArchive.kt / ProfilePackageManifest.kt | NOFOLLOW文件原语、权限、legacy backup；迁移marker与活动profile配置保留/传输/旧blank seed隔离；未知 `.dsh` 冲突项默认保留；严格内嵌SHA与durable fingerprint准入；用户全量备份走分块AEAD和唯一owned tx，profile manifest merge 与快照刷新共用，SAF/platform transaction participant由UI层接入 | SnapshotTransaction、EngineManager、backup SAF controller |
+| SnapshotFs.kt / SnapshotFileMode.kt / SnapshotUserData.kt / SnapshotFingerprintPolicy.kt / ProfilePackageManifest.kt | NOFOLLOW文件原语、权限；迁移marker与活动profile配置保留/传输/旧blank seed隔离；未知 `.dsh` 冲突项默认保留；严格内嵌SHA与durable fingerprint准入；profile manifest merge 与快照刷新共用 | SnapshotTransaction、EngineManager |
 | FactoryProfilePatch.kt | 0.14（#214）：profile `cordis.patch.yml` 工厂语义定点纠正（按 id 以工厂为准，退役 disabled 残行清理，用户独有条目不动） | EngineManager、SnapshotTransaction |
 | UpdateManager.kt | 快照在线更新（manifest/sha256/换 usr，usr-old 回退） | EngineManager、EngineStartFlow、UndoGate（注释） |
 | EngineProbe.kt | 引擎探活（Proxy.NO_PROXY 直连 #118；401/303 视作 alive） | 壳侧全部探活唯一入口 |
