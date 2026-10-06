@@ -143,9 +143,17 @@ node scripts/patches/apply-patches.mjs vendor --list
   [perf] boot singles=.. records=..        （compose #1 之后一次，C5 反向判据）
   [perf] single #N at=..ms singles=..      （单条 URL 被服务时，C5 正向对照）
   ```
-  字段齐备，无值报 -1（绝不省字段）；`loopP99Ms`/`loopSamples` 取自 `monitorEventLoopDelay`
-  （宿主实测：它不会挂住事件循环退出）。
-  P1 在每次 `compose()` 返回时**立即**输出一条累计 TOTAL，并从同一 C4 monitor 读取当时的 p99/样本数；不再排队或延后 TOTAL，保留既有 shell tail 与 last-row 解析时序。独立 `[perf] phase` 诊断只接收四种固定阶段名并按名聚合到有界 Map；首条记录后 250ms 用 unref timer 收口，后续事件不重置 deadline。phase 行字段为 `startMs/durTotalMs/durMaxMs/observations/forwardedCallbacks`：耗时是 wall-clock，observations 是阶段记录次数，forwardedCallbacks 单独表示延迟 flush 转发的回调数。记录构造 flush、loader settle 等待、延迟启动 flush 与首次 settle 后 compose start；不重置或延迟 C4 直方图采样。
+  字段齐备，无值报 -1（绝不省字段）。
+  **C4 采样器口径（2026-10-06 换尺）**：`loopP99Ms`/`loopSamples` 取自 **P1 自建的采样器**
+  （`dshMobileComboProbeArmLoopSampler` + `dshMobileComboProbeLoopHistogram`），**不再**使用
+  `perf_hooks` 的 event-loop-delay monitor。换尺原因（设备实测根因）：那个 monitor 对「与 `enable()`
+  同 tick 内开始的同步块」结构性失明——其直方图只度量它自己采样定时器的迟到量，定时器尚未触发就
+  什么都不记（本机复现 95/500/1500/2000 ms 各档一律读成约 11 ms；设备上一段 2.0 s 的启动阻塞被读成
+  11 ms，而独立 interval 观察器完整看到 2.0 s）。自建采样器在 **arming 时先锚定墙钟基线**，因此首个
+  被观测到的 gap 覆盖自 arming 起的全部时间、**包含此刻已在进行的块**；样本上限 8192（窗口封顶），
+  timer `unref`，整体 try/catch——探针绝不抛进 composition。**调用点必须是模块加载期即刻 arming**：
+  推迟到首拍会让基线落在块**之后**，正是旧缺陷的成因。
+  P1 在每次 `compose()` 返回时**立即**输出一条累计 TOTAL，并从该采样器读取当时的 p99/样本数；不再排队或延后 TOTAL，保留既有 shell tail 与 last-row 解析时序。独立 `[perf] phase` 诊断只接收四种固定阶段名并按名聚合到有界 Map；首条记录后 250ms 用 unref timer 收口，后续事件不重置 deadline。phase 行字段为 `startMs/durTotalMs/durMaxMs/observations/forwardedCallbacks`：耗时是 wall-clock，observations 是阶段记录次数，forwardedCallbacks 单独表示延迟 flush 转发的回调数。记录构造 flush、loader settle 等待、延迟启动 flush 与首次 settle 后 compose start；不重置或延迟 C4 直方图采样。
   - **只主线程安装**（`isMainThread` 门）：worker 线程的 `calls=0` TOTAL 绝不得成为壳侧解析到的
     最后一条 TOTAL。**为什么必须挡**（T6 设备实测的真因）：`--import`/`NODE_OPTIONS` 在 file-based
     worker 线程里也会执行（Node v24.17 实测，引擎树至少 5 处 worker），worker 临终打 `calls=0`，

@@ -30,24 +30,46 @@ const ROOT = dirname(HERE)
 
 // ── 预算常量 ─────────────────────────────────────────────────────────────────
 // C4：冷启动**窗口内**的 p99 事件循环延迟上限。
-// 口径更正（2026-09-19，设备实测）：原值 50 ms 是**稳态**目标（docs/ANDROID-RUNTIME-PERF-2026-09-12.md
-// §C6），而探针量的是**冷启动窗口**——那段窗口正在全量 compose，与「稳态空闲」不是同一个量。
-// 直接套 50 ms 会把口径错配当成设备缺陷。设备 n=3 实测：37.0 / 61.6 / 77.1 ms。取 max×1.3≈100
-// 作为冷启动窗口预算；**稳态 p99 仍未被任何探针测量**（列为未闭合项，见详档 §6）。
 //
-// 采样器口径更正（2026-10-06，设备根因）：上述 37.0/61.6/77.1 是用 perf_hooks 的
-// event-loop-delay monitor 量的，而它**对「与 enable() 同 tick 内开始的同步块」结构性失明**：
-// 该直方图只度量它自己采样定时器的迟到量，定时器若尚未触发就什么都不记（实测 95/500/1500/2000ms
-// 各档一律读成约 11ms；设备上一段 2.0s 的启动阻塞被读成 11ms，而独立 interval 观察器完整看到 2.0s）。
-// 探针现改为**自建采样器**：arming 时锚定墙钟基线，故首个 gap 覆盖自 arming 起的全部时间，
-// 包含**已经在进行中**的块。⇒ 该预算的**历史标定值不再可比**：换尺后读数会显著变大（把原先被
-// 丢弃的整段阻塞计回来是**预期行为**，不是性能回归）。在新尺子的设备基线重标之前，本判据的红/绿
-// 只反映「尺子换了」，不得据此宣布性能回归；重标方法与 n>=5 基线见详档 §6 第 2 项。
-const LOOP_P99_BUDGET_MS = 100
+// 三代口径（每一代都是被设备实测推翻后重标的，不是「调参放宽」）：
+//
+// 第一代（-2026-09-19）50 ms：照搬**稳态**目标（docs/ANDROID-RUNTIME-PERF-2026-09-12.md §C6）。
+// 错在口径错配——探针量的是冷启动窗口（全量 compose 进行中），与「稳态空闲」不是同一个量。
+//
+// 第二代（2026-09-19）100 ms：设备 n=3 实测 37.0 / 61.6 / 77.1 ms，取 max×1.3≈100。
+// 错在**尺子本身失明**——那三个读数来自 perf_hooks 的 event-loop-delay monitor，而它对
+// 「与 enable() 同 tick 内开始的同步块」结构性失明：直方图只度量它自己采样定时器的迟到量，
+// 定时器尚未触发就什么都不记（本机复现：95/500/1500/2000 ms 各档一律读成约 11 ms）。
+// ⇒ 它量的从来不是「冷启动窗口」，而是「Loader 装载结束之后那一小段残窗」。
+//
+// 第三代（2026-10-06）本轮：探针换成**自建、arming 时锚定墙钟基线**的采样器（首个 gap 覆盖
+// 自 arming 起全部时间，含已在进行的块）。换尺后读数第一次与两条独立通路对齐：
+//   · 独立 interval 观察器（同轮）：1666–2413 ms
+//   · phase 探针 loader-settle-wait（用 performance.now 差值，从未受失明缺陷影响）：1624–3249 ms
+// 设备 16416 竖屏 n=8 实测：1468.4 / 1525.6 / 1533.0 / 1654.6 / 1753.9 / 2184.0 / 2188.7 / 2886.5 ms
+//   → min 1468.4 · median 1704.3 · max 2886.5
+// 同批分解证明这 2 秒**不是** compose、也不由本仓补丁造成：
+//   · compose 单次最大 5–29 ms；compose 调用数恒 2
+//   · constructor-flush（我们的 client-modules registry 扫描）：57.4–182.0 ms
+//   · deferred-startup-flush：21.2–57.8 ms
+//   · loader-settle-wait：1624.4–3249.1 ms  ← p99 与它几乎逐轮同步（相关性近乎 1）
+// 即该窗口的支配项是**上游引擎自身激活全部 ~193 条 Loader entry**（模块编译/求值链）。
+//
+// 阈值取值：max×1.15 ≈ 3319 ms，向上取整到 **3400 ms**。
+//   · 余量取 1.15 而非第二代的 1.3：n 从 3 升到 8、且已有两条独立通路交叉验证，采样不确定性
+//     明显下降，不需要更宽的余量；同时避免把阈值放到失去回归哨兵作用。
+//   · 这是**回归哨兵**，不是性能目标：它守的是「冷启动窗口别再变差」。它**不能**用来声称
+//     「冷启动已经很快」——约 1.5–2.9 s 的引擎自激活成本仍在，属上游引擎侧，本仓只观测不认领。
+//     （注：详档里的 2795 ms 是 A4 之前的**单次 compose** 同步块，与本文的 loader-settle-window
+//     不是同一个量，勿混用作本阈值的依据。）
+//   · **样本依赖说明（重要）**：本阈值是在 MuMu x86_64 模拟器（16416，竖屏）上取的。
+//     模拟器 CPU 争用会放大该窗口；真机(arm64)数值未测，可能更小。发布前须在真机补一次
+//     同口径采样；若真机显著更小，应据真机数据**下调**阈值而不是保留模拟器值。
+const LOOP_P99_BUDGET_MS = 3400
 // C4：至少要采到的样本数——**只用于区分「可判定」与「不可判定」，不用于健康判定**。
-// 下限 30 曾在设备实测 25 个样本上误红（探针在模块装载时 enable、compose 返回处读取，冷启动窗口长度
-// 随启动快慢天然波动，设备实测 25~92）。取 10：n=10 时 p99 约等于最大值，是粗糙但**非空洞**的断言；
-// 低于它分位数不成立 → C4 记 SKIP（不可判定），而 samples==0 仍判红（探针坏掉）。
+// 下限 30 曾在设备实测 25 个样本上误红（冷启动窗口长度随启动快慢天然波动）。取 10：n=10 时
+// p99 约等于最大值，是粗糙但**非空洞**的断言；低于它分位数不成立 → C4 记 SKIP（不可判定），
+// 而 samples==0 仍判红（探针坏掉）。换尺后实测样本 10–20，仍在 10 附近，故该下限保持不变。
 const LOOP_MIN_SAMPLES = 10
 /** C2：单个同步块上限（详档 §5.1：「探针报告的单次 compose dur ≤ 2000 ms」）。 */
 const SYNC_BLOCK_BUDGET_MS = 2000
@@ -675,20 +697,30 @@ function selfTest() {
       String(resultOf(r, 'C4')?.detail ?? '').slice(0, 100))
   }
 
-  // ⑦a 实机反例：首次 TOTAL 可以在 monitor 收口前记录 -1/0，末次 TOTAL 才有完整采样。
+  // ⑦a 实机反例：首次 TOTAL 可以在采样窗口收口前记录 -1/0，末次 TOTAL 才有完整采样。
   // 必须从末条完整 TOTAL 读取一对数据，不能把早期哨兵读成最终值，也不能跨行拼接字段。
   {
     const body = [
       '[perf] TOTAL calls=1 totalMs=300 instances=1 firstAt=100ms singles=-1 loopP99Ms=-1 loopSamples=0',
       '[perf] compose #2 at=800ms dur=40ms instances=1 records=60 singles=-1',
+      // 245.1 是**第二代（失明尺）**时期的实机读数，此处仅用于验证「取末条完整 loopStats」的解析语义。
       '[perf] TOTAL calls=2 totalMs=340 instances=1 firstAt=100ms singles=-1 loopP99Ms=245.1 loopSamples=20',
     ].join('\n')
     const parsed = parseProbe(body)
     check('⑦a-① 多条 TOTAL 取末条完整 loopStats（245.1ms / 20）',
       parsed.loopP99Ms === 245.1 && parsed.loopSamples === 20,
       'loopP99Ms=' + String(parsed.loopP99Ms) + ' loopSamples=' + String(parsed.loopSamples))
-    const r = run(segLine(), body)
-    check('⑦a-② 实机读数 245.1ms / 20 样本按超预算判 C4 FAIL',
+    // **必须由预算常量推导，不得写死字面量**：本用例原写死「245.1ms 必判红」，那是照失明尺时期的
+    // 100ms 预算写的；2026-10-06 按新尺重标到 3400ms 后 245.1 < 3400，该断言**静默失效**——
+    // 与 ⑧ 处已记载的 `p99=88` 事故同形（一个不会失败的测试不是防线）。改从常量推导，读数本身
+    // 只作解析面样本，判红面用「预算 + 123.4」这个必然超预算的值。
+    const overBudget = LOOP_P99_BUDGET_MS + 123.4
+    const overBody = [
+      '[perf] TOTAL calls=1 totalMs=300 instances=1 firstAt=100ms singles=-1 loopP99Ms=-1 loopSamples=0',
+      '[perf] TOTAL calls=2 totalMs=340 instances=1 firstAt=100ms singles=-1 loopP99Ms=' + overBudget + ' loopSamples=20',
+    ].join('\n')
+    const r = run(segLine(), overBody)
+    check('⑦a-② 超预算读数（' + overBudget + 'ms / 20 样本）判 C4 FAIL',
       okOf(r, 'C4') === false && resultOf(r, 'C4')?.severity === 'fail',
       'C4 ok=' + okOf(r, 'C4') + ' severity=' + resultOf(r, 'C4')?.severity)
     const finalSentinel = parseProbe([
