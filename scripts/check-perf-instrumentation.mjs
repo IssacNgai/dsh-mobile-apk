@@ -151,6 +151,11 @@ const PHASE_PROBE_MARKERS = [
   '[perf] phase name=${phase.name}',
   'durTotalMs=',
   'forwardedCallbacks=',
+  // C4 采样器口径（2026-10-06）：自建、arming 时锚定墙钟基线的采样器。
+  // 缺了这条，旧快照（用对外部 monitor）会一路通过构建并再次把整段卡顿报成健康。
+  'function dshMobileComboProbeLoopHistogram(',
+  'function dshMobileComboProbeArmLoopSampler(',
+  'let last = performance.now();',
 ]
 const missingPhaseProbeMarkers = (text) => PHASE_PROBE_MARKERS.filter((marker) => !text.includes(marker))
 const staleP1Fixture = 'dsh-mobile combo probe (P1)\ndshMobileComboProbeEmit\n[perf] TOTAL calls=1 totalMs=5 loopP99Ms=-1 loopSamples=0'

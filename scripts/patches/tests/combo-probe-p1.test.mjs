@@ -93,6 +93,19 @@ try {
       && !scheduleLine.includes('dshMobileComboProbeLoopLine'))
   check('cache/singles 以哨兵值缺席而非省字段',
     patched.includes('"comboCache=none hits=0 misses=0"') && /\? value : -1/.test(patched))
+  // C4 口径反证（2026-10-06 设备根因）：monitorEventLoopDelay 对「与 enable() 同 tick 开始的同步块」
+  // 结构性失明（设备实测：2.0s 整段阻塞被读成 11ms）。装进产品的必须是自建、arming 时锚定墙钟基线
+  // 的采样器，而不是该 API。缺了这条，旧实现会一路绿到设备上再次把卡顿报成健康。
+  check('C4 采样器 arming 时锚定基线（不是 monitorEventLoopDelay）',
+    patched.includes('dshMobileComboProbeArmLoopSampler')
+      && patched.includes('let last = performance.now();')
+      && patched.includes('function dshMobileComboProbeLoopHistogram()')
+      && !patched.includes('monitorEventLoopDelay('),
+    'arm=' + patched.includes('dshMobileComboProbeArmLoopSampler')
+      + ' anchor=' + patched.includes('let last = performance.now();')
+      + ' blindApi=' + patched.includes('monitorEventLoopDelay('))
+  check('C4 采样器在模块加载期即刻 arming（推迟会让基线落在块之后）',
+    /dshMobileComboProbeArmLoopSampler\(\);/.test(patched))
   // ④ 主线程门：非主线程块必须是**空**的，探针安装只发生在 else 分支
   const gateAt = patched.indexOf('if (!isMainThread) {')
   const elseAt = patched.indexOf('} else {', gateAt)
@@ -231,6 +244,42 @@ try {
     console.log = originalLog
   }
   check('行为夹具无 activation/compose 报错', errors.length === 0, errors.map(String).join(' | '))
+
+  // ⑤ C4 采样器行为反证（2026-10-06）：把「与 arming 同 tick 的同步块」喂给装进产品的采样器，
+  //    它必须看见整段。旧实现（monitorEventLoopDelay）在同一场景下恒报 ~11ms（设备 2.0s 块被报成
+  //    11ms），本用例就是为那个假绿形态存在的：换回旧 API 即判红。
+  {
+    const samplerRegion = patched.match(/function dshMobileComboProbeLoopHistogram\(\)[\s\S]*?\n\}/)
+      && patched.match(/function dshMobileComboProbeArmLoopSampler\(\)[\s\S]*?\n\}/)
+    check('采样器可从产物中提取（行为反证前置）', Boolean(samplerRegion))
+    if (samplerRegion) {
+      // 取连续区间：直方图 + 其间的 let/const 声明 + arm 函数（分开取会漏掉声明，harness 直接 ReferenceError）
+      const hist = patched.match(/function dshMobileComboProbeLoopHistogram\(\)[\s\S]*?dshMobileComboProbeArmLoopSampler\(\) \{[\s\S]*?\n\}/)[0]
+      const harness = [
+        hist,
+        'function dshMobileComboProbeLoopLine() {',
+        '  const stats = dshMobileComboProbeLoopStats;',
+        '  if (stats === void 0 || stats.samples === 0) return "loopP99Ms=-1 loopSamples=-1";',
+        '  const p99 = stats.percentile(99);',
+        '  return "loopP99Ms=" + (p99 < 0 ? -1 : p99) + " loopSamples=" + stats.samples;',
+        '}',
+        'const block = (ms) => { const s = performance.now(); while (performance.now() - s < ms) {} };',
+        'dshMobileComboProbeArmLoopSampler();',
+        'block(400);',
+        'await new Promise(r => setTimeout(r, 250));',
+        'console.log(dshMobileComboProbeLoopLine());',
+      ].join('\n')
+      const harnessPath = join(scratch, 'sampler-harness.mjs')
+      writeFileSync(harnessPath, harness)
+      const witness = spawnSync(process.execPath, [harnessPath], { encoding: 'utf8' })
+      const line = (witness.stdout || '').trim()
+      const p99 = Number((line.match(/loopP99Ms=([\d.-]+)/) || [])[1])
+      // 同一 tick 的 400ms 块：可接受区间取 >250ms（调度抖动与 arming 开销留余量），
+      // 旧实现恒为 ~11ms，落不进该区间。
+      check('行为反证：arming 同 tick 的 400ms 同步块必须可见（旧实现在此恒报 ~11ms）',
+        Number.isFinite(p99) && p99 > 250, line + '（p99=' + String(p99) + '）')
+    }
+  }
 } finally {
   rmSync(scratch, { recursive: true, force: true })
 }
