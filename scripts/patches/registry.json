@@ -93,6 +93,16 @@
       "marker": "dsh-mobile safe keeps shipped plugins (S1)"
     },
     {
+      "id": "undo-safe-transaction-S2",
+      "target": "dsh-undo-savepoint/lib/core.mjs",
+      "summary": "Safe Mode 先验证备份并原子写兼容状态，再逐项原子改动；中断后保留可重试恢复路径",
+      "provenance": "2026-10-05 Hard/Soft/Data 重构审计：多个 Safe Mode 入口曾在改配置后才写状态，崩溃会丢失退出依据",
+      "requires": [
+        "undo-safe-align-S1"
+      ],
+      "marker": "dsh-mobile safe mode transaction (S2)"
+    },
+    {
       "id": "undo-api-auth-U1",
       "target": "dsh-undo-savepoint/lib/index.js",
       "summary": "为 /api/undo 更长 prefix 重建 Host/Origin、浏览器会话和壳侧 controlToken 鉴权；所有读写在 body/快照操作前失败关闭",
@@ -157,6 +167,22 @@
       "summary": "把 compose 探针送进产品内（收口 t_compose_total 恒 -1）：在 compose() 返回处打印 `[perf] compose #N at=.. dur=..` 与 `[perf] TOTAL calls=.. totalMs=.. instances=.. firstAt=..ms singles=.. loopP99Ms=.. loopSamples=.. comboCache=..`（字段齐备，无值报 -1）；只主线程安装（worker 的 calls=0 TOTAL 不得冒充真读数）；不新增快照成员、壳侧解析器零改动",
       "provenance": "0.14.1 块F（T6 设备实测真因 + 详档 §5.1 C6/P-AC-04）：42/42 恒为 -1；preload/注入方案结构性无效——① count-compose 的 TOTAL 只在 process.on('exit') 打印，落在 killExistingEngine() 内、早于 rotateEngineLog()，被搬进 engine.log.1 而新生代从偏移 0 读不到；② --import/NODE_OPTIONS 在 file-based worker 线程也执行（Node v24.17 实测，引擎树至少 5 处 worker），worker 临终打 calls=0 而解析取最后一条，得到「非 -1 但为 0」的假绿，且 NODE_OPTIONS 会继承到 agent 全部子进程、缺 COMBO_LIB 直接 exit(2)。落点在 compose() 返回处 = LISTEN 之后、首个页面请求路径上，正是 C2 要测的同步块",
       "marker": "dsh-mobile combo probe (P1)"
+    },
+    {
+      "id": "client-registry-scan-C4",
+      "target": "usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-modules/lib/index.js",
+      "scope": "engine",
+      "summary": "每个同步 flush 按名称单次索引 Loader 条目，错误回调后失效；nearestPackage 已解析的 manifest 在 resolveMeta 内复用。保留同步构造错误、启动 settle 顺序及运行期/HMR即时语义",
+      "provenance": "2026-10-06 MuMu 0.14.5 受控细分：client 构造 flush 193 次 Loader 遍历、38021 行；typert 初始 flush 193 次 qualifies、24181 行。独立CPU样本证实反复遍历热点；C4总体预算仍须无诊断冷启动复测，不以局部耗时改善认绿。",
+      "marker": "dsh-mobile registry scan C4"
+    },
+    {
+      "id": "typert-registry-scan-C4",
+      "target": "usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-typert-loader/lib/index.js",
+      "scope": "engine",
+      "summary": "每个同步 flush 单次索引已挂接名称；异步 typert manifest 完成后仍扫描 live Loader，防已移除条目误注册。错误回调后索引失效，显式包与激活失败语义保留",
+      "provenance": "2026-10-06 MuMu 0.14.5 受控细分：client 构造 flush 193 次 Loader 遍历、38021 行；typert 初始 flush 193 次 qualifies、24181 行。独立CPU样本证实反复遍历热点；C4总体预算仍须无诊断冷启动复测，不以局部耗时改善认绿。",
+      "marker": "dsh-mobile typert scan C4"
     },
     {
       "id": "perf-compile-cache-flush-N2",
@@ -230,6 +256,21 @@
       "provenance": "Official639ed015 patches/@earendil-works__pi-ai@0.87.1.patch SHA256 b9bcce474fb2ac44633dff0fa722816a5bff5451b4575d5874035ea14ba70a4f; exact context/idempotent, no fuzzy matching",
       "marker": "official pi-ai0.87.1 six-file streaming state checked by exact pinned contexts",
       "verifier": "pi-upstream-streaming-020"
+    },
+    {
+      "id": "mimo-thinking-toggle-056",
+      "target": "usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-llm-pi-ai/lib/index.js",
+      "additionalTargets": [
+        "usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@earendil-works/pi-ai/dist/api/openai-completions.js"
+      ],
+      "scope": "engine",
+      "summary": "MiMo OpenAI Completions thinking.type 二态开关：保留关闭值、仅显示关闭/开启、传回多轮 reasoning_content，不发送 reasoning_effort",
+      "provenance": "Issue #56; MiMo 官方 openai-completions 协议 profile; exact pinned runtime anchors",
+      "marker": "dsh-mobile MiMo thinking toggle (issue #56)",
+      "requires": [
+        "pi-upstream-streaming-020"
+      ],
+      "verifier": "mimo-thinking-toggle-056"
     },
     {
       "id": "pi-toolcall-G2",

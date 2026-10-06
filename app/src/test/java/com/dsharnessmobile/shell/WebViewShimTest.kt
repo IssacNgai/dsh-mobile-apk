@@ -62,6 +62,20 @@ class WebViewShimTest {
     assertEquals(0, WebViewShim.majorOf(".5"))
   }
 
+  @Test
+  fun chromiumVersionComesFromTheEngineUserAgentNotVendorPackageVersion() {
+    assertEquals(
+      "99.0.4844.88",
+      WebViewShim.chromiumVersionFromUserAgent("Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/99.0.4844.88 Mobile Safari/537.36"),
+    )
+    assertEquals("", WebViewShim.chromiumVersionFromUserAgent("14.0.0.370"))
+    assertEquals("", WebViewShim.chromiumVersionFromUserAgent("Mozilla/5.0 VendorWebView/14.0.0.370"))
+    assertEquals("unknown", WebViewShim.syntaxFloorStatus(WebViewShim.chromiumVersionFromUserAgent("14.0.0.370"), 94))
+    assertEquals("unknown", WebViewShim.syntaxFloorStatus("", 94))
+    assertEquals("false", WebViewShim.syntaxFloorStatus("93.0.4577.82", 94))
+    assertEquals("true", WebViewShim.syntaxFloorStatus("99.0.4844.88", 94))
+  }
+
   // ── 单面真源契约 ────────────────────────────────────────────────────
 
   @Test

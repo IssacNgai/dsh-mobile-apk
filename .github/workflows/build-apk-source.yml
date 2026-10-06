@@ -16,6 +16,7 @@ jobs:
       - name: Checkout project source without Git LFS runtime archives
         uses: actions/checkout@v4
         with:
+          persist-credentials: false
           fetch-depth: 1
           lfs: false
 
@@ -33,14 +34,7 @@ jobs:
       - name: Verify pinned source replacement before the expensive build
         run: |
           python3 -m unittest discover -s scripts/source-build -p 'test_*.py' -v
-          node --test scripts/source-build/reconcile-harness-vendor-lock.test.mjs
-          node --test scripts/source-build/check-package-lock-roots.test.mjs
-          node --test scripts/source-build/check-android-native-runtime-packages.test.mjs
-          node --test scripts/source-build/preset-carriers.test.mjs
-          node --test scripts/source-build/restore-overlay-pins.test.mjs
-          node --test scripts/source-build/reconcile-engine-patch-copies.test.mjs
-          node --test scripts/source-build/normalize-snapshot.test.mjs
-          node --test scripts/source-build/source-chain-rerun.test.mjs
+          node --test scripts/source-build/*.test.mjs scripts/check-apk-signatures.test.mjs scripts/resolve-version-suffix.test.mjs
           node scripts/source-build/check-package-lock-roots.mjs
       - name: Install archive and signature tools
         run: |
@@ -882,6 +876,17 @@ jobs:
           node scripts/source-build/normalize-snapshot.mjs "$work/tree" \
             --out .deploy-tmp/source-build/snapshot-normalization.json
           rm -rf "$work"
+
+      - name: Reverify final APK files before artifact upload
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/check-apk-signatures.mjs --self-test
+          mapfile -t apks < <(find out -type f -name '*.apk' | sort)
+          [ "${#apks[@]}" -gt 0 ] || { echo "::error::source build has no final APKs"; exit 1; }
+          args=()
+          for apk in "${apks[@]}"; do args+=(--apk "$apk"); done
+          node scripts/check-apk-signatures.mjs "${args[@]}"
 
       - name: Upload APK and provenance
         uses: actions/upload-artifact@v4

@@ -29,6 +29,9 @@ on:
         type: boolean
         default: false
 
+permissions:
+  contents: read
+
 jobs:
   source-audit:
     if: ${{ inputs.source_audit }}
@@ -48,6 +51,7 @@ jobs:
       - name: 检出本仓库（含 Git LFS 底座归档）
         uses: actions/checkout@v4
         with:
+          persist-credentials: false
           fetch-depth: 0
           lfs: true
 
@@ -113,6 +117,15 @@ jobs:
         run: |
           set -e
           node scripts/build-apk.mjs --abi "${{ matrix.abi }}" --suffix "${{ github.event.inputs.suffix }}"
+
+      - name: 上传前复核最终 APK 签名
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/check-apk-signatures.mjs --self-test
+          mapfile -t apks < <(find out -type f -name '*.apk' | sort)
+          [ "${#apks[@]}" -eq 1 ] || { echo "::error::当前 ABI 产物数不是 1: ${#apks[@]}"; exit 1; }
+          node scripts/check-apk-signatures.mjs --apk "${apks[0]}"
 
       - name: 上传 APK 产物（本地下载 debug；不出 Release）
         uses: actions/upload-artifact@v4

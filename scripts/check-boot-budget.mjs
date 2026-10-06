@@ -236,7 +236,7 @@ export function parseSegments(text) {
  *   [perf] compose #<n> at=<ms>ms dur=<ms>ms instances=<n> records=<n> [singles=<n>] [comboCache=...]
  *   [perf] boot singles=<n> records=<n>          ← compose #1 之后的启动期读数（C5 反向判据）
  *   [perf] single #<n> at=<ms>ms singles=<n>     ← 单条 URL 被请求（C5 正向对照）
- *   [perf] TOTAL calls=<n> totalMs=<ms> instances=<n> firstAt=<ms>ms singles=<n> loopP99Ms=<ms|n/a> loopSamples=<n> [comboCache=...]
+ *   [perf] TOTAL calls=<n> totalMs=<ms> instances=<n> firstAt=<ms>ms singles=<n> loopP99Ms=<-1|ms|n/a> loopSamples=<-1|n> [comboCache=...]
  */
 export function parseProbe(text) {
   const body = String(text ?? '')
@@ -257,8 +257,11 @@ export function parseProbe(text) {
   const singleLines = [...body.matchAll(/\[perf\] single #(\d+) at=\d+ms singles=(-?\d+|n\/a)/g)]
     .map((m) => ({ n: Number(m[1]), singles: m[2] }))
   const singlesField = /singles=(\d+)/.exec(body)
-  const p99 = /loopP99Ms=([\d.]+|n\/a)/.exec(body)
-  const samples = /loopSamples=(\d+)/.exec(body)
+  // TOTAL 行可能先输出 monitor 尚未采样的 -1/0，随后再输出 debounce 收口后的真实读数。
+  // 两个字段必须从同一条、最新的完整 TOTAL 行配对读取；分开 .exec 会把早期哨兵当成最终值。
+  const loopStats = [...body.matchAll(/\[perf\] TOTAL\b[^\r\n]*?\bloopP99Ms=(-?\d+(?:\.\d+)?|n\/a)\s+loopSamples=(-?\d+)\b/g)]
+    .map((m) => ({ p99: m[1], samples: Number(m[2]) }))
+  const lastLoopStats = loopStats.length > 0 ? loopStats[loopStats.length - 1] : null
   return {
     hasProbe: total !== null,
     // composeCalls 取**末条** TOTAL 的 calls：P1 的 stats.calls 是进程内累计计数器，末条即真值。
@@ -284,8 +287,8 @@ export function parseProbe(text) {
     maxSingleSingles: singleLines.length > 0
       ? Math.max(...singleLines.map((s) => (s.singles === 'n/a' ? -1 : Number(s.singles)))) : undefined,
     singlesAtExit: singlesField ? Number(singlesField[1]) : undefined,
-    loopP99Ms: p99 && p99[1] !== 'n/a' ? Number(p99[1]) : undefined,
-    loopSamples: samples ? Number(samples[1]) : undefined,
+    loopP99Ms: lastLoopStats && lastLoopStats.p99 !== 'n/a' ? Number(lastLoopStats.p99) : undefined,
+    loopSamples: lastLoopStats?.samples,
   }
 }
 
@@ -475,7 +478,7 @@ export function runChecks(input, budgets = resolveBudgets([])) {
   // 误红**（下限 30 曾在设备 25 样本上误红）。三态：
   //   ① samples ≥ 下限 → 按 p99 判 PASS/FAIL（唯一的健康判据）；
   //   ② 0 < samples < 下限 → **SKIP**（不可判定：窗口太短、分位数不成立），绝不判红、也绝不算绿；
-  //   ③ samples == 0 或缺读数 → **FAIL**（探针/接线坏了，正是 C4 要防的真缺陷）。
+  //   ③ sentinel/负样本、samples == 0 → **FAIL**（探针/接线坏了，正是 C4 要防的真缺陷）。
   // ③ 是「C4 不会因长期 SKIP 而丧失判别力」的锚点：没有它，把不足一律 SKIP 等于让 C4 永绿。
   {
     const p99 = probe.loopP99Ms
@@ -484,6 +487,10 @@ export function runChecks(input, budgets = resolveBudgets([])) {
     if (p99 === undefined || samples === undefined) {
       add('C4', budgetLabel, false,
         '缺 loopP99Ms/loopSamples 读数——探针未产出事件循环读数（接线坏了）', strict ? 'fail' : 'skip')
+    } else if (p99 < 0 || samples < 0) {
+      add('C4', budgetLabel, false,
+        '事件循环探针返回哨兵值：loopP99Ms=' + p99 + ' loopSamples=' + samples
+        + '（负值表示没有有效读数，不能视为缺字段、SKIP 或通过）')
     } else if (samples === 0) {
       // ③ 探针一个样本都没有：与「窗口太短」是两回事，这是真缺陷。
       add('C4', budgetLabel, false,
@@ -643,15 +650,46 @@ function selfTest() {
       okOf(r, 'C5+') === false, 'C5+ ok=' + okOf(r, 'C5+'))
   }
 
-  // ⑦ 反向对照：p99 达标但样本数为 0（探针一个样本都没产出）→ C4 必须判红。
+  // ⑦ 反向对照：p99=-1 且样本数为 0 → 哨兵和空读数都必须被解析并使 C4 判红。
   // 这是三态切法里的第 ③ 态，也是「C4 不因长期 SKIP 而丧失判别力」的锚点。
   {
-    const r = run(segLine(), probeText({ p99: 5, samples: 0, single: true }))
-    check('反向对照：loopSamples=0（探针未产出样本）→ C4 判红（不得当 SKIP/绿）',
-      okOf(r, 'C4') === false, 'C4 ok=' + okOf(r, 'C4'))
-    check('反向对照：loopSamples=0 的判红理由点名「探针未生效/未接线」',
-      String(resultOf(r, 'C4')?.detail ?? '').includes('一个样本都没产出'),
-      String(resultOf(r, 'C4')?.detail ?? '').slice(0, 90))
+    const body = probeText({ p99: -1, samples: 0, single: true })
+    const parsed = parseProbe(body)
+    check('反向对照：loopP99Ms=-1 被解析为哨兵值，loopSamples=0 保留为真实读数',
+      parsed.loopP99Ms === -1 && parsed.loopSamples === 0,
+      'loopP99Ms=' + String(parsed.loopP99Ms) + ' loopSamples=' + String(parsed.loopSamples))
+    const r = run(segLine(), body)
+    check('反向对照：loopP99Ms=-1 / loopSamples=0 → C4 判红（不得误报缺字段或 SKIP）',
+      okOf(r, 'C4') === false && resultOf(r, 'C4')?.severity === 'fail',
+      'C4 ok=' + okOf(r, 'C4') + ' severity=' + resultOf(r, 'C4')?.severity)
+    check('反向对照：负哨兵判红理由明确点名「哨兵值」',
+      String(resultOf(r, 'C4')?.detail ?? '').includes('哨兵值'),
+      String(resultOf(r, 'C4')?.detail ?? '').slice(0, 100))
+  }
+
+  // ⑦a 实机反例：首次 TOTAL 可以在 monitor 收口前记录 -1/0，末次 TOTAL 才有完整采样。
+  // 必须从末条完整 TOTAL 读取一对数据，不能把早期哨兵读成最终值，也不能跨行拼接字段。
+  {
+    const body = [
+      '[perf] TOTAL calls=1 totalMs=300 instances=1 firstAt=100ms singles=-1 loopP99Ms=-1 loopSamples=0',
+      '[perf] compose #2 at=800ms dur=40ms instances=1 records=60 singles=-1',
+      '[perf] TOTAL calls=2 totalMs=340 instances=1 firstAt=100ms singles=-1 loopP99Ms=245.1 loopSamples=20',
+    ].join('\n')
+    const parsed = parseProbe(body)
+    check('⑦a-① 多条 TOTAL 取末条完整 loopStats（245.1ms / 20）',
+      parsed.loopP99Ms === 245.1 && parsed.loopSamples === 20,
+      'loopP99Ms=' + String(parsed.loopP99Ms) + ' loopSamples=' + String(parsed.loopSamples))
+    const r = run(segLine(), body)
+    check('⑦a-② 实机读数 245.1ms / 20 样本按超预算判 C4 FAIL',
+      okOf(r, 'C4') === false && resultOf(r, 'C4')?.severity === 'fail',
+      'C4 ok=' + okOf(r, 'C4') + ' severity=' + resultOf(r, 'C4')?.severity)
+    const finalSentinel = parseProbe([
+      '[perf] TOTAL calls=1 totalMs=300 instances=1 firstAt=100ms singles=-1 loopP99Ms=12 loopSamples=40',
+      '[perf] TOTAL calls=2 totalMs=340 instances=1 firstAt=100ms singles=-1 loopP99Ms=-1 loopSamples=0',
+    ].join('\n'))
+    check('⑦a-③ 末条仍为 -1/0 时保留末条哨兵（不回退到早期健康值）',
+      finalSentinel.loopP99Ms === -1 && finalSentinel.loopSamples === 0,
+      'loopP99Ms=' + String(finalSentinel.loopP99Ms) + ' loopSamples=' + String(finalSentinel.loopSamples))
   }
 
   // ⑦b 三态切法的回归用例（本轮踩到的真实场景）。

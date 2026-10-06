@@ -196,14 +196,12 @@ class EngineManager(private val context: Context, private val pickToken: String?
           + " -> " + discarded.joinToString(", "))
       }
       SnapshotFs.createDirectories(stage)
-      if (!extractSnapshotTo(stage, onProgress)) {
-        SnapshotFs.deletePath(stage)
-        Log.e(TAG, "snapshot refresh: extract failed; live runtime untouched")
-        return false
-      }
-      if (!stagedRuntimeComplete(stage)) {
-        SnapshotFs.deletePath(stage)
-        Log.e(TAG, "snapshot refresh: staged runtime incomplete; live runtime untouched")
+      if (!SnapshotRefreshStage.extractAndValidate(
+          stage,
+          extract = { extractSnapshotTo(it, onProgress) },
+          validate = ::stagedRuntimeComplete,
+        )) {
+        Log.e(TAG, "snapshot refresh: extraction failed or staged runtime incomplete; live runtime untouched")
         return false
       }
 
@@ -887,25 +885,7 @@ class EngineManager(private val context: Context, private val pickToken: String?
     if (isSymlink(privateDir)) {
       Files.delete(privateDir.toPath())
     }
-    if (!publicDir.isDirectory) return
-    if (privateDir.isDirectory) {
-      if (privateDir.listFiles()?.isNotEmpty() == true) {
-        // Conflict: the private entity wins; the public copy is kept aside for review.
-        val backup = uniqueBackup(publicDir)
-        if (!publicDir.renameTo(backup)) {
-          throw java.io.IOException("failed to backup public dir " + publicDir.absolutePath)
-        }
-        Log.w(TAG, "private " + privateDir.absolutePath + " exists; public kept as " + backup.absolutePath)
-        return
-      }
-      SnapshotFs.deletePath(privateDir)
-    }
-    privateDir.parentFile?.mkdirs()
-    copyTreeVerified(publicDir, privateDir)
-    SnapshotFs.deletePath(publicDir)
-    if (SnapshotFs.exists(publicDir)) {
-      throw java.io.IOException("failed to delete public source " + publicDir.absolutePath)
-    }
+    ReverseMigration.migrateDir(privateDir, publicDir)
   }
 
   /** File-level reverse migration: drop the private symlink, copy the public file back, then delete the public source. */
@@ -1050,16 +1030,6 @@ class EngineManager(private val context: Context, private val pickToken: String?
 
   private fun isSymlink(file: File): Boolean = Files.isSymbolicLink(file.toPath())
 
-  private fun uniqueBackup(publicFile: File): File {
-    var candidate = File(publicFile.parentFile, publicFile.name + ".public-backup")
-    var i = 1
-    while (candidate.exists()) {
-      candidate = File(publicFile.parentFile, publicFile.name + ".public-backup-" + i)
-      i++
-    }
-    return candidate
-  }
-
   private fun uniquePrivateBackup(privateFile: File): File {
     var candidate = File(privateFile.parentFile, privateFile.name + ".private-backup")
     var i = 1
@@ -1068,26 +1038,6 @@ class EngineManager(private val context: Context, private val pickToken: String?
       i++
     }
     return candidate
-  }
-
-  /** Recursively copy a directory tree, verifying the file count and total size. */
-  private fun copyTreeVerified(src: File, dst: File) {
-    dst.mkdirs()
-    src.listFiles()?.forEach { f ->
-      val target = File(dst, f.name)
-      if (f.isDirectory) {
-        copyTreeVerified(f, target)
-      } else {
-        f.copyTo(target, overwrite = true)
-      }
-    }
-    val srcFiles = src.walkBottomUp().filter { it.isFile }.toList()
-    val dstFiles = dst.walkBottomUp().filter { it.isFile }.toList()
-    val srcSize = srcFiles.sumOf { it.length() }
-    val dstSize = dstFiles.sumOf { it.length() }
-    if (srcFiles.size != dstFiles.size || srcSize != dstSize) {
-      throw java.io.IOException("copy verification failed for " + src.absolutePath)
-    }
   }
 
   /**
@@ -1576,17 +1526,20 @@ class EngineManager(private val context: Context, private val pickToken: String?
     // 字段名与 MainActivity 在 boot-diag.log 里用的**逐字一致**，便于两处对账。
     // 取值口径同源：统一走 WebViewShim（provider 回读唯一实现）。
     try {
-      val ver = WebViewShim.providerVersionName()
+      val providerVersion = WebViewShim.providerVersionName()
       // 这里的「读不到」哨兵保留 -1（显式缺席）；与 MainActivity 判据侧的 0 口径不同是有意的：
       // 判据侧 0 不冒充通过，诊断包侧 -1 强调「连版本名都没拿到」。
-      val major = if (ver.isEmpty()) -1 else WebViewShim.providerMajor()
+      val chromiumVersion = MainActivity.observedChromiumVersion
+      val major = if (chromiumVersion.isEmpty()) -1 else WebViewShim.majorOf(chromiumVersion)
       sb.append("webview_package: ").append(WebViewShim.providerPackageName()).append('\n')
       // provider 缺席（无 WebView ROM / 升级窗口）与「版本串解析失败」含义不同，单列一项。
       sb.append("webview_provider_available: ").append(WebViewShim.providerAvailable()).append('\n')
-      sb.append("webview_version: ").append(ver).append('\n')
+      sb.append("webview_provider_version: ").append(providerVersion).append('\n')
+      sb.append("webview_version: ").append(chromiumVersion).append('\n')
       sb.append("webview_major: ").append(major).append('\n')
       // 语法下限 94（Chromium 94 起才有类静态块 static{}；低于它入口 chunk 解析即整体不执行 = 纯白无字）。
-      sb.append("syntax_floor_ok: ").append(major >= MainActivity.WEBVIEW_SYNTAX_FLOOR_MAJOR).append('\n')
+      val syntaxFloor = WebViewShim.syntaxFloorStatus(chromiumVersion, MainActivity.WEBVIEW_SYNTAX_FLOOR_MAJOR)
+      sb.append("syntax_floor_ok: ").append(syntaxFloor).append('\n')
     } catch (_: Throwable) {
       // 诊断本身不得成为故障源；字段缺席好过抛异常。
     }

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// verify-auto-undo.mjs —— 自动回滚（UndoGate → 急救 CLI restore-last-good）的设备验收。
+// verify-auto-undo.mjs —— 自动回滚（UndoGate → 壳侧已知良好快照 ID）的设备验收。
 //
 // 用户口径（2026-09-21）：「不能让有问题的回滚进入新版本。测试流程就是手动注入坏插件，重启引擎
 // 看看有没有被清除」，并追加验收第二条：「要测试是不是能正常剔除坏插件**且不损坏我们自己注册的任何好插件**」。
@@ -363,7 +363,7 @@ async function goodThenBadPhase() {
  * P5 跨版本护栏：把「已知良好记录」的安装指纹篡改成**另一次安装**的指纹，然后重现坏插件故障。
  *
  * 期望：**不回滚**（探针出现 `aborted no-known-good-for-this-install` 且本轮没有新的 `executed ok`）。
- * 反面（旧实现）：CLI 的 restore-last-good 会把上一次安装/崩溃启动时的配置写回 ⇒ 新版本自带的
+ * 反例（已移除的壳侧自动 fallback）：CLI 的 restore-last-good 会把上一次安装/崩溃启动时的配置写回 ⇒ 新版本自带的
  * 补丁与挂载项被静默删掉，用户看到「升级后功能反而没了」，而且 APK 还是新的（新代码 + 旧配置混合态）。
  *
  * 注意顺序：先杀引擎再篡改——否则下一拍 HEALTHY 会把记录按当前指纹重写，篡改活不过 5 秒。

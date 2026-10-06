@@ -294,7 +294,8 @@
         "package.json": "usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-modules/package.json"
       },
       "patchIds": [
-        "combo-probe-P1"
+        "combo-probe-P1",
+        "client-registry-scan-C4"
       ]
     },
     "dsh-root-0.2.0-rc.2": {
@@ -485,6 +486,7 @@
       },
       "patchIds": [
         "pi-upstream-streaming-020",
+        "mimo-thinking-toggle-056",
         "pi-toolcall-G2"
       ]
     },
@@ -566,6 +568,56 @@
       "patchIds": [
         "atomic-stale-lock-F4"
       ]
+    },
+    "dsh-llm-pi-ai-0.2.0-rc.2": {
+      "source": "engine-tgz",
+      "engine": "0.2.0-rc.2",
+      "package": "@deepseek-ai/dsh-llm-pi-ai@0.2.0-rc.2",
+      "provenance": {
+        "tarballFile": "deepseek-ai-dsh-llm-pi-ai-0.2.0-rc.2.tgz",
+        "tarballSha256": "684c9084556c650cb69ed48c9f8ebc3ca56dedb9a4077ed487eae46a0b3b21c4",
+        "inputKind": "published-tarball"
+      },
+      "files": [
+        "lib/index.js",
+        "package.json"
+      ],
+      "fileSha256": {
+        "lib/index.js": "d46dbc30aeb3414190000e6f8aeaaf994246b5e5c651de07639f4a7e92de37ef",
+        "package.json": "202c51795238f9ef8f3d57319bda831973eb91a0eb8661256aa6a75476e6e53f"
+      },
+      "targets": {
+        "lib/index.js": "usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-llm-pi-ai/lib/index.js",
+        "package.json": "usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-llm-pi-ai/package.json"
+      },
+      "patchIds": [
+        "mimo-thinking-toggle-056"
+      ]
+    },
+    "dsh-typert-loader-0.2.0-rc.2": {
+      "source": "engine-tgz",
+      "engine": "0.2.0-rc.2",
+      "package": "@deepseek-ai/dsh-typert-loader@0.2.0-rc.2",
+      "provenance": {
+        "tarballFile": "deepseek-ai-dsh-typert-loader-0.2.0-rc.2.tgz",
+        "tarballSha256": "69aebbbf48718a6b33f0cfb76cb82bbb82adcbe51e27d5cb700c502deb682b5b",
+        "inputKind": "published-tarball"
+      },
+      "files": [
+        "lib/index.js",
+        "package.json"
+      ],
+      "fileSha256": {
+        "lib/index.js": "7543ff6113374e6bd21a3c0aece264dffada131d816533bdfb61adf6abbac00e",
+        "package.json": "5ec69734190f4ccd765e3584c5f676d55f61c71a5b96139cf882172c3245b7ae"
+      },
+      "targets": {
+        "lib/index.js": "usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-typert-loader/lib/index.js",
+        "package.json": "usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-typert-loader/package.json"
+      },
+      "patchIds": [
+        "typert-registry-scan-C4"
+      ]
     }
   },
   "capture": {
@@ -577,6 +629,6 @@
       ]
     },
     "overlaySha256": "20d3c4b6cd1d01391272f8ec9a036590befcee9a5e3cb55263619982a0a4bfba",
-    "registrySha256": "d1953ba2c74ea40093253628963400c7a894498e98c1992e2fc3b4af6b21bc04"
+    "registrySha256": "9c21d4f90816b4fd14ccc16d474e4b40eedfe1b2419ad09b6a9fc03be1431688"
   }
 }

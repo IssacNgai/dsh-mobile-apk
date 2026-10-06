@@ -35,18 +35,23 @@ jobs:
       # （inject-snapshot.py / ci-verify-snapshot.py 与协调仓逐字节一致，由协调仓 CI 的
       # check-patch-mirror 跨仓守门）。
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/checkout@v4
         with:
+          persist-credentials: false
           repository: kelai141/dsh-shell-termux
           ref: ${{ inputs.plugins_ref || 'main' }}
           path: dsh-shell-termux
       - uses: actions/checkout@v4
         with:
+          persist-credentials: false
           repository: kelai141/dsh-client-ui-responsive
           ref: ${{ inputs.plugins_ref || 'main' }}
           path: dsh-client-ui-responsive
       - uses: actions/checkout@v4
         with:
+          persist-credentials: false
           repository: kelai141/dsh-host-web-compat
           ref: ${{ inputs.plugins_ref || 'main' }}
           path: dsh-host-web-compat
@@ -130,6 +135,7 @@ jobs:
           ANDROID_USER_HOME: ${{ github.workspace }}/.android-home
         run: |
           chmod +x gradlew
+          node --test scripts/check-apk-signatures.test.mjs scripts/resolve-version-suffix.test.mjs
           mkdir -p "$ANDROID_USER_HOME/.android" out/apk out/snapshot out/plugins
           cp keystore/debug.keystore "$ANDROID_USER_HOME/.android/debug.keystore"
           VER="${{ steps.ver.outputs.version }}"
@@ -141,6 +147,8 @@ jobs:
             ./gradlew :app:assembleDebug --no-daemon --rerun-tasks -PversionNameSuffix="${{ inputs.version_suffix }}"
             cp app/build/outputs/apk/debug/app-debug.apk "out/apk/dsh-mobile-apk-v${VER}-${ABI}.apk"
           done
+          node scripts/check-apk-signatures.mjs --self-test
+          node scripts/check-apk-signatures.mjs --dir out/apk
           cp snapshot/snapshot-arm64.tar.xz out/snapshot/
           cp snapshot/snapshot-x86_64.tar.xz out/snapshot/
           cp plugins/*.tgz out/plugins/
@@ -155,6 +163,12 @@ jobs:
           done > MANIFEST.txt
           printf '# v%s 发布说明\n\n## 改动\n- \n\n## 验证记录（门禁要求：每个 ABI 必须引用验证）\n- arm64-v8a: （真机/MuMu 记录）\n- x86_64: （MuMu 记录）\n' "${{ steps.ver.outputs.version }}" > notes.md
           cat MANIFEST.txt
+
+      - name: Upload 前复核最终 APK 签名
+        run: |
+          set -euo pipefail
+          node scripts/check-apk-signatures.mjs --self-test
+          node scripts/check-apk-signatures.mjs --dir out/apk
 
       # ---- 产物只存 artifact（不创建 release）----
       - uses: actions/upload-artifact@v4

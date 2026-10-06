@@ -21,6 +21,9 @@ if ($Fast) {
 # 共用同一份脚本——双仓字节级同版，杜绝雷点 10 单边演进。
 $apkDir = Join-Path $Root "dsh-mobile-apk"
 if (-not (Test-Path $apkDir)) { $apkDir = $Root }
+Write-Host "== APK scheme / version suffix regression tests =="
+node --test (Join-Path $Root "scripts\check-apk-signatures.test.mjs") (Join-Path $Root "scripts\resolve-version-suffix.test.mjs") (Join-Path $Root "scripts\build-apk-engine.test.mjs")
+if ($LASTEXITCODE -ne 0) { throw "APK scheme/version regression tests failed" }
 
 # 统一 per-ABI 拒绝记账（坑 94 / review C2，2026-09-14）：曾有三处拒绝路径只 `continue` 不记账
 # （机密 / 运行时资产 / A1 出厂值）+ elf-check 退出码被丢弃 → 请求双 ABI 时只交付单 ABI 仍 exit 0。
@@ -224,6 +227,9 @@ $Out = Join-Path $Root ("out\v" + $GradleVer)
 # Keep the layout-resolved path from the root self-detection above.
 # Overwriting it here breaks self-contained APK checkouts by targeting Root\dsh-mobile-apk.
 New-Item -ItemType Directory -Force -Path $Out | Out-Null
+# This directory contains generated deliverables. Remove old APKs before the dual-ABI run so a
+# stale or extra package cannot pass the final directory-wide signature scan as this build's output.
+Get-ChildItem $Out -Filter '*.apk' -File -Recurse | Remove-Item -Force
 
 # 注入集单一常量（0.13.8-b ST-06 / F-ENV-04）：dirs/externals 都在 scripts/plugin-dirs.json，
 # 与云端链 dsh-mobile-apk/scripts/build-apk.mjs 共用同一份——此前两条链各写一份，云端
@@ -441,29 +447,23 @@ foreach ($abi in @('arm64', 'x86_64')) {
     node (Join-Path $Root "scripts\check-perf-instrumentation.mjs") --require --snapshot $snapIn --abi $abi 2>&1
     if ($LASTEXITCODE -ne 0) { Deny-Abi $abi "A1 出厂值/度量入口校验失败"; continue }
 
-    # 3. 双 ABI APK（cp 快照 + 指纹 → gradle assembleDebug）
+    # 3. Shared per-ABI terminal engine: snapshot/fingerprint -> Gradle -> named artifact.
+    # The ABI-specific gates/injection above and multi-ABI rejection accounting remain local.
     Write-Host "== 构建 APK（$abi, suffix=$Suffix）=="
-    # 增量打包防护（2026-08-23 修复）：mergeDebugAssets 缓存随 ABI 切换不会失效，
-    # 且打包器会在旧 APK 上叠加同名条目（产品曾出现双 snapshot.tar.xz、APK 288MB）——每次迭代前清理。
-    Remove-Item (Join-Path $apkDir "app\build\intermediates\assets") -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item (Join-Path $apkDir "app\build\outputs\apk\debug") -Recurse -Force -ErrorAction SilentlyContinue
-    Copy-Item $snapIn (Join-Path $apkDir "app\src\main\assets\snapshot.tar.xz") -Force
-    $sha = (Get-FileHash $snapIn -Algorithm SHA256).Hash.ToLower()
-    Set-Content -Path (Join-Path $apkDir "app\src\main\assets\snapshot.sha256") -Value $sha -NoNewline -Encoding ascii
-    # ST-04 严格复核：本 ABI 的 tar 与刚写入的声明值必须逐字节一致（--require：缺件即失败，不得 SKIP）。
-    # 两个 ABI 各自构建时各自声明值与各自 tar 一致——不得再出现「入库值是单一 ABI 构建的事实」。
-    node (Join-Path $Root "scripts\check-snapshot-fingerprint.mjs") --require 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "快照指纹对账失败（$abi）：tar 与声明值不一致，拒绝打包" }
-    Push-Location $apkDir
-    try {
-        & .\gradlew :app:assembleDebug --no-daemon -PversionNameSuffix="$Suffix" 2>&1 | Select-Object -Last 4
-        if ($LASTEXITCODE -ne 0) { throw "gradle 构建失败（$abi）" }
-        $ver = "$GradleVer$Suffix"
-        Copy-Item "app\build\outputs\apk\debug\app-debug.apk" (Join-Path $Out "dsh-mobile-apk-v$ver-$abi.apk") -Force
-        Write-Host "产物: $Out\dsh-mobile-apk-v$ver-$abi.apk"
-    } finally {
-        Pop-Location
-    }
+    $ver = "$GradleVer$Suffix"
+    $engineArgs = @(
+        (Join-Path $Root "scripts\build-apk-engine.mjs"), "assemble",
+        "--snapshot", $snapIn,
+        "--apk-dir", $apkDir,
+        "--output-dir", $Out,
+        "--artifact-name", "dsh-mobile-apk-v$ver-$abi.apk",
+        "--clean"
+    )
+    # Windows PowerShell drops an empty native argument during splatting. Omitting an empty
+    # suffix avoids shifting --clean into the suffix value (and producing versionName 0.14.5--clean).
+    if (-not [string]::IsNullOrEmpty($Suffix)) { $engineArgs += @("--suffix", $Suffix) }
+    node @engineArgs
+    if ($LASTEXITCODE -ne 0) { throw "APK build engine failed ($abi)" }
     $producedAbis += $abi
 }
 
@@ -491,6 +491,12 @@ if ($ExportSnapshots) {
 }
 $producedList = (($producedAbis | Select-Object -Unique) -join ", ")
 $rejectedList = (($rejectedAbis | Select-Object -Unique) -join ", ")
+# Validate the exact APK files left at the final output path. An unsigned intermediate is never a delivered APK.
+Write-Host "== 最终 APK 签名门禁（v1 + v2 + v3；apksigner 原始输出与退出码留在日志）=="
+node (Join-Path $Root "scripts\check-apk-signatures.mjs") --self-test
+if ($LASTEXITCODE -ne 0) { throw "APK 签名门禁自测失败" }
+node (Join-Path $Root "scripts\build-apk-engine.mjs") verify --dir $Out --skip-self-test
+if ($LASTEXITCODE -ne 0) { throw "最终 APK 缺少 v1/v2/v3 全部签名，拒绝交付" }
 Write-Host "=== 汇总。已产出 ABI: [$producedList] / 被拒 ABI: [$rejectedList] ==="
 Write-Host "=== 产物目录：$Out ==="
 # 任一 ABI 被门禁拒绝 = 不得交付（单 ABI 产物发布 = 缺 ABI 的 release）——必须非 0 退出，

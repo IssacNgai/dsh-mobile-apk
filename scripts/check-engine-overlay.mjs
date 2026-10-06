@@ -16,6 +16,7 @@ import { execSync } from 'node:child_process'
 import { resolveEnginePatchTarget } from './patches/resolve-engine-patch-target.mjs'
 import { planPiStreaming } from './patches/pi-upstream-streaming-020.mjs'
 import { planPatch as planPtcAndroid } from './patches/ptc-android-native-A1.mjs'
+import { planMimoThinking } from './patches/mimo-thinking-toggle-056.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = dirname(HERE)
@@ -250,14 +251,19 @@ for (const patch of PATCH_REGISTRY.patches.filter(p => p.scope === 'engine' && p
     if (patch.verifier) {
       const isPi = patch.id === 'pi-upstream-streaming-020' && patch.verifier === patch.id
       const isPtc = patch.id === 'ptc-android-native-A1' && patch.verifier === patch.id
-      if (!isPi && !isPtc) throw new Error('unknown exact verifier: ' + patch.id)
+      const isMimo = patch.id === 'mimo-thinking-toggle-056' && patch.verifier === patch.id
+      if (!isPi && !isPtc && !isMimo) throw new Error('unknown exact verifier: ' + patch.id)
       const base = isPi ? NM + 'node_modules/@earendil-works/pi-ai' : NM + 'node_modules/@deepseek-ai/dsh-ptc-runtime-node'
       const read = file => {
         const text = res.hits[base + '/' + file]
         if (typeof text !== 'string') throw new Error('missing exact-verifier target: ' + file)
         return text
       }
-      const plan = isPi ? planPiStreaming('', read) : planPtcAndroid('', false, read)
+      const plan = isPi
+        ? planPiStreaming('', read)
+        : isPtc
+          ? planPtcAndroid('', false, read)
+          : planMimoThinking(file => res.hits[file])
       if (plan.some(file => file.before !== file.after)) throw new Error('incomplete exact multi-file patch: ' + patch.id)
     }
   } catch (error) { fails.push('[exact-patch] ' + patch.id + ': ' + error.message) }

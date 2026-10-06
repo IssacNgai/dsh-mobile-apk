@@ -1266,7 +1266,8 @@ a{display:inline-block;margin-top:16px;padding:10px 20px;border-radius:8px;backg
 
   private fun caps(): JSONObject {
     val versionText = WebViewShim.providerVersionName()
-    val major = WebViewShim.providerMajor()
+    val chromiumVersion = WebViewShim.chromiumVersionFromUserAgent(dshWebView.settings.userAgentString.orEmpty())
+    val major = WebViewShim.majorOf(chromiumVersion).takeIf { it > 0 } ?: -1
     val metrics = dshWebView.resources.displayMetrics
     val documentStart = WebViewShim.supports(WebViewFeature.DOCUMENT_START_SCRIPT)
     val uaCh = WebViewShim.supports(WebViewFeature.USER_AGENT_METADATA)
@@ -1593,10 +1594,9 @@ a{display:inline-block;margin-top:16px;padding:10px 20px;border-radius:8px;backg
   private fun applyUserAgentMetadata(browser: WebView, profile: String): Boolean {
     if (profile == "android-real" || !WebViewShim.supports(WebViewFeature.USER_AGENT_METADATA)) return false
     // Metadata follows the applied UA, not an unrelated provider package version.
-    val versionText = Regex("Chrome/([0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+)")
-      .find(browser.settings.userAgentString.orEmpty())?.groupValues?.get(1)
-      ?: WebViewShim.providerVersionName()
-    // 不可解析时回空串（与旧实现一致）：UA-CH 的 major 字段为空好过填 "0" 冒充。
+    val versionText = WebViewShim.chromiumVersionFromUserAgent(browser.settings.userAgentString.orEmpty())
+    if (versionText.isEmpty()) return false
+    // UA 不含可验证的 Chromium 版本时不伪造 UA-CH 元数据。
     val major = WebViewShim.majorOf(versionText).takeIf { it > 0 }?.toString() ?: ""
     return try {
       val metadata = UserAgentMetadata.Builder()

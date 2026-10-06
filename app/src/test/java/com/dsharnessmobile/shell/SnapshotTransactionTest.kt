@@ -53,6 +53,39 @@ class SnapshotTransactionTest {
     }
   }
 
+  @Test
+  fun preservesUnknownDshDataOnFactoryCollisionAndSeedsMissingEntries() {
+    val filesDir = tempDir()
+    try {
+      val live = File(filesDir, "live").apply { mkdirs() }
+      val stage = SnapshotTransaction.stageRoot(filesDir)
+      writeRuntime(live, "old-node", "old-profile")
+      writeRuntime(stage, "new-node", "new-profile")
+      File(live, "home/.dsh/user-extension.json").writeText("user-value")
+      File(stage, "home/.dsh/user-extension.json").writeText("factory-value")
+      File(stage, "home/.dsh/new-factory-seed.json").writeText("seed-value")
+      val entries = mutableListOf<String>()
+
+      SnapshotTransaction.swap(
+        filesDir = filesDir,
+        stagedRoot = stage,
+        usrDir = File(live, "usr"),
+        homeDir = File(live, "home"),
+        preservedNames = preserved,
+        fingerprint = "fp1",
+        startedAt = 1L,
+        onEntry = entries::add,
+      )
+
+      assertEquals("user-value", File(live, "home/.dsh/user-extension.json").readText())
+      assertEquals("seed-value", File(live, "home/.dsh/new-factory-seed.json").readText())
+      assertTrue(entries.contains("保留未分类DSH数据 user-extension.json"))
+      SnapshotTransaction.finish(filesDir)
+    } finally {
+      SnapshotFs.deletePath(filesDir)
+    }
+  }
+
   /**
    * 0.13.8 #167：profiles 分区合并——用户插件生态幸存 + 工厂条目更新，两者同时成立。
    * （live 与 staged 的 .gitconfig / profiles 内容必须不同，否则断言恒真即假绿。）
@@ -861,6 +894,50 @@ class SnapshotTransactionTest {
   }
 
   @Test
+  fun recoveryCanRetryAfterATransientRollbackFailureAndConvergesIdempotently() {
+    val filesDir = tempDir()
+    try {
+      // The first recovery cannot create live/usr because live is a regular file.
+      File(filesDir, "live").writeText("temporary obstruction")
+      val stage = SnapshotTransaction.stageRoot(filesDir)
+      SnapshotFs.createDirectories(stage)
+      val previous = SnapshotTransaction.previousRoot(filesDir)
+      File(previous, "usr/bin").mkdirs()
+      File(previous, "usr/bin/node").writeText("last known runtime")
+      SnapshotTransaction.writeMarker(
+        filesDir,
+        SnapshotTransaction.Marker(SnapshotTransaction.Phase.SWAPPING, "fp-retry", 1L, listOf("usr")),
+      )
+
+      val failed = SnapshotTransaction.recover(filesDir, stage, File(filesDir, "live/usr"), File(filesDir, "live/home"))
+      assertEquals("first recovery must report the obstruction", SnapshotTransaction.Outcome.ROLLBACK_FAILED, failed.outcome)
+      assertTrue("failed recovery must retain its journal", SnapshotTransaction.readMarker(filesDir) != null)
+      assertEquals("rollback source must survive the failed attempt", "last known runtime", File(previous, "usr/bin/node").readText())
+
+      val failedAgain = SnapshotTransaction.recover(filesDir, stage, File(filesDir, "live/usr"), File(filesDir, "live/home"))
+      assertEquals("a repeated failure must remain an explicit failure", SnapshotTransaction.Outcome.ROLLBACK_FAILED, failedAgain.outcome)
+      assertTrue("repeated failure must still retain its journal", SnapshotTransaction.readMarker(filesDir) != null)
+      assertEquals("repeated failure must not consume its rollback source", "last known runtime", File(previous, "usr/bin/node").readText())
+
+      // Remove only the transient obstruction, then retry as the next process start would.
+      File(filesDir, "live").delete()
+      File(filesDir, "live").mkdirs()
+      val retried = SnapshotTransaction.recover(filesDir, stage, File(filesDir, "live/usr"), File(filesDir, "live/home"))
+      assertEquals("retry must complete the rollback", SnapshotTransaction.Outcome.ROLLED_BACK, retried.outcome)
+      assertEquals("previous runtime must be restored", "last known runtime", File(filesDir, "live/usr/bin/node").readText())
+      assertNull("converged transaction must clear its journal", SnapshotTransaction.readMarker(filesDir))
+      assertFalse("previous source is reclaimable only after successful restore", SnapshotFs.exists(previous))
+      assertFalse("stage residue is cleared after successful restore", SnapshotFs.exists(stage))
+
+      val repeated = SnapshotTransaction.recover(filesDir, stage, File(filesDir, "live/usr"), File(filesDir, "live/home"))
+      assertEquals("another startup after convergence is a no-op", SnapshotTransaction.Outcome.NONE, repeated.outcome)
+      assertEquals("re-entry must not change restored data", "last known runtime", File(filesDir, "live/usr/bin/node").readText())
+    } finally {
+      SnapshotFs.deletePath(filesDir)
+    }
+  }
+
+  @Test
   fun rollbackReportsOkSoTheCallerCanDecideAboutTheMarker() {
     val filesDir = tempDir()
     try {
@@ -1365,7 +1442,7 @@ class SnapshotTransactionTest {
       writeRuntime(live, "old-node", "old-profile")
       writeRuntime(stage, "new-node", "new-profile")
       File(live, "home/.dsh/profiles/web/package.json").writeText(
-        """{"dependencies":{"@user/pin":"1.0.0"},"dsh":{"profile":{"bundles":["@user/custom"]}}}""",
+        """{"dependencies":{"@user/pin":"1.0.0"},"dsh":{"profile":{"bundles":["@user/custom"],"futureCapability":{"enabled":true}}},"futureUserSchema":{"version":7,"unknownFlag":"keep-me"}}""",
       )
       File(stage, "home/.dsh/profiles/web/package.json").writeText(
         """{"dependencies":{"@factory/new":"2.0.0"},"dsh":{"profile":{"bundles":["@deepseek-ai/dsh-base"]}}}""",
@@ -1387,6 +1464,9 @@ class SnapshotTransactionTest {
       val deps = root.getJSONObject("dependencies")
       assertTrue("用户 pin 必须幸存", deps.has("@user/pin"))
       assertTrue("工厂新增依赖必须补入", deps.has("@factory/new"))
+      assertEquals("schema 演进不得丢弃未知用户顶层字段", "keep-me", root.getJSONObject("futureUserSchema").getString("unknownFlag"))
+      assertTrue("schema 演进不得丢弃未知用户嵌套字段",
+        root.getJSONObject("dsh").getJSONObject("profile").getJSONObject("futureCapability").getBoolean("enabled"))
       val bundles = root.getJSONObject("dsh").getJSONObject("profile").getJSONArray("bundles")
       val list = (0 until bundles.length()).map { bundles.getString(it) }
       assertTrue("用户 bundle 幸存", list.contains("@user/custom"))

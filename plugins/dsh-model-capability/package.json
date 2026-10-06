@@ -1,6 +1,6 @@
 {
   "name": "@dsh-android/dsh-model-capability",
-  "description": "Host-side capability discovery for user-declared provider routes: passive endpoint descriptors first, vendor schemas second, user-approved active probes last — never inferred from URLs or model names",
+  "description": "Host-side capability discovery for user-declared provider routes: passive endpoint descriptors, vendor schemas, and protocol-aware catalogs — never inferred from URLs or model names",
   "version": "0.2.1",
   "type": "module",
   "main": "lib/index.js",
@@ -16,7 +16,7 @@
   "private": true,
   "scripts": {
     "build": "tsc -p .",
-    "test": "npm run build && node --test test/capability-probe.test.mjs test/catalog-lookup.test.mjs test/settings-writer.test.mjs test/dialect-gate.test.mjs test/signature-stamp.test.mjs test/t1-poll-cost.test.mjs test/models-dev.test.mjs test/write-cas-retry.test.mjs"
+    "test": "npm run build && node --test test/capability-probe.test.mjs test/active-probe-gate.test.mjs test/catalog-lookup.test.mjs test/settings-writer.test.mjs test/dialect-gate.test.mjs test/mimo-blocker.test.mjs test/mimo-toggle-profile.test.mjs test/signature-stamp.test.mjs test/t1-poll-cost.test.mjs test/models-dev.test.mjs test/write-cas-retry.test.mjs"
   },
   "dependencies": {},
   "peerDependencies": {

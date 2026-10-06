@@ -34,6 +34,15 @@ internal object SnapshotUserData {
   )
 
   /**
+   * Direct children of the current factory `home/.dsh` archive. Existing paths outside
+   * this inventory are user or third-party data and must be preserved on collision.
+   * Add a name only after verifying its ownership in the snapshot builder and documenting
+   * why replacing an existing user path is required. The verified current archive
+   * inventory is profiles/, settings.yaml, and .private-layout; recheck it when assets change.
+   */
+  internal val factorySnapshotNames = setOf("profiles", "settings.yaml", ".private-layout")
+
+  /**
    * Small singletons that are restored wholesale. A leftover backup means the refresh
    * that could have overwritten them did not finish, and the backup copy predates that
    * extraction, so it is the authoritative content.

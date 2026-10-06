@@ -1,12 +1,10 @@
 # release.yml — 一键正式发布链（workflow_dispatch：传入 version + notes）
 #
 # 目标（用户口径）：workflow_dispatch 输入 version + notes -> CI 自动完成
-#   【构建快照（arm64 + x86_64）-> 打包 APK（双 ABI）-> 跑门禁 -> 建 draft Release -> 上传 9 件资产】
+#   【构建快照（arm64 + x86_64）-> 打包 APK（双 ABI）-> 跑门禁 -> 上传待发布 artifact -> 独立 job 建 draft Release】
 #
-# 现状（2026-09-27）：**本文件是骨架，尚未端到端触发过**（本轮无法真触发 CI）。
-#   - 与既有 .github/workflows/build-snapshot.yml 是同一条链的两个阶段：后者已做到
-#     「注入 -> 门禁 -> 双 ABI APK -> MANIFEST -> upload-artifact」，缺的只有
-#     「从源重建快照」与「建 draft Release / 上传资产」。本 workflow 把这两段补齐并收成一个入口。
+# 当前结构（2026-10-05）：snapshot 与 APK 构建/验证 job 只读并上传 artifact；publish job 下载同一 artifact，
+#   仅负责创建 draft Release 与上传资产。完整 GitHub runner 发布尚未在本轮触发验证。
 #   - **测试包不走这里**：测试包在本地构建（-Fast / -Suffix 等），理由与影响见
 #     docs/0.14.2-fx-2-DEFECTS-AND-PLAN.md 的 G.2。
 #
@@ -17,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: '版本号（不带 v，如 0.14.2-fx-2）；必须等于 app/build.gradle.kts 的 versionName'
+        description: '版本号（不带 v，如 0.14.5）；必须等于 app/build.gradle.kts 的 versionName'
         required: true
         type: string
       notes:
@@ -32,7 +30,7 @@ on:
         default: false
 
 permissions:
-  contents: write   # 建 draft Release + 上传资产
+  contents: read
   actions: read
 
 jobs:
@@ -50,6 +48,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          persist-credentials: false
           fetch-depth: 0
           lfs: true                     # base/ 底座是 LFS 归档（快照重建的输入）
       - uses: actions/setup-node@v4
@@ -113,18 +112,22 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # ── J2 打包 + 门禁 + draft Release ───────────────────────────────────────
+  # ── J2 打包 + 门禁 + 待发布 artifact（无远程写权限）─────────────────────
   release:
     needs: [snapshot]
     # J1 被 skip 时仍要跑（needs 的 skipped 会被当失败，故 always + 显式判空）
     if: always() && (needs.snapshot.result == 'success' || inputs.skip_snapshot_rebuild == true)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     env:
       DSH_APK_DIR: ${{ github.workspace }}
       ANDROID_USER_HOME: ${{ github.workspace }}/.android-home
     steps:
       - uses: actions/checkout@v4
         with:
+          persist-credentials: false
           fetch-depth: 0
           lfs: true
       - uses: actions/setup-node@v4
@@ -263,6 +266,8 @@ jobs:
           ls -lR "$OUT"
           apk_count=$(find "$OUT/apk" -name '*.apk' | wc -l)
           [ "$apk_count" -ge 2 ] || { echo "::error::APK 少于 2 件（双 ABI 缺件）"; exit 1; }
+          node scripts/check-apk-signatures.mjs --self-test
+          node scripts/check-apk-signatures.mjs --dir "$OUT/apk"
           snap_count=$(find "$OUT/snapshot" -name 'snapshot-*.tar.xz' | wc -l)
           [ "$snap_count" -ge 2 ] || { echo "::error::注入后快照少于 2 件"; exit 1; }
       - name: 产出侧签名断言（固定证书指纹）
@@ -311,23 +316,56 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: release-v${{ inputs.version }}
-          path: release/v*/
+          path: release/v${{ inputs.version }}/
           retention-days: 30
-      - name: 建 draft Release 并上传资产
+
+  publish:
+    needs: [release]
+    if: ${{ needs.release.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-v${{ inputs.version }}
+          path: release/v${{ inputs.version }}
+      - name: 确认待发布包结构
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER="${{ inputs.version }}"
+          DIR="release/v${VER}"
+          test -s "$DIR/notes.md"
+          test -s "$DIR/MANIFEST.txt"
+          apk_count=$(find "$DIR/apk" -maxdepth 1 -type f -name '*.apk' | wc -l)
+          [ "$apk_count" -ge 2 ] || { echo "::error::下载的 Release artifact 缺少双 ABI APK"; exit 1; }
+          # MANIFEST is made after signature verification in the build job. Matching every downloaded APK
+          # to its manifest digest proves publish is handling the exact verified bytes, without rebuilding or re-signing.
+          while IFS= read -r apk; do
+            rel="${apk#${DIR}/}"
+            expected=$(awk -v file="$rel" '$2 == file { print $1; count++ } END { if (count != 1) exit 1 }' "$DIR/MANIFEST.txt") || { echo "::error::MANIFEST 缺少唯一条目: $rel"; exit 1; }
+            actual=$(sha256sum "$apk" | awk '{print $1}')
+            [ "$actual" = "$expected" ] || { echo "::error::下载后的 APK 与已验证 artifact MANIFEST 不同: $rel"; exit 1; }
+            echo "发布字节核对通过: $rel sha256=$actual"
+          done < <(find "$DIR/apk" -maxdepth 1 -type f -name '*.apk' | sort)
+      - name: 建 draft Release 并上传已验证资产
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -e
-          TAG="v${{ inputs.version }}"
+          VER="${{ inputs.version }}"
+          TAG="v${VER}"
           # 幂等：已存在则复用，避免重跑 422
           if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             echo "release $TAG 已存在，复用"
           else
             gh release create "$TAG" --repo "${{ github.repository }}" --draft \
-              --title "dsh-mobile $TAG" --notes-file "release/v${ver}/notes.md"
+              --title "dsh-mobile $TAG" --notes-file "release/v${VER}/notes.md"
           fi
-          for f in release/v${ver}/apk/*.apk release/v${ver}/snapshot/*.tar.xz release/v${ver}/plugins/*.tgz release/v${ver}/provenance/*.json release/v${ver}/MANIFEST.txt release/v${ver}/notes.md; do
+          for f in release/v${VER}/apk/*.apk release/v${VER}/snapshot/*.tar.xz release/v${VER}/plugins/*.tgz release/v${VER}/provenance/*.json release/v${VER}/MANIFEST.txt release/v${VER}/notes.md; do
             [ -f "$f" ] || continue
             gh release upload "$TAG" "$f" --repo "${{ github.repository }}" --clobber
           done

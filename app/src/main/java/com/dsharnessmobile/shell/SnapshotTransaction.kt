@@ -538,6 +538,12 @@ internal object SnapshotTransaction {
               mergeProfiles(filesDir, moved, fingerprint, startedAt, child, liveChild, File(previousDsh, "profiles"), onEntry, notes, links)
               continue
             }
+            if (SnapshotFs.exists(liveChild) && child.name !in SnapshotUserData.factorySnapshotNames) {
+              // Unknown .dsh entries can belong to newer app versions or user extensions.
+              // Seed absent paths, but never let a factory archive erase an unclassified collision.
+              onEntry("保留未分类DSH数据 " + child.name)
+              continue
+            }
             replaceEntry(
               filesDir, moved, fingerprint, startedAt,
               "home/.dsh/" + child.name, child, liveChild, File(previousDsh, child.name), onEntry, move,
@@ -1103,46 +1109,9 @@ internal object SnapshotTransaction {
       )
       return
     }
-    val user = try { org.json.JSONObject(liveText) } catch (_: Throwable) { return }
-    val factory = try { org.json.JSONObject(stagedText) } catch (_: Throwable) { return }
-    val factoryDeps = factory.optJSONObject("dependencies") ?: org.json.JSONObject()
-    if (factoryDeps.length() > 0) {
-      val deps = user.optJSONObject("dependencies") ?: org.json.JSONObject().also { user.put("dependencies", it) }
-      for (key in factoryDeps.keys()) if (!deps.has(key)) deps.put(key, factoryDeps.getString(key))
-    }
-    // bundles 并集（兼容两种键形态）：真实出厂清单写的是**嵌套** dsh.profile.bundles
-    // （scripts/lib/profile-seed.mjs:38-42；设备实测同一形态），而旧实现只读扁键
-    // "dsh.profile.bundles" ⇒ 真机恒不命中，bundles 并集静默失效（工厂新增 bundle 进不了 live）。
-    val factoryBundles = findBundles(factory)
-    if (factoryBundles != null && factoryBundles.length() > 0) {
-      val bundles = findBundles(user)
-        ?: createBundles(user, nested = nestedBundles(factory) || user.optJSONObject("dsh") != null)
-      val present = (0 until bundles.length()).map { bundles.optString(it) }.toHashSet()
-      for (i in 0 until factoryBundles.length()) {
-        val item = factoryBundles.optString(i)
-        if (item.isNotEmpty() && item !in present) bundles.put(item)
-      }
-    }
+    val merged = ProfilePackageManifest.merge(liveText, stagedText) ?: return
     // issue #274 ②：原子写 + 写后 JSON 可解析性校验（失败留 .pre-*，见 writeTextAtomic）。
-    writeTextAtomic(live, user.toString(2), "package.json") { validateJson(it, "package.json") }
-  }
-
-  /** 读 bundles：先历史扁键，再真实嵌套 dsh.profile.bundles。 */
-  private fun findBundles(root: org.json.JSONObject): org.json.JSONArray? =
-    root.optJSONArray("dsh.profile.bundles")
-      ?: root.optJSONObject("dsh")?.optJSONObject("profile")?.optJSONArray("bundles")
-
-  /** 该清单的 bundles 是否为嵌套形态（而非历史扁键）。 */
-  private fun nestedBundles(root: org.json.JSONObject): Boolean =
-    root.optJSONArray("dsh.profile.bundles") == null &&
-      root.optJSONObject("dsh")?.optJSONObject("profile")?.optJSONArray("bundles") != null
-
-  /** 按 [nested] 新建 bundles 数组（live 缺该键时用工厂/live 的实际形态，避免写进引擎不读的扁键）。 */
-  private fun createBundles(root: org.json.JSONObject, nested: Boolean): org.json.JSONArray {
-    if (!nested) return org.json.JSONArray().also { root.put("dsh.profile.bundles", it) }
-    val dsh = root.optJSONObject("dsh") ?: org.json.JSONObject().also { root.put("dsh", it) }
-    val profile = dsh.optJSONObject("profile") ?: org.json.JSONObject().also { dsh.put("profile", it) }
-    return org.json.JSONArray().also { profile.put("bundles", it) }
+    writeTextAtomic(live, merged, "package.json") { validateJson(it, "package.json") }
   }
 
   /**

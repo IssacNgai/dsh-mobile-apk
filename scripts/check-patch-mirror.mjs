@@ -118,6 +118,27 @@ if (peer) {
       check(`镜像一致: scripts/patches/${f}`, false, String(e).slice(0, 200))
     }
   }
+  // data/ 注入片段也是 scripts/patches/** 的权威源；逐递归清单和内容比对，避免新片段漏镜像。
+  const walkFiles = (dir, prefix = '') => {
+    const out = []
+    for (const name of readdirSync(dir)) {
+      const full = join(dir, name)
+      const rel = prefix ? `${prefix}/${name}` : name
+      if (statSync(full).isDirectory()) out.push(...walkFiles(full, rel))
+      else out.push(rel)
+    }
+    return out
+  }
+  try {
+    const mineData = walkFiles(join(ROOT, 'scripts', 'patches', 'data'))
+    const peerData = walkFiles(join(peer, 'scripts', 'patches', 'data'))
+    const onlyMine = mineData.filter((r) => !peerData.includes(r))
+    const onlyPeer = peerData.filter((r) => !mineData.includes(r))
+    check('data/ 文件清单一致', onlyMine.length === 0 && onlyPeer.length === 0,
+      `本仓独有: [${onlyMine.join(', ')}]；对端独有: [${onlyPeer.join(', ')}]`)
+    const bad = mineData.filter((r) => peerData.includes(r) && cmp(join(ROOT, 'scripts', 'patches', 'data', r), join(peer, 'scripts', 'patches', 'data', r)) === 'content')
+    check('data/ 共有文件逐字节一致', bad.length === 0, `内容漂移: [${bad.join(', ')}]`)
+  } catch (e) { check('data/ 目录可枚举', false, String(e).slice(0, 200)) }
   // tests/ 递归清单 + 共有文件逐字节
   // **递归**列清单：0.14.3 实锤——旧实现只列 tests/ 的一层，于是 `fixtures` 被当成一个dir 条目，
   // 里面的 31 个夹具目录从未参与比对。协调仓已把夹具换到 0.2.0-rc.2，APK 侧仍留着 0.1.7-rc.2 的旧夹具，
@@ -163,6 +184,16 @@ if (peer) {
   // 对端缺该文件时跳过（apk 仓独占脚本合法）。
   const MIRROR_TOP = [
     'scripts/build-apk-013.ps1',
+    // Shared per-ABI terminal build stage, used by both the local and portable
+    // APK chains as well as the local release assembler.
+    'scripts/build-apk-engine.mjs',
+    'scripts/build-apk-engine.test.mjs',
+    // Shared delivery gates and version normalization are invoked from the
+    // mirrored local build entrypoint; keep their implementation and tests in sync.
+    'scripts/check-apk-signatures.mjs',
+    'scripts/check-apk-signatures.test.mjs',
+    'scripts/resolve-version-suffix.mjs',
+    'scripts/resolve-version-suffix.test.mjs',
     // 门禁脚本**自身**也必须在镜像面（AGENTS.md 铁律 6 明文声明：「scripts/patches/** 与
     // scripts/check-patch-mirror.mjs 是双仓逐字节镜像，单边演进必拒」）。此前它没被自己列进
     // MIRROR_TOP，于是 apk 副本可以长期落后而本门禁**永远不会报**——本轮实测就是如此
@@ -218,6 +249,7 @@ if (peer) {
     'scripts/bridge-symmetry-baseline.json',
     'scripts/check-gate-skips.mjs',
     'scripts/check-perf-instrumentation.mjs',
+    'scripts/check-perf-instrumentation.test.mjs',
     'scripts/perf-instrumentation-gaps.json',
     'scripts/perf/count-compose.mjs',
     'scripts/perf/measure-steady.ps1',

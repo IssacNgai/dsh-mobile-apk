@@ -2,6 +2,9 @@ package com.dsharnessmobile.shell
 
 import android.content.Context
 import java.io.File
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.security.MessageDigest
 
 /**
  * 启动失败页「安全模式启动」的状态机（缺陷 D / fx-2）。
@@ -113,6 +116,37 @@ internal object SafeMode {
   /** 操作结果：ok=false 时 message 是给用户看的人话（不得为空）。 */
   internal class Result(val ok: Boolean, val message: String, val id: String? = null)
 
+  private fun sha256(bytes: ByteArray): String = MessageDigest.getInstance("SHA-256")
+    .digest(bytes).joinToString("") { "%02x".format(it) }
+
+  /** Replace one file atomically within its directory; the state marker makes a multi-file sequence retryable. */
+  private fun replaceAtomically(target: File, bytes: ByteArray) {
+    val parent = target.absoluteFile.parentFile ?: error("missing parent for ${target.absolutePath}")
+    if (!parent.exists() && !parent.mkdirs()) error("cannot create ${parent.absolutePath}")
+    val temp = Files.createTempFile(parent.toPath(), ".safe-mode-${target.name}-", ".tmp")
+    try {
+      Files.write(temp, bytes)
+      Files.move(temp, target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+    } finally {
+      Files.deleteIfExists(temp)
+    }
+  }
+
+  private fun backupFor(autoDir: File, path: String, snapshotId: String, prefix: String): File? {
+    if (path.isBlank()) return null
+    return runCatching {
+      val root = autoDir.canonicalFile.toPath()
+      val candidate = File(path).canonicalFile.toPath()
+      if (candidate.parent != root || candidate.fileName.toString() != "$prefix$snapshotId.yml") null
+      else candidate.toFile()
+    }.getOrNull()
+  }
+
+  private fun verifyBackup(file: File, expectedSha: String?): Boolean = runCatching {
+    if (!file.isFile || !file.canRead()) return false
+    expectedSha.isNullOrBlank() || sha256(file.readBytes()).equals(expectedSha, ignoreCase = true)
+  }.getOrDefault(false)
+
   /**
    * 进入安全模式：备份成功后**先写状态文件**，再改 patch（修既有崩溃窗口）。
    *
@@ -129,43 +163,61 @@ internal object SafeMode {
    * @param autoDir 快照/急救共用目录（`<home>/.dsh/undo-snapshots/auto`，平铺）。
    * @param id 本次入档 id（生产传时间戳；测试传固定值以便逐字节比对）。
    */
-  internal fun enter(patch: File, homePatch: File, autoDir: File, id: String): Result {
+  internal fun enter(
+    patch: File,
+    homePatch: File,
+    autoDir: File,
+    id: String,
+    atomicWrite: (File, ByteArray) -> Unit = ::replaceAtomically,
+  ): Result {
+    val stateFile = File(autoDir, STATE_FILE)
+    if (stateFile.isFile) {
+      try {
+        val existing = org.json.JSONObject(stateFile.readText())
+        if (existing.optBoolean("active", false)) {
+          return Result(true, "安全模式已开启；保留现有恢复档，未重复改写。", existing.optString("snapshotId", ""))
+        }
+      } catch (t: Throwable) {
+        return Result(false, "安全模式状态文件损坏（" + t.javaClass.simpleName + "），已拒绝覆盖；请先恢复状态文件。")
+      }
+    }
     if (!autoDir.exists() && !autoDir.mkdirs()) return Result(false, "无法创建安全模式目录：" + autoDir.absolutePath)
     val backup = File(autoDir, "safe-mode-backup-$id.yml")
     val homeBackup = File(autoDir, "safe-mode-home-backup-$id.yml")
-    val stateFile = File(autoDir, STATE_FILE)
     val homeExisted = homePatch.isFile
     return try {
       val original = if (patch.isFile) patch.readBytes() else "[]\n".toByteArray()
-      backup.writeBytes(original)
+      atomicWrite(backup, original)
       // ③ 校验：备份必须真的落盘且与原文件逐字节相同（只信 readBytes 的结果，不信任 writeBytes 没抛）。
       if (!backup.isFile || !backup.readBytes().contentEquals(original)) {
         return Result(false, "安全模式备份校验失败（备份与原文不一致），已放弃进入——未改动任何文件")
       }
       if (homeExisted) {
         val homeBytes = homePatch.readBytes()
-        homeBackup.writeBytes(homeBytes)
+        atomicWrite(homeBackup, homeBytes)
         if (!homeBackup.readBytes().contentEquals(homeBytes)) {
           return Result(false, "安全模式 home 级备份校验失败，已放弃进入——未改动任何文件")
         }
       }
       // ④ 先落状态：此后无论何时崩溃，off 都能凭备份整份还原。
-      stateFile.writeText(
+      atomicWrite(stateFile, (
         org.json.JSONObject()
           .put("active", true)
           .put("enteredAt", java.time.Instant.now().toString())
           .put("by", "shell-guide-button")
           .put("backup", backup.absolutePath)
+          .put("backupSha256", sha256(original))
           .put("homeBackup", homeBackup.absolutePath)
+          .put("homeBackupSha256", if (homeExisted) sha256(homePatch.readBytes()) else "")
           .put("homeExisted", homeExisted)
           .put("snapshotId", id)
-          .toString(2),
-      )
+          .toString(2)
+      ).toByteArray(Charsets.UTF_8))
       // ⑤ 最后改 patch。
       val filtered = filterThirdPartyInserts(String(original, Charsets.UTF_8))
       patch.parentFile?.mkdirs()
-      patch.writeText(filtered)
-      if (homeExisted) homePatch.writeText("# dsh safe mode (home level)\n[]\n")
+      atomicWrite(patch, filtered.toByteArray(Charsets.UTF_8))
+      if (homeExisted) atomicWrite(homePatch, "# dsh safe mode (home level)\n[]\n".toByteArray(Charsets.UTF_8))
       val removed = removedPluginNames(String(original, Charsets.UTF_8))
       Result(
         true,
@@ -186,29 +238,37 @@ internal object SafeMode {
    * 任一备份缺失/不可读 ⇒ 拒绝退出且**不动任何文件**（宁可停在安全模式，也不做一次
    * 「patch 已写、备份没了」的半还原——那正是用户插件永久消失的形态）。
    */
-  internal fun exit(patch: File, homePatch: File, autoDir: File): Result {
+  internal fun exit(
+    patch: File,
+    homePatch: File,
+    autoDir: File,
+    atomicWrite: (File, ByteArray) -> Unit = ::replaceAtomically,
+  ): Result {
     val stateFile = File(autoDir, STATE_FILE)
     if (!stateFile.isFile) return Result(false, "安全模式未开启（没有状态文件），无需退出")
     val st = try { org.json.JSONObject(stateFile.readText()) } catch (t: Throwable) {
       return Result(false, "安全模式状态文件损坏（" + t.javaClass.simpleName + "），已拒绝退出以免误改文件；备份仍在 " + autoDir.absolutePath)
     }
+    if (!st.optBoolean("active", false)) return Result(false, "安全模式状态未标记为开启，已拒绝退出")
     val backupPath = st.optString("backup", "")
     if (backupPath.isEmpty()) return Result(false, "状态文件缺少 backup 字段，已拒绝退出")
-    val backup = File(backupPath)
+    val snapshotId = st.optString("snapshotId", "")
+    val backup = backupFor(autoDir, backupPath, snapshotId, "safe-mode-backup-")
+      ?: return Result(false, "安全模式备份路径不符合状态文件约定，已拒绝退出")
     val homeExisted = st.optBoolean("homeExisted", false)
-    val homeBackup = File(st.optString("homeBackup", ""))
-    if (!backup.isFile) {
+    val homeBackup = if (homeExisted) backupFor(autoDir, st.optString("homeBackup", ""), snapshotId, "safe-mode-home-backup-")
+      ?: return Result(false, "安全模式 home 级备份路径不符合状态文件约定，已拒绝退出") else null
+    if (!verifyBackup(backup, st.optString("backupSha256", ""))) {
       return Result(false, "安全模式备份缺失（" + backup.absolutePath + "），已拒绝退出：现在退出会让 patch 停在安全模式内容且无从还原。备份找回后再试。")
     }
-    if (homeExisted && !homeBackup.isFile) {
+    if (homeBackup != null && !verifyBackup(homeBackup, st.optString("homeBackupSha256", ""))) {
       return Result(false, "安全模式 home 级备份缺失（" + homeBackup.absolutePath + "），已拒绝退出（不动任何文件）")
     }
     return try {
-      patch.parentFile?.mkdirs()
       // 整份还原 —— 不用「合并/只删我们加的」，因为任何增量还原都可能留下半态。
-      backup.copyTo(patch, overwrite = true)
-      if (homeExisted) homeBackup.copyTo(homePatch, overwrite = true)
-      stateFile.delete()
+      atomicWrite(patch, backup.readBytes())
+      if (homeBackup != null) atomicWrite(homePatch, homeBackup.readBytes())
+      if (stateFile.exists() && !stateFile.delete()) error("无法清除安全模式状态文件")
       Result(true, "已退出安全模式：装配清单已整份还原到进入前的状态，重启应用生效。")
     } catch (t: Throwable) {
       Result(false, "退出安全模式失败：" + t.javaClass.simpleName + ": " + (t.message ?: "无消息"))

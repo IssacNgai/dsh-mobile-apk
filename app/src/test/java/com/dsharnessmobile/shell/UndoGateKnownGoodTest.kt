@@ -19,7 +19,7 @@ import org.junit.Test
  *   ③ 结果：坏插件仍被挂载、引擎仍不可达——**回滚报成功而状态没变好**。
  *
  * 修法（本文件守护的不变量）：「已知良好」只能由**壳侧自己的健康观测**定义（引擎 HTTP 活着的那一拍），
- * 且回滚优先用那个 id；只有它不可用（首启/被 prune）才退回 `restore-last-good`，并在探针里明写哪条路。
+ * 本轮实现将该回退路径移除：只有 ID 可用且属于本次安装时才恢复，否则 fail closed。
  */
 class UndoGateKnownGoodTest {
 
@@ -41,7 +41,7 @@ class UndoGateKnownGoodTest {
     )
     // 字典序 = 时间序；状态文件与临时名不得被当成快照 id（否则会把 boot-state.json 传给 CLI restore）。
     assertEquals("20260921-001349-13de", UndoGate.newestSnapshotId(names))
-    assertNull("空目录必须返回 null（调用方据此退回 last-good）", UndoGate.newestSnapshotId(emptyList()))
+    assertNull("空目录必须返回 null；调用方不得退回 CLI last-good", UndoGate.newestSnapshotId(emptyList()))
     assertNull(
       "非快照形状一个都不认",
       UndoGate.newestSnapshotId(listOf("boot-state.json", "env-vault", "2026-09-20", "2026092-1", "manual")),
@@ -99,5 +99,26 @@ class UndoGateKnownGoodTest {
     // ④ 「已知良好」只由壳侧健康观测写入
     val svc = shellSource("EngineService.kt")
     assertTrue("看门狗 HEALTHY 拍必须记 known-good", svc.contains("UndoGate.noteHealthy(this, engineManager)"))
+  }
+
+  @Test
+  fun noKnownGoodStillHasExplicitConsoleRecoveryWithoutAutomaticFallback() {
+    val manager = shellSource("EngineManager.kt")
+    val startFlow = shellSource("EngineStartFlow.kt")
+    val session = shellSource("ConsoleSession.kt")
+    val guide = shellSource("GuidePageRenderer.kt")
+    val cli = File("src/main/assets/undo-emergency.mjs").takeIf { it.isFile }
+      ?: File("app/src/main/assets/undo-emergency.mjs")
+
+    assertTrue("启动前部署本地急救 CLI", startFlow.contains("engineManager.deployUndoCli()"))
+    assertTrue("CLI 部署到壳可读的 filesDir", manager.contains("File(context.filesDir, asset)"))
+    assertTrue("控制台继承 shellEnv", session.contains("environment().putAll(engineManager.shellEnv())"))
+    assertTrue("shellEnv 为控制台提供 app-private 根目录", manager.contains("\"DSH_FILES_DIR\" to context.filesDir.absolutePath"))
+    assertTrue("错误页仍可打开离线控制台", guide.contains("onOpenConsole = { activity.startActivity(Intent(activity, ConsoleActivity::class.java)) }"))
+    val emergencyCli = cli.readText()
+    assertTrue("CLI 支持列出可选快照", emergencyCli.contains("case 'list':"))
+    assertTrue("CLI 支持按显式 ID 恢复", emergencyCli.contains("case 'restore':"))
+    assertTrue("手动 CLI 恢复不改变自动 fail-closed 判据", shellSource("UndoGate.kt").contains("listOf(\"restore\", known)"))
+    assertFalse("自救说明不能把 last-good 引回自动路径", shellSource("UndoGate.kt").contains("listOf(\"restore-last-good\")"))
   }
 }

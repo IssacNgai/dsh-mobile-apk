@@ -8,8 +8,8 @@ import java.io.File
  * 崩溃自动回退（PRD F3 / D6 方案 a）：壳侧「undo 全自动」闸门。
  *
  * 职责：当引擎反复启动失败（看门狗连续失败达到阈值）或引擎日志出现崩溃签名时，
- * 自动执行 dsh-undo-emergency 急救 CLI 的 restore-last-good（把配置/插件代码树
- * 回滚到 boot-state.json 归因出的「最后良好快照」），并恢复引擎。
+ * 自动执行 dsh-undo-emergency 急救 CLI，将配置/插件代码树回滚到壳侧探活确认的
+ * known-good 快照，并恢复引擎。
  *
  * 与 UpdateManager/EngineManager 的 usr 层回退（usr-old）正交：
  * - usr 层：运行时二进制回退（EngineManager.rollbackToOld）
@@ -17,7 +17,7 @@ import java.io.File
  *
  * 幂等约束：
  * - 每个「崩溃纪元」只自动执行一次（.undo-auto-done 标记 + 时间戳），
- *   用户手动重试/手动 undo 后清除标记；
+ *   成功回滚后进入重试抑制窗；
  * - 仅在急救 CLI 存在快照时执行（list 非空）；
  * - 仅在引擎确实无法启动时触发（不误伤正常慢启动）。
  */
@@ -353,8 +353,8 @@ object UndoGate {
 
   /**
    * 执行自动 undo（必须后台线程调用）：
-   * 1. 急救 CLI 回滚（**优先 `restore <已知良好 id>`**，无可用 id 才退回 `restore-last-good`）
-   * 2. 写 .undo-auto-done 标记（幂等 + 供启动页显示）
+   * 1. 急救 CLI 恢复壳侧探活记录、且属于本次安装的快照 ID
+   * 2. 写 .undo-auto-done 标记（重试抑制）
    * 3. 返回是否执行了回滚（+ 摘要）
    */
   fun execute(
@@ -510,16 +510,6 @@ object UndoGate {
   /** Clears a pending observation window after the engine becomes reachable. */
   fun disarm(context: Context) {
     armFile(context).delete()
-  }
-
-  /** 清除自动 undo 标记（引擎健康确认/用户手动操作后调用）。 */
-  fun clearMarker(context: Context) {
-    markerFile(context).delete()
-    armFile(context).delete()
-  }
-
-  fun armedToDisplay(context: Context): String? = armFile(context).takeIf { it.exists() }?.let {
-    "auto-undo pending: " + it.readText()
   }
 
   /** 快照 id 形状：`yyyyMMdd-HHmmss-rrrr`（本地时间 + 4 位随机；字典序 = 时间序）。 */

@@ -145,6 +145,7 @@ node scripts/patches/apply-patches.mjs vendor --list
   ```
   字段齐备，无值报 -1（绝不省字段）；`loopP99Ms`/`loopSamples` 取自 `monitorEventLoopDelay`
   （宿主实测：它不会挂住事件循环退出）。
+  P1 在每次 `compose()` 返回时**立即**输出一条累计 TOTAL，并从同一 C4 monitor 读取当时的 p99/样本数；不再排队或延后 TOTAL，保留既有 shell tail 与 last-row 解析时序。独立 `[perf] phase` 诊断只接收四种固定阶段名并按名聚合到有界 Map；首条记录后 250ms 用 unref timer 收口，后续事件不重置 deadline。phase 行字段为 `startMs/durTotalMs/durMaxMs/observations/forwardedCallbacks`：耗时是 wall-clock，observations 是阶段记录次数，forwardedCallbacks 单独表示延迟 flush 转发的回调数。记录构造 flush、loader settle 等待、延迟启动 flush 与首次 settle 后 compose start；不重置或延迟 C4 直方图采样。
   - **只主线程安装**（`isMainThread` 门）：worker 线程的 `calls=0` TOTAL 绝不得成为壳侧解析到的
     最后一条 TOTAL。**为什么必须挡**（T6 设备实测的真因）：`--import`/`NODE_OPTIONS` 在 file-based
     worker 线程里也会执行（Node v24.17 实测，引擎树至少 5 处 worker），worker 临终打 `calls=0`，
@@ -159,7 +160,7 @@ node scripts/patches/apply-patches.mjs vendor --list
   - **不新增快照成员**（避开 `check-snapshot-file-modes` 时序与「测量脚本进产品树」争议）；
     壳侧解析器零改动；与 `scripts/perf/count-compose.mjs`（设备取证用 preload）**格式同源**，
     二者共用同一行契约，可互相校验。
-  - 自证：`node scripts/patches/tests/combo-probe-p1.test.mjs`（23 项）——① 不装本补丁时同一构造
+  - 自证：`node scripts/patches/tests/combo-probe-p1.test.mjs`——① 不装本补丁时同一构造
     取不到 TOTAL（保持 -1/unknown 语义）；② 装了之后取到真实 calls/totalMs 且四条格式行齐备；
     ③ worker 线程不得冒充（含 ③b 无门反向对照 / ③c 取最后一条的顺序危害）。
 
@@ -252,3 +253,18 @@ node scripts/patches/apply-patches.mjs vendor --list
 
 **C3 阈值不放宽**：C3「compose 调用数 ≤ 2」的依据原写 A4 的「1 vs 9-14」；A4 退役后裸树是 2 次，
 阈值**仍然可满足**，注释已重写为「裸树 ctor 2 次」的事实与出处。`COMPOSE_CALLS_BUDGET = 2` 不变。
+
+
+## 2026-10-06 C4 重复扫描与自动补给分段
+
+新增 `client-registry-scan-C4`、`typert-registry-scan-C4`，实现位于 `data/registry-scan-c4.mjs`。
+每个同步 flush 只遍历一次 Loader：client 按名称索引 rows，typert 按名称索引已挂接条目。
+同步错误回调后索引失效，避免回调删除或新增其他 dirty 条目后仍使用旧集合；typert 的异步
+manifest 导入完成后继续按 live Loader 判定。client 的 `nearestPackage` 将本次已解析 manifest
+交给 `resolveMeta`，require fallback 仍读取一次，未新增跨 flush 元数据缓存。
+同步构造失败、Loader settle/Web ready 顺序、运行期 add/remove 与 HMR 同步 compose 保留。
+
+设备量化、三项改动的真实预算及最终 APK 验收边界见 APK 详档 `docs/AGENTS/RUNTIME-PATCHES.md` §7.6。
+C4 monitor、TOTAL 同步返回时采样、100ms 预算和至少10个样本的判据均保持原样；局部优化和 CPU
+profile 不能代替无诊断的预算结果。回归为 `client-registry-scan-c4.test.mjs`、
+`typert-registry-scan-c4.test.mjs` 与同时施加 client 扫描补丁的 `combo-probe-p1.test.mjs`。

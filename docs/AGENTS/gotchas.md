@@ -1388,3 +1388,54 @@
     **修法**：改用 `gh workflow run … -F notes=@release/v<版本>/notes.md`（`-F` 才展开 @file）；并在发布后**下载 notes.md 资产核对首行**是否为 `# v<版本> 发布说明`。**建议（只登记，未开 issue）**：① 把「下载 notes.md 资产并核对首行」列入**发布后动作清单**——发布链自身不校验 notes 内容，这是当前唯一防线；② 可另立 issue 提出「发布链加一条 notes 非空/首行断言」的门禁改进（开不开由 Lead/用户决定）。
     **复验证据**：已**删除坏 draft**，改用 `-F` 重派（run **37281961398**），核对 notes 资产为 **7767 字节正文**（Lead 已执行）；本条待核结论以该次 run 的资产首行为准。
 
+
+
+247. **WebView provider 包版本不等于 Chromium 版本，语法门诊断会假报不兼容（2026-10-05 源码核实，#312 关联）**：
+    **现象**：华为 `com.huawei.webview` 的 provider `versionName` 可为 `14.0.0.370`，旧诊断直接解析首段 `14` 并与 Chromium 94 比较，于是 `syntax_floor_ok=false`；这个字段没有测到实际 JS 引擎版本，升级后「重新连接中」消失也不能证明厂商版本 15 就等于 Chromium 115。
+    **修法**：provider 包名/版本单独记录；Chromium 版本从实际 WebView User-Agent 的 `Chrome/<四段版本>` 读取。读不到时 `syntax_floor_ok=unknown`，不要把 provider 版本当 Chromium 版本。UA-CH 元数据也不得用 vendor package version 伪造。
+    **回归判据**：`WebViewShimTest.chromiumVersionComesFromTheEngineUserAgentNotVendorPackageVersion` 覆盖 Huawei 风格 provider 版本、实际 Chrome token 与 94 以下/以上/未知三态；还需在 MuMu 与报告设备验证 UA 版本和真实渲染表现，测试未跑前不宣称 #312 已解决。
+
+248. **snapshot 工厂清单以外的未知 DSH_HOME 同名项会被事务替换（2026-10-05 源码核实）**：
+    **现象**：`SnapshotTransaction.swap()` 虽然按 `preservedNames` 保护已知数据、对 `profiles` 做专门合并，但其它 staged `.dsh/<name>` 一律进入 `replaceEntry()`。未来工厂快照新增一个与用户未知项同名的文件/目录，就会覆盖用户数据；live-only 未碰巧冲突的未知项则自然幸存，旧测试因此没覆盖此形态。
+    **修法**：对已存在且不在当前工厂直系项清单内的路径采用保留语义；stage 有而 live 无仍 seed-if-absent。工厂资产新增直系项须核实归属并同步 `SnapshotUserData.factorySnapshotNames`，不能通过扩大通用覆盖面实现升级。
+    **回归判据**：`SnapshotTransactionTest.preservesUnknownDshDataOnFactoryCollisionAndSeedsMissingEntries` 同时构造未知同名冲突与缺项 seed；还需跑事务全套 Kotlin 用例与覆盖升级设备验收。
+249. **`android_vdisplay_input` 回执 schema 必须覆盖 `callVdOp` 成功字段（0.14.4 本地用户反馈）**：
+    **现象**：tap 等输入动作已由设备执行，工具结果却因 `additionalProperties: false` 拒绝；失败样本在 `issue存图/阅后即焚.txt`，属于本地反馈回归，不据此声称存在对应 GitHub issue。
+    **真因**：`android_vdisplay_create`、`android_vdisplay_destroy` 与 `android_vdisplay_input` 共用 `callVdOp`，它成功时始终附加 `state`；输入工具 schema 漏声明 `state`。壳侧 `vdInput` 正常回执同时有 `verb`、`screenId`、`displayId`，都必须在严格 schema 中逐一声明，不能开放额外属性。
+    **修法与回归**：schema 保持 `additionalProperties: false`，逐字段覆盖正常和失败形态；工具测试检查正常回执的 `state/verb/screenId/displayId` 与 schema 一致，并检查本地拒绝及控制通道异常也通过各自 schema。检查 web/headless profile 注入共用镜像插件 lib，避免旧副本掩盖修复。
+
+250. **启动期逐批 activation 让 cold-boot compose 次数超过预算（0.14.4 MuMu 实测，0.14.5 修复待设备复验）**：
+    **现象**：`check-boot-budget.mjs --require-real` 测到 C3 `compose calls=8`，真实 `[perf] compose` 行的 records 从 0 逐批增至 68；不是探针重复计数，也不是多实例。
+    **真因**：同一个 `ClientModuleRegistry` 在 loader 逐批 activation 后多次 `flush.changed → compose`。上游 `dsh/` 是只读 checkout，不能直接改。
+    **修法**：engine `combo-probe-P1` 在现有 `loader.await()` settle 屏障前暂存启动期 dirty Fiber，保留构造期同 shape/rev 的空 graph，并在 Web connection ready continuation 前发布完整 graph；启动期最多两次 compose（既有 rows 的同步 flush + settle flush），settle 后 add/remove/HMR 保持即时语义。TOTAL 每次 compose 同步输出同一监视器的累计值；phase 诊断用四阶段 allowlist Map 聚合，首条 phase 记录后固定 250ms 收口，分别报告 wall time、observations 与 forwarded callbacks；壳 `LogCollector` 暂存 LISTEN 前真实 TOTAL，LISTEN 行关联该值，未知仍为 -1。
+    **回归**：`scripts/patches/tests/combo-probe-p1.test.mjs` 覆盖空图、构造期 0 次 compose、settle 前多批合并、ready 顺序、settle 后运行期与 HMR；需在集成 0.14.5 APK 上再跑 C1-C6 真机门禁，不能把夹具通过写作设备通过。
+
+251. **冷启动门禁读取过早的 event-loop 快照（2026-10-05 实机日志核对，解析器已改为取末条）**：
+    **现象**：MuMu 0.14.5 的真实日志先输出 `loopP99Ms=-1 loopSamples=0`，后续 debounce 收口再输出 `245.1/20`；解析器分开用 `.exec()` 取首个值，于是 C4 误判成探针零样本，漏掉真实的超预算读数。更早的解析器还曾因拒绝负数而把首条哨兵误报为字段缺失。
+    **修法**：只从完整 `[perf] TOTAL` 行中成对读取 `loopP99Ms` 与 `loopSamples`，并使用最后一条；负哨兵仍要明确判 FAIL，末条 `245.1/20` 则因 p99 超过 100ms 预算而判 FAIL。不得改预算或把结果降级为 SKIP。
+    **回归**：`node scripts/check-boot-budget.mjs --self-test` 覆盖首条 `-1/0`、末条 `245.1/20`、末条仍为 `-1/0` 三种情况。补丁改变后从当前 registry 重建对应 ABI 快照，再构建 APK、覆盖安装并重新采集日志；旧设备日志和旧 snapshot stage 不能证明新快照行为。
+
+252. **Safe Mode 将备份路径与 realpath 后的 autoDir 作词法比较，导致 symlink 仓库无法恢复（2026-10-05 回归修复）**：
+    **现象**：`autoDir`/`DSH_UNDO_ROOT` 指向目录 symlink 时，Safe Mode `on` 能创建状态和备份，但 `off` 将保存的 symlink 路径目录与 realpath 后的根目录直接比较，恢复被拒绝。
+    **修法**：先 realpath 备份的父目录，与 autoDir 的 realpath 比较；要求叶文件是普通文件且不是 symlink，再返回根目录下规范化后的文件路径。父目录别名可用，备份本身的 symlink 与越界目录仍拒绝。
+    **复验证据**：`node --test vendor/dsh-undo-savepoint/test/safe-mode-transaction.test.mjs` 与 `node --test scripts/patches/tests/safe-mode-transaction.test.mjs` 各覆盖 symlink on→off 恢复和伪造越界备份拒绝；两份源码、测试和补丁模板需保持 APK 子仓逐字节镜像。
+
+
+253. **复用旧 snapshot 会让 APK 缺少当前 engine 探针，源码门禁通过仍不能证明产物新鲜（2026-10-06 独立产物核验）**：
+    **现象**：0.14.5 菜单修复 APK 与设备指纹一致，但解包和设备中的 `dsh-client-modules/lib/index.js` 均没有新 phase 探针；C4 仍为 308.3ms/22 samples，FAIL。
+    **真因**：`build-apk.mjs --snapshot` 复用原始快照，只执行后续 vendor 补丁与插件注入，不重新应用 engine 补丁；旧门禁检查当前源码和 profile，漏检归档中的实际模块。
+    **修法**：engine 补丁变更后重新执行 `build-snapshot-013.mjs`。度量门禁读取快照实际模块并检查 phase allowlist、Map、固定窗口、记录函数和输出字段；旧 P1、缺目标、坏 tar 与缺输出均拒绝。
+    **复验证据**：双仓微型 tar CLI 回归通过；旧原始快照严格检查 exit 1，当前源重建快照严格检查 exit 0。最终 APK 和设备的新探针验收仍须独立完成，mtime、版本号与快照指纹一致不能替代探针内容检查。
+
+
+254. **Android 模型菜单未登记返回层，系统 Back 会结束 Activity（2026-10-06 模拟器复现）**：
+    **现象**：模型选择菜单已不透明，但竖屏 MuMu 16416 用真实 `KEYCODE_BACK` 后直接回到 Launcher；WebView target 同时销毁。
+    **真因**：上游 ModelSelect 的菜单通过 React portal 挂在 body，既无 slash/@ 菜单的 `data-trigger-menu`，也不是附件菜单。原 BackStackSignal 漏掉这一层，壳侧在无其他返回层时结束 Activity。复用普通菜单的 pointerdown 关闭路径也不成立：ModelSelect 使用 mousedown 外部关闭及自己的 Escape 分层逻辑。
+    **修法**：只识别 ComposerPopupGuard 为展开且 aria-controls 关联的 Android ModelSelect 加的 `data-dsh-android-model-menu`，登记 `model-menu`。返回时向真实 portal 发送可取消并冒泡的 Escape，让上游先退模型子列表、再关根菜单并恢复焦点。上游 preventDefault 会让 dispatchEvent 返回 false，这表示事件已处理，不能解释为返回未消费。
+    **复验证据**：新增单测覆盖标记晚到、preventDefault 仍消费、子列表逐级返回、宽屏不依赖窄屏标记、其他菜单不误认领。responsive 全量 463/463、tsc/build 通过；src/tests/lib 已 robocopy 镜像，双仓镜像门禁 SKIP=0。MuMu 16416 热推后真实 ADB tap/Back 验证根菜单关闭、子列表先退一级再关闭、MainActivity 保持前台、模型未变；CDP 确认层信号与不透明背景及关闭后的标记清理，整页 39/39 通过。证据 `.deploy-tmp/refactor/0.14.5-phase-device/portrait-back-menu-*.json/.png` 和 `verify-webview-menu-back-portrait.log`。横屏返回测试及最终入包验收仍待完成；热推不代表修复已进入当前 APK。
+
+
+255. **把 compose 时长当作 C4 根因会漏掉 Loader 扫描和自动补给投影（2026-10-06 MuMu 实测）**：
+    **现象**：compose仅数毫秒，C3已收敛为2，但真实C4仍反复超过100ms。
+    **真因**：client/typert每个dirty名称重新遍历Loader；nearestPackage与resolveMeta复读同一manifest；本方模型能力初次投影、离线目录解析和最终fresh签名在同一事件循环turn堆叠。constructor首TOTAL样本为0，deferred末尾同步TOTAL尚未采到该flush阻塞，故phase wall time本身不是C4 p99。
+    **修法与证据**：同步flush临时索引、当前manifest复用及自动pass分段yield；同步错误回调后重建索引、异步typert完成后live复验、CAS与最新签名重读保留。定量计时、五轮真预算和最终APK边界统一见 `RUNTIME-PATCHES.md` §7.6，不把SKIP或诊断profile当作绿。

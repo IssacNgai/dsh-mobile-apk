@@ -27,31 +27,13 @@ class SafeModeTest {
 
   /** 一份**逼真的** live patch：含第三方条目 + 全部自有插件 + 组外 config 行。 */
   private fun realisticPatch(extraThirdParty: Boolean = true): String {
-    val sb = StringBuilder()
-    sb.append("- id: bash-sandbox\n  disabled: true\n")
-    sb.append("- insert:\n")
-    sb.append("    - id: shell-termux\n      name: '@dsh-android/dsh-shell-termux'\n      config:\n        bashPath: /x/bash\n")
-    sb.append("    - id: host-web-compat\n      name: '@dsh-android/dsh-host-web-compat'\n")
-    sb.append("    - id: ui-responsive\n      name: '@dsh-android/dsh-client-ui-responsive'\n")
-    sb.append("    - id: android-bridge\n      name: '@dsh-android/dsh-android-bridge'\n")
-    sb.append("    - id: android-manage\n      name: '@dsh-android/dsh-android-manage'\n")
-    sb.append("    - id: android-linux-env\n      name: '@dsh-android/dsh-android-linux-env'\n")
-    sb.append("    - id: android-file-open\n      name: '@dsh-android/dsh-android-file-open'\n")
-    sb.append("    - id: model-capability\n      name: '@dsh-android/dsh-model-capability'\n")
-    sb.append("    - id: android-browser\n      name: '@dsh-android/dsh-android-browser'\n")
-    sb.append("    - id: android-vdisplay\n      name: '@dsh-android/dsh-android-vdisplay'\n")
-    if (extraThirdParty) {
-      sb.append("    - id: dsh-code-diff-viewer\n      name: dsh-code-diff-viewer\n      config:\n        theme: dark\n")
-      sb.append("    - id: dsh-find-plugin\n      name: dsh-find-plugin\n")
-    }
-    sb.append("- insert:\n")
-    sb.append("    - id: dsh-undo-savepoint\n      name: dsh-undo-savepoint\n")
-    sb.append("- insert:\n")
-    sb.append("    - id: dshmarketplace\n      name: dshmarketplace-plugin\n")
-    sb.append("- id: client-hmr\n  disabled: true\n")
-    sb.append("- id: ptc-runtime\n  config:\n    nodeExecutable: /x/node\n")
-    sb.append("- id: llm-pi-ai\n  name: \"@deepseek-ai/dsh-llm-pi-ai\"\n  config:\n    providers: {}\n")
-    return sb.toString()
+    val shared = javaClass.getResourceAsStream("/safe-mode/cordis.patch.yml")
+      ?.bufferedReader(Charsets.UTF_8)?.use { it.readText().replace("\r\n", "\n") }
+      ?: error("shared Safe Mode patch fixture missing")
+    if (extraThirdParty) return shared
+    return shared
+      .replace(Regex("    - id: dsh-code-diff-viewer\n      name: dsh-code-diff-viewer\n      config:\n        theme: dark\n"), "")
+      .replace("    - id: dsh-find-plugin\n      name: dsh-find-plugin\n", "")
   }
 
   private fun fixture(): Triple<File, File, File> {
@@ -162,6 +144,61 @@ class SafeModeTest {
     assertFalse("home 级必须被改写", homePatch.readText() == homeOriginal)
     assertTrue(SafeMode.exit(patch, homePatch, autoDir).ok)
     assertEquals("home 级必须整份还原", homeOriginal, homePatch.readText())
+  }
+
+  @Test
+  fun `重复进入保留首次备份且重复退出不改数据`() {
+    val (patch, homePatch, autoDir) = fixture()
+    val original = realisticPatch()
+    patch.writeText(original)
+    assertTrue(SafeMode.enter(patch, homePatch, autoDir, "repeat-a").ok)
+    val stateFile = File(autoDir, SafeMode.STATE_FILE)
+    val stateBefore = stateFile.readText()
+    val filtered = patch.readBytes()
+    assertTrue(SafeMode.enter(patch, homePatch, autoDir, "repeat-b").ok)
+    assertEquals("重复 on 必须保留第一次 marker", stateBefore, stateFile.readText())
+    assertTrue("重复 on 不得再改 live patch", filtered.contentEquals(patch.readBytes()))
+    assertTrue(SafeMode.exit(patch, homePatch, autoDir).ok)
+    assertFalse("成功 off 清除 marker", stateFile.exists())
+    assertFalse("重复 off 是无操作失败", SafeMode.exit(patch, homePatch, autoDir).ok)
+    assertEquals("重复操作仍逐字节还原", original, patch.readText())
+  }
+
+  @Test
+  fun `损坏备份拒绝退出并保留安全态和 marker`() {
+    val (patch, homePatch, autoDir) = fixture()
+    val original = realisticPatch()
+    patch.writeText(original)
+    assertTrue(SafeMode.enter(patch, homePatch, autoDir, "damaged").ok)
+    val stateFile = File(autoDir, SafeMode.STATE_FILE)
+    val state = org.json.JSONObject(stateFile.readText())
+    File(state.getString("backup")).writeText("corrupted")
+    val safePatch = patch.readBytes()
+    val result = SafeMode.exit(patch, homePatch, autoDir)
+    assertFalse("SHA 不符必须拒绝退出", result.ok)
+    assertTrue("拒绝退出保留安全态 patch", safePatch.contentEquals(patch.readBytes()))
+    assertTrue("拒绝退出保留 marker", stateFile.isFile)
+  }
+
+  @Test
+  fun `写入中断后 marker 仍可驱动完整还原`() {
+    val (patch, homePatch, autoDir) = fixture()
+    val original = realisticPatch()
+    patch.writeText(original)
+    val interruptPatchWrite: (File, ByteArray) -> Unit = { target, bytes ->
+      if (target.canonicalFile == patch.canonicalFile) {
+        target.writeBytes(bytes.copyOf(bytes.size / 2))
+        throw java.io.IOException("simulated interrupted patch write")
+      }
+      target.parentFile?.mkdirs()
+      target.writeBytes(bytes)
+    }
+    val entered = SafeMode.enter(patch, homePatch, autoDir, "interrupted", interruptPatchWrite)
+    assertFalse("注入的写入中断必须回报失败", entered.ok)
+    assertTrue("marker 已先提交，off 仍可恢复", File(autoDir, SafeMode.STATE_FILE).isFile)
+    assertTrue(SafeMode.exit(patch, homePatch, autoDir).ok)
+    assertEquals("中断后的文件必须逐字节回到进入前", original, patch.readText())
+    assertFalse("完成恢复后清 marker", File(autoDir, SafeMode.STATE_FILE).exists())
   }
 
   // ── ② 用户口径：保留我们自己的插件 ──────────────────────────────────────────

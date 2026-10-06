@@ -92,14 +92,12 @@ const checks = [
   ['右栏展开键存在性与面板展开态互斥（展开键存在 === 面板未展开）',
     CORNER_PROBE,
     (v) => !!v && v.corner === true && v.button === !v.open],
-  // 2026-09-26 修正：加「会话已就绪」前置。上游 ConversationSession.tsx:65-70 在 hideChrome
-  // （无 session / 全 blank）时整段不渲染标题行与工具位 —— 空白 hero 态本就不该有该入口，
-  // 旧断言无条件判存在，结论随「跑前 UI 停在哪个状态」漂移（竖屏有会话恒绿、横屏 hero 恒红，
-  // 上一轮被误读成两方向行为不一致）。会话就绪的真源是 conversation root 的 data-phase="active"；
-  // hero 态按「不该存在」判，两条分支都可证伪。
-  ['我们的「在文件中打开」入口存在（hero 空白态豁免；两方向都判）',
+  // 0.14.2 P5 已按用户反馈退役 Session-header 文件夹入口；
+  // dsh-client-ui-responsive/src/client/index.ts:352-356 记录删除注册的原因，组件仍供 open-with tab 使用。
+  // 此断言验证退役状态在空白页和活动会话中都成立，避免把历史 UI 入口误报为产品回归。
+  ['已退役的 Session-header「在文件中打开」入口不存在（两方向都判）',
     "(() => { const active = !!document.querySelector('[data-dsh-frame] [data-phase=\"active\"]'); return { active, present: !!document.querySelector('[aria-label=\"在文件中打开\"]') } })()",
-    (v) => !!v && (v.active ? v.present === true : v.present === false)],
+    (v) => !!v && v.present === false],
   ['桥 openPathChooser 已注入', "typeof window.androidBridge?.openPathChooser === 'function'", true],
   ['桥 downloadDebugLogs 已退役', "typeof window.androidBridge?.downloadDebugLogs === 'undefined'", true],
   ['桥 pickImage 已退役', "typeof window.androidBridge?.pickImage === 'undefined'", true],

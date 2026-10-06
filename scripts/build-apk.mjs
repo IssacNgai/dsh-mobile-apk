@@ -13,15 +13,17 @@
 //   ④ `--dry-run` 只解析真源并打印产物名/注入集/门禁集，不写任何文件（验收 ① 的机器可读入口）。
 //
 // 用法：node scripts/build-apk.mjs --abi arm64|x86_64 [--suffix "-v3"] [--snapshot <snap.tar.xz>] [--skip-inject] [--dry-run]
-// 依赖：node、python 在 PATH；插件/vendor 在 ROOT（apk 仓自包含布局下 ROOT 即 apk 仓根）；
+// 依赖：node、python（Windows）/python3（Linux/WSL）在 PATH；插件/vendor 在 ROOT（apk 仓自包含布局下 ROOT 即 apk 仓根）；
 //       scripts/plugin-dirs.json 与 scripts/profile-web.cordis.patch.yml 在场。
 import { execFileSync, spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
-import { mkdirSync, existsSync, rmSync, copyFileSync, cpSync, writeFileSync, readFileSync, readdirSync } from 'node:fs'
-import { createHash } from 'node:crypto'
+import { mkdirSync, existsSync, rmSync, copyFileSync, cpSync, readFileSync, readdirSync } from 'node:fs'
+import { assembleApk, verifyApks } from './build-apk-engine.mjs'
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)))
+/** Python 命令名：Windows 用 python，Linux/WSL 用 python3，与 build-snapshot-013.mjs 一致。 */
+const PYTHON = process.platform === 'win32' ? 'python' : 'python3'
 // apk 仓库目录：默认 ROOT/dsh-mobile-apk（协调仓布局）；云端 workflow 宿主若=apk 仓库（GITHUB_WORKSPACE），
 // 用 DSH_APK_DIR 覆盖（此时 ROOT 指向作为依赖签出的协调库子目录）。
 const apkDir = process.env.DSH_APK_DIR
@@ -68,6 +70,8 @@ const GATE_SCRIPTS = [
   // 产物（gitignore）——本链（云端自包含）对应小节 SKIP 计数；发布链以 --require 强制齐全。
   'check-contract.mjs',
   'check-snapshot-fingerprint.mjs',
+  // Delivery gate: every final APK must verify with v1, v2, and v3 before leaving out/.
+  'check-apk-signatures.mjs',
   'check-manifest-hardening.mjs',
   'check-bounded-io.mjs',
   'check-api-route-auth.mjs',
@@ -153,6 +157,8 @@ if (DRY_RUN) {
 }
 
 try {
+  log('APK scheme and version suffix regression tests…')
+  run(process.execPath, ['--test', gate('check-apk-signatures.test.mjs'), gate('resolve-version-suffix.test.mjs'), gate('build-apk-engine.test.mjs'), gate('check-perf-instrumentation.test.mjs')])
   mkdirSync(OUT, { recursive: true })
   mkdirSync(work, { recursive: true })
 
@@ -288,7 +294,7 @@ try {
     const marketDeg = degraded.get('market')
     log('单 pass 注入（@dsh-android + undo/market + 权威 patch，全部装配 profile）…')
     // ST-05：--all-profiles = 权威 patch 写给全部真实装配 profile（web+headless，负控 profile 除外）
-    run('python', [
+    run(PYTHON, [
       join(ROOT, 'scripts', 'inject-all.py'), snapSrc, join(work, 'snap-final2.tar.xz'),
       join(ROOT, 'scripts', 'profile-web.cordis.patch.yml'),
       '--dsh-android', ...pluginDirs,
@@ -341,8 +347,8 @@ try {
   // check-engine-overlay 的正向闭包结构性看不见它——设备实测 boot 硬崩的正是这条）。
   log('门禁：MCP client 运行期依赖闭包（严格）…')
   run('node', [gate('check-mcp-client-deps.mjs'), ABI, '--require', '--snapshot', snapIn])
-  // A1 出厂声明值对账（P-AC-01，严格档）：注入后快照的 profile 清单必须带 patchReload 出厂值。
-  log('门禁：性能度量入口与 A1 出厂值（严格）…')
+  // 严格产物检查：实际 P1 phase 探针、A1 profile 清单及退役 patchReload 不回流。
+  log('门禁：实际 P1 phase 探针与 A1 profile 清单（严格）…')
   run('node', [gate('check-perf-instrumentation.mjs'), '--require', '--snapshot', snapIn, '--abi', ABI])
 
   // ---- 5. 许可资产（LICENSES + notices -> APK assets/licenses）----
@@ -352,26 +358,22 @@ try {
   copyFileSync(join(ROOT, 'THIRD_PARTY_NOTICES.md'), join(licAssets, 'THIRD_PARTY_NOTICES.md'))
   log('许可资产就位')
 
-  // ---- 6. 快照 + 指纹写入 assets（防增量叠加缓存：先清 intermediates/输出）----
-  rmSync(join(apkDir, 'app', 'build', 'intermediates', 'assets'), { recursive: true, force: true })
-  rmSync(join(apkDir, 'app', 'build', 'outputs', 'apk', 'debug'), { recursive: true, force: true })
-  copyFileSync(snapIn, join(apkDir, 'app', 'src', 'main', 'assets', 'snapshot.tar.xz'))
-  const sha = createHash('sha256').update(readFileSync(snapIn)).digest('hex')
-  writeFileSync(join(apkDir, 'app', 'src', 'main', 'assets', 'snapshot.sha256'), sha, 'ascii')
-  log(`snapshot.sha256 = ${sha}`)
-  // ST-04 严格复核：本 ABI 的 tar 与刚写入的声明值必须逐字节一致（--require：缺件即失败，不得 SKIP）。
-  run('node', [gate('check-snapshot-fingerprint.mjs'), '--require'])
-
-  // ---- 7. gradle assembleDebug（跨平台 gradlew）----
-  log('构建 APK…')
-  const gradleCmd = process.platform === 'win32' ? 'gradlew.bat' : './gradlew'
-  const gr = spawnSync(gradleCmd, [':app:assembleDebug', '--no-daemon', `-PversionNameSuffix=${SUFFIX}`], { cwd: apkDir, stdio: 'inherit', shell: process.platform === 'win32' })
-  if (gr.status !== 0) { console.error(`gradle 失败 (${gr.status})`); process.exit(1) }
-
-  // ---- 8. 产物拷贝（产物名与输出目录都来自 gradle 真源）----
+  // ---- 6-8. Shared terminal stage: snapshot/fingerprint + Gradle + copy ----
   const name = `dsh-mobile-apk-v${VER}${SUFFIX}-${ABI}.apk`
-  copyFileSync(join(apkDir, 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk'), join(OUT, name))
-  log(`产物: ${join(OUT, name)}`)
+  log('构建 APK…')
+  const finalApk = assembleApk({
+    snapshot: snapIn,
+    apkDir,
+    outputDir: OUT,
+    artifactName: name,
+    suffix: SUFFIX,
+    clean: true,
+    fingerprintGate: gate('check-snapshot-fingerprint.mjs'),
+    log,
+  }, (cmd, argv, opts) => spawnSync(cmd, argv, { cwd: ROOT, encoding: 'utf8', stdio: 'inherit', ...opts }))
+  run(process.execPath, [gate('check-apk-signatures.mjs'), '--self-test'])
+  verifyApks({ signatureGate: gate('check-apk-signatures.mjs'), directories: [OUT], selfTest: false, log },
+    (cmd, argv, opts) => spawnSync(cmd, argv, { cwd: ROOT, encoding: 'utf8', stdio: 'inherit', ...opts }))
   console.log(`=== 完成（${ABI} ${SUFFIX}）===\nAPK=${join(OUT, name)}`)
 } catch (e) {
   console.error(`[build-apk/${ABI}] ${e.message}`)

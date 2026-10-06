@@ -13,7 +13,7 @@ DeepSeek Harness 的**安卓壳应用**（包名 `com.dsharnessmobile.shell`）�
 
 **关键约束：AI 可见的能力全部来自插件**，壳侧不直接注册工具。
 
-**运行时**：内嵌 Termux 快照（`assets/snapshot.tar.xz` → `files/usr` + `files/home`）；引擎 `@deepseek-ai/dsh` 0.1.7-rc.2 监听 `127.0.0.1:3080`；WebView 加载引擎 Web UI。
+**运行时**：内嵌 Termux 快照（`assets/snapshot.tar.xz` → `files/usr` + `files/home`）；当前快照中的 `@deepseek-ai/dsh` 为 **0.2.0-rc.2**（以快照内 `package.json` 与 `scripts/snapshot-config/engine-overlay.json` 为准），监听 `127.0.0.1:3080`；WebView 加载引擎 Web UI。
 
 **构建链**：minSdk 26 / targetSdk 34 / compileSdk 36；Kotlin 2.0.21；AGP 8.8.2；Java 17。
 
@@ -104,6 +104,7 @@ adb -s <serial> install -r -t out\v<版本>\dsh-mobile-apk-v<版本>-arm64.apk
 | 运行顺序 / 嵌套 / 耦合 / 流程图（排查入口） | `docs/AGENTS/EXECUTION-MAP.md` |
 | 模拟器验收规范（代码/CDP/adb 三层 + 真实任务） | `docs/AGENTS/emulator-test-protocol.md` |
 | **版本历史（全量）** | `docs/AGENTS/changelog-archive.md` |
+| Hard / Soft / Data 持久化路径、SharedPreferences keys、恢复来源 | `docs/AGENTS/PERSISTENT-DATA.md` |
 
 ---
 

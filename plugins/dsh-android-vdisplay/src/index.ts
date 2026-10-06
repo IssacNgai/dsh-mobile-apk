@@ -298,6 +298,7 @@ export function apply(ctx: Context): void {
         ok: { type: 'boolean', required: true },
         code: { type: 'string', required: true },
         guidance: { type: 'string', required: true },
+        state: { type: 'string' },
         verb: { type: 'string' },
         screenId: { type: 'string' },
         displayId: { type: 'integer' },

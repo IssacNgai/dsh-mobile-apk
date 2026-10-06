@@ -16,9 +16,11 @@
 // 安全边界：本工具只写配置文件与插件代码树（同快照范围），不触碰用户数据目录
 // （sessions/storages/凭据真实值）；敏感文件快照为脱敏副本，真实值在本机 vault 中，
 // 恢复时优先从 vault 取真实值（与插件 applySnapshot 语义一致），vault 缺失才写占位。
-import { readdirSync, readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, rmSync, cpSync } from 'node:fs'
+import { readdirSync, readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, rmSync, cpSync, renameSync, realpathSync } from 'node:fs'
 import { join, basename, dirname, sep, resolve } from 'node:path'
 import { homedir } from 'node:os'
+import { createHash, randomBytes } from 'node:crypto'
+import { fileURLToPath } from 'node:url'
 
 const DSH_HOME = process.env.DSH_HOME || join(homedir(), '.dsh')
 const UNDO_ROOT = process.env.DSH_UNDO_ROOT || join(DSH_HOME, 'undo-snapshots')
@@ -179,7 +181,39 @@ function restoreLastGood({ pretend = false } = {}) {
   return restore(snap.id, { pretend })
 }
 
-function safeMode(action) {
+function sha256(bytes) { return createHash('sha256').update(bytes).digest('hex') }
+
+function safeModeAtomicWrite(target, bytes) {
+  mkdirSync(dirname(target), { recursive: true })
+  const tmp = `${target}.safe-mode-${randomBytes(6).toString('hex')}.tmp`
+  try {
+    writeFileSync(tmp, bytes)
+    renameSync(tmp, target)
+  } finally {
+    try { rmSync(tmp, { force: true }) } catch {}
+  }
+}
+
+function safeModeBackup(autoDir, value, id, prefix) {
+  if (typeof value !== 'string' || value === '') return null
+  try {
+    const root = realpathSync(autoDir)
+    const candidate = resolve(value)
+    if (dirname(candidate) !== root || basename(candidate) !== `${prefix}${id}.yml`) return null
+    if (realpathSync(candidate) !== candidate) return null
+    return candidate
+  } catch { return null }
+}
+
+function safeModeVerifyBackup(path, expectedSha) {
+  try {
+    if (!path || !existsSync(path)) return false
+    const bytes = readFileSync(path)
+    return typeof expectedSha !== 'string' || expectedSha === '' || sha256(bytes) === expectedSha
+  } catch { return false }
+}
+
+export function safeMode(action, { atomicWrite = safeModeAtomicWrite } = {}) {
   const { root } = storeDirs()
   const autoDir = join(root, 'auto')
   // 与插件一致的状态文件名（v0.3 插件用 safe-mode.json；旧急救 CLI 误用
@@ -189,26 +223,35 @@ function safeMode(action) {
   const homePatch = join(DSH_HOME, 'cordis.patch.yml')
   const id = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14) + '-' + Math.random().toString(16).slice(2, 6)
   if (action === 'on') {
-    const prev = existsSync(stateFile) ? JSON.parse(readFileSync(stateFile, 'utf8')) : null
-    if (prev?.active) {
-      console.log('安全模式已在开启状态')
-      return true
-    }
     mkdirSync(autoDir, { recursive: true })
-    const backup = join(autoDir, `safe-mode-backup-${id}.yml`)
-    const homeBackup = join(autoDir, `safe-mode-home-backup-${id}.yml`)
-    // 兼容旧急救 CLI 写的 safe-mode-state.json：迁移到插件同名文件
+    // 兼容旧急救 CLI 写的 safe-mode-state.json：迁移后仍按 active 状态幂等处理。
     const legacy = join(autoDir, 'safe-mode-state.json')
     if (existsSync(legacy) && !existsSync(stateFile)) {
-      try { copyFileSync(legacy, stateFile) } catch { /* 忽略 */ }
+      try { copyFileSync(legacy, stateFile) } catch { /* 保留旧 marker 并拒绝下方写入 */ }
     }
-    // 先做变更前建档（等价 Windows 版 pre-snapshot）
+    if (existsSync(stateFile)) {
+      try {
+        const prev = JSON.parse(readFileSync(stateFile, 'utf8'))
+        if (prev?.active) { console.log('安全模式已在开启状态'); return true }
+      } catch {
+        console.error('安全模式状态文件损坏，已拒绝覆盖；请先恢复状态文件')
+        return false
+      }
+    }
+    const backup = join(autoDir, `safe-mode-backup-${id}.yml`)
+    const homeBackup = join(autoDir, `safe-mode-home-backup-${id}.yml`)
+    // 先做变更前建档（等价 Windows 版 pre-snapshot）。快照失败时原配置仍未动。
     createManifestSnapshot('safe-mode-before')
-    if (existsSync(patch)) copyFileSync(patch, backup)
-    else writeFileSync(backup, '[]\n')
+    const patchBytes = existsSync(patch) ? readFileSync(patch) : Buffer.from('[]\n')
+    atomicWrite(backup, patchBytes)
     const homeExisted = existsSync(homePatch)
-    if (homeExisted) copyFileSync(homePatch, homeBackup)
-    if (!existsSync(backup)) { console.log('安全模式备份写入失败，拒绝进入'); return false }
+    const homeBytes = homeExisted ? readFileSync(homePatch) : null
+    if (homeBytes) atomicWrite(homeBackup, homeBytes)
+    if (!safeModeVerifyBackup(backup, sha256(patchBytes)) ||
+      (homeBytes && !safeModeVerifyBackup(homeBackup, sha256(homeBytes)))) {
+      console.log('安全模式备份校验失败，拒绝进入；原配置未改动')
+      return false
+    }
     // 与插件核心（core.mjs 的 undo-safe-align-S1）同口径：只摘第三方 insert 子条目，
     // 保留我方装配的插件与全部顶层 disable 行。原实现整份覆写成最小文件，
     // 会摘掉 12 个 @dsh-android/* 引用与 7 条 disabled（含安全关键的 client-hmr）。
@@ -251,20 +294,48 @@ function safeMode(action) {
       }
       return out.join('\n')
     }
-    const minimal = filterThirdPartyInserts(existsSync(patch) ? readFileSync(patch, 'utf8') : '')
-    mkdirSync(PROFILE_ROOT, { recursive: true })
-    writeFileSync(patch, minimal)
-    if (homeExisted) writeFileSync(homePatch, '# dsh-undo-savepoint SAFE MODE (home level)\n[]\n')
-    writeFileSync(stateFile, JSON.stringify({ active: true, enteredAt: new Date().toISOString(), backup, homeBackup, snapshotId: id, homeExisted }, null, 2))
+    const minimal = filterThirdPartyInserts(patchBytes.toString('utf8'))
+    // Marker is the recovery authority. Persist it atomically before touching any live config.
+    const state = {
+      active: true, enteredAt: new Date().toISOString(), backup, homeBackup,
+      snapshotId: id, homeExisted,
+      backupSha256: sha256(patchBytes), homeBackupSha256: homeBytes ? sha256(homeBytes) : '',
+    }
+    try {
+      atomicWrite(stateFile, Buffer.from(JSON.stringify(state, null, 2)))
+      mkdirSync(PROFILE_ROOT, { recursive: true })
+      atomicWrite(patch, Buffer.from(minimal))
+      if (homeExisted) atomicWrite(homePatch, Buffer.from('# dsh-undo-savepoint SAFE MODE (home level)\n[]\n'))
+    } catch (error) {
+      console.error(`安全模式写入未完成；状态与备份已保留，可修复原因后重试 off：${error.message}`)
+      return false
+    }
     rmSync(legacy, { force: true })
     console.log(`安全模式 ON（建档 ${id}）。已摘除第三方插件条目、保留产品自有插件；重启 DSH 生效。`)
     return true
   }
   if (action === 'off') {
     if (!existsSync(stateFile)) { console.log('安全模式未开启'); return true }
-    const st = JSON.parse(readFileSync(stateFile, 'utf8'))
-    if (existsSync(st.backup)) copyFileSync(st.backup, patch)
-    if (st.homeExisted && existsSync(st.homeBackup)) copyFileSync(st.homeBackup, homePatch)
+    let st
+    try { st = JSON.parse(readFileSync(stateFile, 'utf8')) } catch {
+      console.error('安全模式状态文件损坏；保留状态与备份，拒绝还原')
+      return false
+    }
+    const backupPath = safeModeBackup(autoDir, st.backup, st.snapshotId, 'safe-mode-backup-')
+    const homeBackupPath = st.homeExisted
+      ? safeModeBackup(autoDir, st.homeBackup, st.snapshotId, 'safe-mode-home-backup-') : null
+    if (!st.active || !safeModeVerifyBackup(backupPath, st.backupSha256) ||
+      (st.homeExisted && !safeModeVerifyBackup(homeBackupPath, st.homeBackupSha256))) {
+      console.error('安全模式备份缺失、损坏或路径无效；保留状态与文件，拒绝还原')
+      return false
+    }
+    try {
+      atomicWrite(patch, readFileSync(backupPath))
+      if (st.homeExisted) atomicWrite(homePatch, readFileSync(homeBackupPath))
+    } catch (error) {
+      console.error(`安全模式还原未完成；状态与备份已保留，可修复原因后重试：${error.message}`)
+      return false
+    }
     rmSync(stateFile, { force: true })
     console.log('安全模式 OFF：已还原 patch（重启 DSH 恢复完整插件）')
     return true
@@ -306,14 +377,15 @@ function createManifestSnapshot(reason) {
 }
 
 let boots = null
-const [cmd, arg] = process.argv.slice(2)
-if (!cmd) {
-  console.log(`用法：node dsh-undo-emergency.mjs <list|restore <id|latest>|restore-last-good|undo|safe-mode on|off|status|boot-state>
+if (!new URL(import.meta.url).search && process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const [cmd, arg] = process.argv.slice(2)
+  if (!cmd) {
+    console.log(`用法：node dsh-undo-emergency.mjs <list|restore <id|latest>|restore-last-good|undo|safe-mode on|off|status|boot-state>
 DSH_HOME=${DSH_HOME} / 存储=${UNDO_ROOT} / 档案=${PROFILE}`)
-  process.exit(1)
-}
-let ok = false
-switch (cmd) {
+    process.exit(1)
+  }
+  let ok = false
+  switch (cmd) {
   case 'list': {
     const snaps = listSnapshots()
     if (!snaps.length) console.log('暂无快照。')
@@ -334,5 +406,6 @@ switch (cmd) {
   }
   case 'safe-mode': ok = safeMode(arg ?? 'status'); break
   default: console.log('未知命令：' + cmd)
+  }
+  process.exit(ok ? 0 : 1)
 }
-process.exit(ok ? 0 : 1)
