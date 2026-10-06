@@ -103,15 +103,18 @@
 
 ## 0.14.1 undo 链（2026-09-19）
 
-- **`UndoGate.clearMarker` / `armedToDisplay` 仍是死代码（本轮只登记不修）**：两函数在全仓
-  **零调用点**（`clearMarker` 仅自身定义，`armedToDisplay` 同），与 `UndoGate.kt` 类注释声称的
-  「用户手动重试/手动 undo 后清除标记」及「供启动页显示」两处文档不符。实际只有 `disarm`
-  （被 `EngineService` 在 IDLE 时调用）会删 `.undo-auto-armed`，而 `.undo-auto-done` marker
-  **永不被清**——于是「上次自动 undo 成功」在 `RETRY_WINDOW_MS`（30 分钟）内持续压制后续崩溃纪元
-  的自动回撤。**未修的真实原因**：清除时机是一个产品判断（哪些用户动作算「新的崩溃纪元」），
-  仓促接线会把「用户刚修好又立刻崩溃」误判成旧纪元而拒绝自救，风险高于收益。
-  最小落点：把 `clearMarker` 接在「用户显式重启引擎」（`EngineStartFlow.restart`）与
-  「引擎健康确认跨越 N 拍」两处，并为其补一条能判红的单测。
+- **`.undo-auto-done` 标记无任何清除路径（仍开放，未修；2026-10-06 更正措辞）**：
+  此前本条目称 `UndoGate.clearMarker` / `armedToDisplay` 是「零调用点的死代码」。
+  **该描述已过期且会误导**：这两个函数在本轮之前的清理中已从源码**删除**，全仓只剩本文件引用它们。
+  真实状态是——**函数没了，而它们本该提供的清除行为仍然缺失**，所以这是未修的功能缺口，不是代码卫生项。
+  取证（`UndoGate.kt` 全文 grep）：`markerFile(context)`（即 `.undo-auto-done`）只在 `:434` 被 `writeText`，
+  **全文件没有任何一处对它调用 `.delete()`**；可被删除的只有 `armFile(context)`（`.undo-auto-armed`，删于 `:444` / `:499` / `:512`）。
+  后果：`gate()` 的 `nowMs - lastUndoAtMs < RETRY_WINDOW_MS`（30 分钟）抑制一旦成立，
+  在窗口内**不会再有**任何用户动作能重置它 ⇒ 30 分钟内发生的新崩溃纪元无法自动回撤。
+  **未修的真实原因（不因措辞更正而改变）**：清除时机是产品判断（哪些用户动作算「新的崩溃纪元」），
+  仓促接线会把「用户刚修好又立刻崩溃」误判成旧纪元而拒绝自救，风险高于收益。见 `docs/RECOVERY-ARCH-0.14.5.md` 的 S 项清单。
+  最小落点：在「用户显式重启引擎」（`EngineStartFlow.restart`）与「引擎健康确认跨越 N 拍」两处引入纪元边界，
+  并为其补一条**能判红**的单测（先证明它在缺实现时失败）。
 - **0.14.1 已修的同类缺陷（留档对照）**：`WatchdogV2.planTick` 的熔断锁存盲区——`tripped()` 曾排在
   `undoReady()` 之前且一旦为真即永久 HOLD，而熔断在 60s 打开、托管子进程启动预算却是 90s，导致
   「子进程存活但 HTTP 永不健康」时 undo 与 restart 双双永久失效。修法 = undo 提到熔断之前
