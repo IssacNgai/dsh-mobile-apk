@@ -2259,6 +2259,7 @@ scripts/deploy-device.ps1
 scripts/deploy-embedded.ps1
 scripts/t0-check.ps1
 scripts/e2e-phone-test.ps1
+scripts/verify-state-sync-modep.test.mjs
 -->
 
 ## 8. 历史已知漂移与旧审查线索（当前契约见§6）
