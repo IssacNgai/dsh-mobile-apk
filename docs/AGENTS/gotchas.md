@@ -1439,3 +1439,15 @@
     **现象**：compose仅数毫秒，C3已收敛为2，但真实C4仍反复超过100ms。
     **真因**：client/typert每个dirty名称重新遍历Loader；nearestPackage与resolveMeta复读同一manifest；本方模型能力初次投影、离线目录解析和最终fresh签名在同一事件循环turn堆叠。constructor首TOTAL样本为0，deferred末尾同步TOTAL尚未采到该flush阻塞，故phase wall time本身不是C4 p99。
     **修法与证据**：同步flush临时索引、当前manifest复用及自动pass分段yield；同步错误回调后重建索引、异步typert完成后live复验、CAS与最新签名重读保留。定量计时、五轮真预算和最终APK边界统一见 `RUNTIME-PATCHES.md` §7.6，不把SKIP或诊断profile当作绿。
+256. **`actions/checkout` 的 `lfs: true` 等价于 `git lfs fetch --all`，会为「历史里已删除的对象」持续付费（2026-10-07 用户 LFS 配额耗尽后定位）**：
+    **现象**：用户的 GitHub Git LFS 月流量（10 GB）被耗尽；而日常开发的 diff、构建产物都不走 LFS，无从判断流量花在哪。
+    **真因**：`lfs: true` 不是「把工作区里的 LFS 文件取下来」，而是 `git lfs fetch --all` —— 它按**仓库历史**拉取所有 LFS 对象，包括**当前 HEAD 里已不存在**的。本仓实测：`git lfs ls-files --all` 共 5 个对象约 481 MB，其中 `snapshots/{arm64,x86_64}/snapshot.tar.xz`（143.7 MB + 150.6 MB = **294 MB，占 61%**）已不在 HEAD，但每次检出仍会被拉取。叠加因素：`release.yml` 的 snapshot 与 release 两个 job **各检出一次**，且两者都用 `fetch-depth: 0`（= `git lfs fetch --all` 口径，而非 `fetch --recent`）；`build-apk.yml` 亦然。
+    **修法**：
+      - 不再用 `lfs: true`；改为 `lfs: false` + 只拉本 job 真正需要的路径：`git lfs pull --include="base/base-usr-<abi>.tar.xz,base/base-dsh.tar.xz"`（单 ABI 约 110-121 MB）；
+      - 对 `base/` 目录加 `actions/cache`，缓存键取 **pointer 文件哈希**（pointer 内含 oid+size，对象一变键即变，不会命中陈旧归档），命中时完全跳过 LFS 拉取；
+      - **去掉 release job 的 LFS**：取证 `scripts/build-apk-013.ps1:252` 只消费 `.deploy-tmp/snapshot-013/<abi>/snapshot.tar.xz`、从不读 `base/`，该 job 的 `lfs: true` 纯属浪费；
+      - 配套守卫 `scripts/require-lfs-materialized.mjs`：**按需拉取**一旦失败，工作区留下的是约 130 字节的 pointer 文本——它 `existsSync` 为真、能被 `cp`/`tar` 读到，失败会以「tar 解压出错」之类难懂的下游症状出现。该守卫在源头判红，且**拒绝「过小文件」冒充**（空文件/截断文件同样判红）。
+    **为什么不只是加缓存**：首次运行仍要付 481 MB；缓存键也无法表达「只要这一个对象」。
+    **为什么不删 `.gitattributes` 里的 LFS 规则**：那会让后续 checkout 拿到 pointer 文本而非归档，是**破坏性**改动；本轮不碰。
+    **残留浪费（未处理，环境受限）**：让 LFS 改用 GitHub Actions 缓存或本地缓存需改 `.lfsconfig` / `lfs.storage` / `LFS_STORAGE` 并**实测验证**；本会话无法访问 github.com，无法验证匿名端点与私有仓鉴权，故不做无法验证的改动，仅如实登记。
+    **验证状态**：workflow 的 YAML 可解析性、结构完整性、门禁与「`lfs: true` 已清零」均已本地验证；**真实 runner 行为未验证**（用户边界禁止触发 workflow）。

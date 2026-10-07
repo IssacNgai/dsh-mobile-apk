@@ -48,12 +48,34 @@ jobs:
       # build-apk.mjs 依赖本仓库顶层 scripts/plugins/vendor/base；apk 仓库 = $GITHUB_WORKSPACE
       DSH_APK_DIR: ${{ github.workspace }}
     steps:
-      - name: 检出本仓库（含 Git LFS 底座归档）
+      # LFS 流量治理（0.14.5）：原先 `lfs: true` = `git lfs fetch --all`，会把历史上所有 LFS 对象
+      # 拉全（本仓共约 481 MB，其中 294 MB 是已从 HEAD 删除的 snapshots/* 死对象）。
+      # 本 job 只 stage 本 ABI 的底座 + 共用 base-dsh，故改为按需拉取 + 目录缓存。
+      - name: 检出本仓库（不含 LFS 归档；底座下方按需拉取）
         uses: actions/checkout@v4
         with:
           persist-credentials: false
           fetch-depth: 0
-          lfs: true
+          lfs: false
+      - name: 缓存底座归档（命中则跳过 LFS 拉取）
+        id: lfs-base
+        uses: actions/cache@v4
+        with:
+          path: base
+          key: lfsbase-${{ matrix.abi }}-${{ hashFiles(format('base/base-dsh.tar.xz'), format('base/base-usr-{0}.tar.xz', matrix.abi)) }}
+      - name: 按需拉取 LFS 底座（仅本 ABI，未命中缓存时）
+        if: steps.lfs-base.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -e
+          git lfs install --local
+          git lfs pull --include="base/base-usr-${{ matrix.abi }}.tar.xz,base/base-dsh.tar.xz"
+      - name: 断言底座确实已落地（拒绝 LFS pointer 冒充文件）
+        shell: bash
+        run: |
+          set -e
+          node scripts/require-lfs-materialized.mjs \
+            "base/base-usr-${{ matrix.abi }}.tar.xz" "base/base-dsh.tar.xz"
 
       - name: 准备运行时（node；dsh-client-ui-responsive 的 tsdown 要求 node ^22.18 || >=24.11）
         uses: actions/setup-node@v4

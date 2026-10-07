@@ -46,11 +46,40 @@ jobs:
     env:
       DSH_APK_DIR: ${{ github.workspace }}
     steps:
+      # LFS 流量治理（0.14.5，用户 10 GB/月 LFS 配额已耗尽后实施）：
+      #   原先 `lfs: true` 等价于 `git lfs fetch --all`，会把**历史里所有**LFS 对象拉全。
+      #   本仓历史含 5 个 LFS 对象共约 481 MB，其中 snapshots/{arm64,x86_64}/snapshot.tar.xz
+      #   两个对象（143.7 + 150.6 = 294 MB，61%）**已不在 HEAD**，属纯浪费。
+      #   改为「只拉本 job 真正需要的路径」：本 ABI 的 base-usr + 共用 base-dsh，共约 110-121 MB。
+      #   再加 base/ 目录缓存：命中时完全跳过 LFS 拉取。
+      # 为什么不保留 lfs:true + 只加 cache：那样首次仍要付 481 MB，缓存键也表达不了「只此一个对象」。
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
           fetch-depth: 0
-          lfs: true                     # base/ 底座是 LFS 归档（快照重建的输入）
+          lfs: false                    # 见上方说明：改按需拉取，勿改回 true
+      # 缓存键取 **pointer 文件的哈希**：pointer 内含 oid+size，对象一变键即变，不会命中陈旧归档。
+      - name: 缓存底座归档（命中则跳过 LFS 拉取）
+        id: lfs-base
+        uses: actions/cache@v4
+        with:
+          path: base
+          key: lfsbase-${{ matrix.abi }}-${{ hashFiles(format('base/base-dsh.tar.xz'), format('base/base-usr-{0}.tar.xz', matrix.abi)) }}
+      - name: 按需拉取 LFS 底座（仅本 ABI，未命中缓存时）
+        if: steps.lfs-base.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -e
+          git lfs install --local
+          git lfs pull --include="base/base-usr-${{ matrix.abi }}.tar.xz,base/base-dsh.tar.xz"
+      # 守卫：按需拉取失败时工作区会留下约 130 字节的 pointer 文本——它「看起来是个文件」，
+      # 能被 cp/tar 读到，失败会以「tar 解压出错」之类难懂的下游症状出现。这里在源头判红。
+      - name: 断言底座确实已落地（拒绝 LFS pointer 冒充文件）
+        shell: bash
+        run: |
+          set -e
+          node scripts/require-lfs-materialized.mjs \
+            "base/base-usr-${{ matrix.abi }}.tar.xz" "base/base-dsh.tar.xz"
       - uses: actions/setup-node@v4
         with: { node-version: '24' }
       - name: python -> python3
@@ -125,11 +154,15 @@ jobs:
       DSH_APK_DIR: ${{ github.workspace }}
       ANDROID_USER_HOME: ${{ github.workspace }}/.android-home
     steps:
+      # LFS 流量治理（0.14.5）：本 job **完全不需要** LFS 底座。
+      #   取证：scripts/build-apk-013.ps1:252 只消费 `.deploy-tmp/snapshot-013/<abi>/snapshot.tar.xz`
+      #   并在缺席时明确提示「先跑 build-snapshot-013.mjs」——它从不读 base/。
+      #   底座由上面的 snapshot job 消费；此处原先的 `lfs: true` 纯属浪费。
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
           fetch-depth: 0
-          lfs: true
+          lfs: false
       - uses: actions/setup-node@v4
         with: { node-version: '24' }
       - uses: actions/setup-java@v4

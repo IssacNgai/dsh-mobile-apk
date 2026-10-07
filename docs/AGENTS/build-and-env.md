@@ -66,6 +66,14 @@ cd ..\plugins\dsh-android-<pkg> && npm run build
 available for offline mode`，22s 即 break），且该行把 gradle 输出重定向进 `$null`，日志里只剩一句 `APK build failed (…)`。
 现统一走项目 wrapper。`build-release.ps1 -Version 0.14.5` 的参数是最终版本名，因此传给 Gradle 的 `versionNameSuffix` 为空；测试构建可显式用 `-VersionSuffix "-preview"`（最终目录/包名为 `0.14.5-preview`），或传完整标签 `-Version "0.14.5-preview"`。脚本基于 Gradle 中的 `0.14.5` 派生后缀，拒绝不匹配的完整版本，避免把 `0.14.5` 再拼到自身后面；派生逻辑由 `scripts/resolve-version-suffix.mjs` 与 Node 回归用例覆盖。Gradle调用示例：`.\gradlew.bat :app:assembleDebug --no-daemon "-PversionNameSuffix=$VersionSuffix"`。**改任何一条链的调用前先问：另一条链是不是这条命令**（详档见坑 194）。
 
+**LFS 底座按需拉取，不用 `lfs: true`（0.14.5，用户 LFS 月流量耗尽后改）**：`actions/checkout` 的 `lfs: true` 等价于 `git lfs fetch --all`，
+按**仓库历史**拉取全部 LFS 对象——包括**已从 HEAD 删除**的。本仓实测 5 个对象约 481 MB，其中 `snapshots/{arm64,x86_64}/snapshot.tar.xz`
+（143.7 + 150.6 = **294 MB，占 61%**）已不在 HEAD，却每次检出都拉。现 `build-apk.yml` 与 `release.yml` 的 snapshot job 改为
+`lfs: false` + `git lfs pull --include="base/base-usr-<abi>.tar.xz,base/base-dsh.tar.xz"`（单 ABI 约 110-121 MB），并对 `base/` 加
+`actions/cache`（键取 pointer 文件哈希，对象变则键变，不会命中陈旧归档）；**`release.yml` 的 release job 完全去掉 LFS**——
+取证 `scripts/build-apk-013.ps1:252` 只消费 `.deploy-tmp/snapshot-013/<abi>/snapshot.tar.xz`、从不读 `base/`。
+配套 `scripts/require-lfs-materialized.mjs`：按需拉取失败时工作区留下的是约 130 字节 pointer 文本（`existsSync` 为真、能被 `cp`/`tar` 读到），
+该守卫在源头判红并拒绝「过小文件」冒充。真因与验证边界见 `gotchas.md` 坑 256。
 **云端构建（0.13.0 起，宿主=本仓库，自包含）**：`.github/workflows/build-apk.yml`（`workflow_dispatch` 手动，matrix arm64/x86_64）托管整套构建链并只操作本仓库——快照从源重建（`base/` 底座归档为输入，Git LFS）、6 个缺 lib/ 的插件 npm 构建、注入/门禁/gradle 全部云端完成，仅 `upload-artifact` 供本地下载 debug，不出 Release；**不依赖协调库**（私库，GITHUB_TOKEN 无法签出）。`build-apk.mjs` 以 `DSH_APK_DIR=$GITHUB_WORKSPACE` 指向本仓库（gradle 在此）。本地仍在协调库根跑 `pwsh scripts\build-apk-013.ps1`（`scripts/` 前缀）。
 
 **CI 权限与正式发布**：构建/PR workflow 的 `GITHUB_TOKEN` 明确只读，checkout 禁止持久化凭据；`release.yml` 的快照构建、APK 构建、测试和签名核验均在只读 job 完成并上传 `release-v<version>` artifact。独立 `publish` job 只下载同一 artifact 并创建 draft Release / 上传资产，写权限仅授予该 job。发布阶段不重新构建或重签资产。PR 与来源构建 workflow 的源码 Node 测试使用 `node --test scripts/source-build/*.test.mjs`，新增测试自动进入该测试集。
