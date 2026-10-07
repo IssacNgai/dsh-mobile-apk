@@ -46,6 +46,10 @@ const GATES = [
   // 0.14.2 T6：补丁测试的夹具必须与 contract.baseline 同代——夹具停在上一代时「补丁回归」是结构性假绿
   // （rc.1 实测：真树断 9 条而 16 个补丁测试全绿）。
   { script: 'check-patch-fixtures.mjs', ciApk: true, ciCoord: true, needsSnapshot: false },
+  // 0.14.5（上游对齐审计 C-1）：夹具同代**不等于**断言被跑过——26 个补丁回归里此前只有 6 个有入口，
+  // 其余只被 node --check 解析过。本门禁把全部 26 个真的串行跑起来，并对已知失败采用**带理由的显式白名单**：
+  // 存量失败如实记账，任何**新增**失败立刻判红。实测它当场逮到 ptc-android-native-A1 读 fixture 里不存在的 src/*.ts。
+  { script: 'check-patch-test-manifest.mjs', ciApk: true, ciCoord: true, needsSnapshot: false },
   { script: 'check-manifest-hardening.mjs', ciApk: true, ciCoord: false, needsSnapshot: false },
   { script: 'check-bounded-io.mjs', ciApk: true, ciCoord: false, needsSnapshot: false },
   // #222：所有 mobile-owned /api exact/prefix 路由必须在登记表中，并有本地 auth guard 或窄公开白名单。

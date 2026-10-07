@@ -59,9 +59,10 @@ jobs:
           node scripts/check-patch-mirror.mjs --self
           # 0.14.2 T6：夹具停在上一代引擎时补丁回归测试是结构性假绿（本仓同样携带 tests/ 镜像面）
           node scripts/check-patch-fixtures.mjs
-          node scripts/patches/tests/spj-migration-link-f5.test.mjs
-          node scripts/patches/tests/atomic-stale-lock.test.mjs
-          node scripts/patches/tests/publish-exclusive-reclaim.test.mjs
+          # 0.14.5 C-1：原先此处硬编码跑 3 个补丁回归（26 个里只覆盖 3 个）。改用清单门禁——
+          # 它串行跑全部 26 个，并对已知失败要求带 reason/since 的显式声明，新增失败立刻判红。
+          # 那 3 条已被完整覆盖，故删除硬编码行而不是并行保留（避免两处清单各自漂移）。
+          node scripts/check-patch-test-manifest.mjs
       # 控制协议 V2（0.13.8 批 F）：引擎侧编解码的往返等价与体积基线（壳侧 Kotlin 一侧由
       # 本仓单测 + 跨语言往返门禁另守）。
       - name: 协议 V2 往返与体积门禁

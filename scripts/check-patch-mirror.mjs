@@ -300,6 +300,9 @@ if (peer) {
     // 0.14.2 D7：执行地图门禁纳入聚合并声明集合，它就必须与产物面同源 ——
     // 单边演进会让协调仓与 apk 仓对同一棵工作树给出不同的地图结论。
     'scripts/check-code-map.mjs',
+    // 0.14.5（上游对齐审计 C-1）：补丁回归清单门禁。它读 scripts/patches/tests/**（已镜像）并调 node:test，
+    // 两端结论必须同源；单边演进会让一仓判红、另一仓判绿。
+    'scripts/check-patch-test-manifest.mjs',
     'scripts/check-strip-noop.mjs',
     // combo 缓存（0.14.0 启动性能 P1-2 / A3）：预计算模块与覆盖门禁是双仓构建链的同一执行面——
     // 云端自包含构建会用 apk 仓副本（单边演进 = 云端算出的缓存与协调仓门禁口径不一致）。

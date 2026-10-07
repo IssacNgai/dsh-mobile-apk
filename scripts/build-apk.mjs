@@ -64,6 +64,8 @@ const GATE_SCRIPTS = [
   'check-patch-mirror.mjs',
   // 0.14.2 T6：补丁测试夹具必须与 contract.baseline 同代（夹具停在上一代 = 补丁回归结构性假绿）。
   'check-patch-fixtures.mjs',
+  // 0.14.5 C-1：夹具同代不等于断言被跑过——把 26 个补丁回归全部纳入执行，已知失败用带理由白名单记账。
+  'check-patch-test-manifest.mjs',
   // 0.14.2 D3 / B6：死 token 防漂移（我们 CSS 引用的 --dsw-* 对账上游现存令牌集合；上游树缺席即 SKIP 计数）。
   'check-dead-tokens.mjs',
   // review C6：适配层契约（bundle 行/构建产物/版本钉）。上游 dsh/ 与基线 node_modules 是本机只读
@@ -173,6 +175,9 @@ try {
   run('node', [gate('check-patch-mirror.mjs')])
   log('门禁：补丁测试夹具随版（夹具代 == contract.baseline）…')
   run('node', [gate('check-patch-fixtures.mjs')])
+  // 0.14.5 C-1：夹具同代**不等于**断言被跑过（26 个补丁回归此前只有 6 个有入口）。此处真的串行执行。
+  log('门禁：补丁回归清单（全部 26 个文件必须被执行）…')
+  run('node', [gate('check-patch-test-manifest.mjs')])
   // 0.14.2 D3 / B6：死 token 防漂移（我们 CSS 引用的 --dsw-* 对账上游现存令牌集合；上游树缺席即 SKIP 计数）。
   // 本轮实修：此前只登记进 GATE_SCRIPTS 声明数组、从未在此处调用——云端自包含链上这道门禁根本不跑。
   log('门禁：死 token 引用对账（--dsw-* vs 上游现存令牌）…')

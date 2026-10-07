@@ -72,6 +72,12 @@ Write-Host "== 补丁测试夹具随版门禁 =="
 node (Join-Path $Root "scripts\check-patch-fixtures.mjs") 2>&1
 if ($LASTEXITCODE -ne 0) { Write-Host "夹具未随版，拒绝打包（跑 node scripts\probe-engine-anchors.mjs --fixtures 重生成）"; exit 1 }
 
+# 0.14.5（上游对齐审计 C-1）：26 个补丁回归里此前只有 6 个有自动化入口，其余只被 node --check 解析过。
+# 本门禁把全部 26 个真的串行跑起来；存量失败用带理由的显式白名单记账，新增失败立刻判红。
+Write-Host "== 补丁回归清单门禁 ==
+node (Join-Path $Root "scripts\check-patch-test-manifest.mjs") 2>&1
+if ($LASTEXITCODE -ne 0) { Write-Host "补丁回归出现未声明失败，拒绝打包（修掉，或按既有格式加带 reason/since 的白名单）"; exit 1 }
+
 # 0.14.2 D3 / B6：死 token 防漂移——我们 CSS 引用的 --dsw-* 必须在上游现存令牌集合里（上游树缺席即 SKIP 计数）。
 # 注意：本门禁**必须紧随自己的守卫**，不得插在别的门禁调用与其 $LASTEXITCODE 守卫之间——
 # PowerShell 的 $LASTEXITCODE 是单一变量，只反映最后一条原生命令；插在中间会让**前一道**门禁的失败被本道覆盖（0.14.2 实修）。
