@@ -42,7 +42,7 @@ jobs:
           sudo apt-get install -y xz-utils gnupg unzip
 
       # 产出侧签名断言要用 apksigner，而它属于 Android SDK 的 build-tools——
-      # runner 镜像上是否预装并不稳定（本仓 pr-gate / build-snapshot 两条链都显式
+      # runner 镜像上是否预装并不稳定（本仓 pr-gate / release 两条链都显式
       # `sdkmanager "build-tools;36.0.0"`），故在这里**提前**解析：拿不到就当场判红，
       # 不让它拖到出包之后才失败。解析结果落盘供打包步骤复用。
       - name: Resolve the Android SDK apksigner
@@ -68,7 +68,7 @@ jobs:
           }
           apksigner_bin="$(resolve_apksigner || true)"
           if [ -z "$apksigner_bin" ]; then
-            echo "apksigner 不在场，尝试用 sdkmanager 装 build-tools（与 pr-gate / build-snapshot 同一做法）"
+            echo "apksigner 不在场，尝试用 sdkmanager 装 build-tools（与 pr-gate / release 同一做法）"
             for root in "${sdk_roots[@]}"; do
               if [ -x "$root/cmdline-tools/latest/bin/sdkmanager" ]; then
                 yes | sudo "$root/cmdline-tools/latest/bin/sdkmanager" "build-tools;36.0.0" >/dev/null 2>&1 || true

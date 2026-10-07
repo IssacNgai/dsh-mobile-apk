@@ -1491,3 +1491,44 @@
     **判红证据**：修前 APK 侧 `fail 1`、协调仓 `pass 6`；修后**两仓均 `pass 6 / fail 0`**，且镜像仍逐字节一致。
     **通用教训**：双仓镜像的测试里，凡是 `../../../` 这种**依赖自己在第几层**的路径都是定时炸弹——
     写测试时先问"同一份文件放到另一个仓的同一相对位置，这条路径还指得对吗"。
+
+262. **GitHub Actions 残余清理：artifact 是「按 run 分桶 + 有保留期」，cache 是「按 key 分代」，两者判据完全不同（0.14.5）**：
+    **实测存量**（清理前）：50 个 artifacts / 13.52 GB；62 个 caches / 1344 MB；42 个 release / 19.6 GB assets。
+    **判据（不要混用）**：
+    - **artifact**：与**某一次 workflow run** 绑定。同一个 run 里各 job 的产物天然同寿；
+      重新发布同一版本会再产一份 ⇒ 判据是「这个 run 的结论有没有被同版本的后一次成功 run 取代」，不是「文件多老」。
+      保留期由仓库设置决定（本仓 `actions_retention_days` 为 null ⇒ 用 GitHub 默认；实测三个月前的 0.12.x
+      artifacts **仍是 `expired=false`**，所以「等它自己过期」在这个仓不成立）。
+    - **cache**：与 **key** 绑定，不是与 run 绑定。Gradle 的 `setup-gradle@v4` 会为每个 commit 生成一组
+      `gradle-transforms-v1-<hash>` / `gradle-home-v1|...|<sha>` 键；**同一个 key 只有一份**，新 run 命中即复用。
+      但 **content-keyed 的三种 key 必须留下**：`gradle-wrapper-zips-v1-<hash>`、
+      `gradle-generated-gradle-jars-v1-<hash>`、`gradle-dependencies-v1-<hash>` —— 它们的 hash 来自**文件内容**
+      而非 commit，跨 commit 长期复用，删掉等于让下一次 CI 重新下载（本仓实测这三条共 **336 MB**）。
+    **删除动作**：`gh api --method DELETE repos/<owner>/<repo>/actions/artifacts/<id>`、
+    `gh cache delete <id> -R <repo>`、`gh api --method DELETE repos/<owner>/<repo>/releases/<id>`。
+    实测有约 5% 的请求瞬时失败（`DEL FAIL`），**必须重试收口**，不要当成"已被引用/不可删"。
+    **workflow 本身删不掉**：REST 的 `DELETE /repos/{o}/{r}/actions/workflows/{id}` **不存在**（实测 404）。
+    线上残留已删文件的 workflow 只能 `gh workflow disable`（状态变 `disabled_manually`）；
+    **要真正从 Actions 列表消失，必须删掉该 workflow 文件本身那次 commit 之前的版本**——
+    换句话说：workflow 条目由**默认分支上是否还有该文件**决定，本地 `git rm` 只有 push 后才生效。
+    ⇒ 本轮 `build-snapshot.yml` 已本地删除但未推送，线上 `Snapshot Build` 仍在列表里，只能先 disable。
+    **判红/证据**：清理前后 raw JSON 快照（`.deploy-tmp/actions-cleanup/*.json`）；
+    终态 13 artifacts / 1.74 GB（-87%）、2 caches / 4.84 MB、42 releases（0 draft）；
+    删除全程未触碰任何 release asset（`v0.14.4` 仍 12 assets / 586 MB）。
+
+263. **同一个 PowerShell 脚本里，`ConvertFrom-Json` 的字段是 DateTime，`[string]` 一转就变成美式格式——判据和动作会对不上（0.14.5，本轮自伤）**：
+    **现象**：清 cache 时我先用**计划脚本**算出「保留 13 个 / 删除 49 个」，再用**执行脚本**动手；
+    执行完打印 `DELETE 62 caches / 1,344 MB`，与计划的 49 个不符，我却在当时当成"计划过时"没深究。
+    **真因**：两个脚本用了**不同的比较方式**：
+    - 计划脚本：`$_.createdAt -ge '2026-10-04'`（`$_.createdAt` 仍是 **DateTime**，PS 把右侧字符串强转成 DateTime ⇒ 比较正确）；
+    - 执行脚本：`$created = [string]$x.createdAt; if ($created -lt '2026-10-04')` ——
+      `[string]` 把 DateTime 渲染成 `10/05/2026 09:12:27`（**美式 M/d/yyyy**），
+      再与 `'2026-10-04'` 做**字符串**比较 ⇒ `'1' -lt '2'` 恒真 ⇒ **62 个全部判为"太老"**。
+    **结果**：计划保留的 13 个（约 223 MB）被实际删掉，只剩 2 个删除请求恰好失败的（4.84 MB）。
+    **影响**：Gradle cache 是**构建脚手架**，不含任何仓库内容；下次 CI 重新拉取即可自愈（代价是一次构建变慢）。
+    所有 release / artifact / 源码**未受影响**（`v0.14.4` 仍 12 assets / 586 MB，42 个 release 完好）。
+    **通用教训（比这次损失值钱）**：
+    ① **同一批操作的计划与实际必须共用同一个比较函数**，不要一个用对象比较、一个用字符串比较；
+    ② `ConvertFrom-Json` 的日期字段**默认就是 DateTime**，要字符串比较就显式 `.ToString('yyyy-MM-dd')`；
+    ③ **执行输出与计划不一致时必须当场停手查**——我这次看到了 `62 ≠ 49` 却继续，这正是本仓反复出现的
+       「输出看起来正常，但它证明的事情是假的」同一形态，只不过这次是我自己造的。
