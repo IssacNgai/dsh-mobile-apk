@@ -734,7 +734,7 @@ jobs:
           set -euo pipefail
           # 固定签名（坑 202）：本链曾现场生成一次性证书，等于重新引入 e65818a 修掉的缺陷
           # ——每次构建新密钥，产物既装不上已有安装，两次构建的包也互相覆盖不了。
-          # 项目规范（gotchas 坑 10 / DEPENDENCIES.md / design.md / build-snapshot.yml）是
+          # 项目规范（gotchas 坑 10 / DEPENDENCIES.md / design.md）是
           # 「CI 与本地同一把 keystore/debug.keystore」，来源链同样走这一把：
           # 产物可 install -r -t 覆盖、签名可复现，与正式产物的区别只在 -source 版本后缀与 artifact 名。
           # 这里只查「在场」；证书指纹的判据放在产出侧（用 apksigner，输出不随语言/JDK 版本变），

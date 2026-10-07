@@ -256,7 +256,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          # 与 build-snapshot.yml:98-105 同一套口径（那份已在 CI 真跑过）——
+          # 与既有子仓打包口径一致（原先参照的 build-snapshot.yml 已于 0.14.5 删除；此处保留同一套做法）——
           # shell-termux / ui-responsive 需先 build；host-web-compat 源码入库，只 pack。
           # 三个包的 name 由各自 package.json 决定（实测: dsh-android-dsh-<name>-<version>.tgz），
           # 不在这里改写文件名：MANIFEST 与 Release 资产名都按 pack 的原样名走。
