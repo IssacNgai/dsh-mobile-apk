@@ -32,3 +32,6 @@ out/
 # Windows 环境变量展开失败产生的幻影目录（字面量 %SystemDrive% 被当成目录名，
 # 内含 ProgramData\Microsoft\Windows\Caches\*.db）。它不是仓库内容，任何提交都不该带上。
 %SystemDrive%/
+
+# gh CLI 在 CWD 下落的设备状态（我这边只读调用产生，非仓库内容）
+.local/
