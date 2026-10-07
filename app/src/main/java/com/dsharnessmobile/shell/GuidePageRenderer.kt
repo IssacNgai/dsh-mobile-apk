@@ -467,6 +467,8 @@ internal class GuidePageRenderer(private val activity: MainActivity) {
       homePatch = SafeMode.homePatchFile(engine),
       autoDir = SafeMode.autoDir(engine),
       id = SafeMode.newId(),
+      // 归属判定的权威来源：本版本实际装配的条目（不再是包名前缀，见 [SafeMode.isProductOwned]）。
+      hardNames = PluginMounts.hardNames(activity),
     )
     if (!result.ok) {
       // 备份不成功就绝不进入（[SafeMode.enter] 保证未改任何文件）——回执必须带真因。

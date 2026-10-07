@@ -49,15 +49,41 @@ internal object SafeMode {
    * 这是既有约定。漂移由 `SafeModeTest.productWhitelistMatchesThePatchScriptSource` 钉住
    * （它按源码文本解析那两行，两边不一致即判红）。
    */
-  internal val SHIPPED_PREFIXES = listOf("@deepseek-ai/", "@dsh-android/")
+  internal val SHIPPED_PREFIXES = listOf("@dsh-android/")
   internal val SHIPPED_NAMES = listOf("dsh-undo-savepoint", "dshmarketplace-plugin")
 
-  /** 某个包名是否属于产品自有插件。 */
+  /** 某个包名是否属于产品自有插件（**静态名单**口径，仅作 manifest 缺席时的回退）。 */
   internal fun isShippedPackage(name: String): Boolean {
     val v = name.trim().trim('\'', '"')
     if (v.isEmpty()) return false
     if (SHIPPED_PREFIXES.any { v.startsWith(it) }) return true
     return SHIPPED_NAMES.contains(v)
+  }
+
+  /**
+   * 归属判定的**权威口径**：本版本实际装配的条目清单（[PluginMounts.hardNames]）优先。
+   *
+   * 0.14.5（D-1(c)，与 G3 同源缺陷第二次出现）：原先只用 `SHIPPED_PREFIXES` 的 `@deepseek-ai/`
+   * 前缀判归属。**包名前缀只说明谁发布的，不说明谁装配的**——用户完全可以自己挂一个官方包
+   * （实测 `@deepseek-ai/dsh-mcp-client`）。按前缀判会把**用户的合法扩展**当成产品自有条目**保留**，
+   * 于是 Safe Mode 的「不加载 Soft」目标对它失效。
+   *
+   * 这不是新发明的修法：`scripts/patches/apply-patches.mjs` 的 G3 启动隔离补丁**正是因为同一实测原因**
+   * 弃用了前缀判据、改用构建期装配清单（见该文件 `dshMobileIsShippedPlugin`）。此处与它同源——
+   * 壳侧已有等价的权威来源 [PluginMounts.hardNames]（`.plugin-hard-manifest.json`，本版本自带、只增不减）。
+   *
+   * 为什么仍保留静态名单做并集：manifest 可能尚未建立（首次启动 / `ensureHard` 之前），
+   * 那时若只认 manifest 会把**产品自有插件也摘掉**，等于把引擎拆残——风险更高。
+   * 并集是安全的：静态名单里 `@dsh-android/` 是**我们自己的命名空间**（无他人发布），
+   * 两个具名插件也是我们的；上游 `@deepseek-ai/` 前缀已从这里移除（正是误判来源）。
+   *
+   * @param hardNames 权威装配清单；空集表示不可用，回退到静态名单。
+   */
+  internal fun isProductOwned(name: String, hardNames: Set<String>): Boolean {
+    val v = name.trim().trim('\'', '"')
+    if (v.isEmpty()) return false
+    if (hardNames.contains(v)) return true
+    return isShippedPackage(v)
   }
 
   // ── 纯逻辑：装配清单过滤 ────────────────────────────────────────────────────
@@ -76,7 +102,7 @@ internal object SafeMode {
    * @param patchText 装配清单全文。
    * @returns 过滤后全文；无改动时与输入**逐字节相同**（调用方据此跳过写盘）。
    */
-  internal fun filterThirdPartyInserts(patchText: String): String {
+  internal fun filterThirdPartyInserts(patchText: String, hardNames: Set<String> = emptySet()): String {
     val lines = patchText.split("\n").toMutableList()
     val out = ArrayList<String>(lines.size)
     var i = 0
@@ -94,7 +120,7 @@ internal object SafeMode {
       val kept = ArrayList<String>()
       for (item in insertChildChunks(body, itemIndent)) {
         val name = itemName(item.lines)
-        if (name != null && !isShippedPackage(name)) continue // 第三方条目：整条摘掉
+        if (name != null && !isProductOwned(name, hardNames)) continue // 第三方条目：整条摘掉
         kept.addAll(item.lines)
       }
       if (kept.none { ITEM.containsMatchIn(it) }) {
@@ -169,6 +195,8 @@ internal object SafeMode {
     autoDir: File,
     id: String,
     atomicWrite: (File, ByteArray) -> Unit = ::replaceAtomically,
+    // 权威装配清单（[PluginMounts.hardNames]）。默认空集 = 不可用，回退静态名单（见 [isProductOwned]）。
+    hardNames: Set<String> = emptySet(),
   ): Result {
     val stateFile = File(autoDir, STATE_FILE)
     if (stateFile.isFile) {
@@ -214,11 +242,11 @@ internal object SafeMode {
           .toString(2)
       ).toByteArray(Charsets.UTF_8))
       // ⑤ 最后改 patch。
-      val filtered = filterThirdPartyInserts(String(original, Charsets.UTF_8))
+      val filtered = filterThirdPartyInserts(String(original, Charsets.UTF_8), hardNames)
       patch.parentFile?.mkdirs()
       atomicWrite(patch, filtered.toByteArray(Charsets.UTF_8))
       if (homeExisted) atomicWrite(homePatch, "# dsh safe mode (home level)\n[]\n".toByteArray(Charsets.UTF_8))
-      val removed = removedPluginNames(String(original, Charsets.UTF_8))
+      val removed = removedPluginNames(String(original, Charsets.UTF_8), hardNames)
       Result(
         true,
         if (removed.isEmpty())
@@ -335,9 +363,9 @@ internal object SafeMode {
   }.getOrDefault(false)
 
   /** 被摘掉的第三方插件名（供回执如实报数；纯函数）。 */
-  internal fun removedPluginNames(patchText: String): List<String> {
+  internal fun removedPluginNames(patchText: String, hardNames: Set<String> = emptySet()): List<String> {
     val kept = entryNamesOfInsertChildren(patchText)
-    return kept.filter { !isShippedPackage(it) }.distinct()
+    return kept.filter { !isProductOwned(it, hardNames) }.distinct()
   }
 
   /** insert 组内的一个子条目（原始行片段）。 */

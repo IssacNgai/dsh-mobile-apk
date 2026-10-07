@@ -154,6 +154,8 @@ class ConsoleActivity : ComponentActivity() {
           homePatch = SafeMode.homePatchFile(engine),
           autoDir = SafeMode.autoDir(engine),
           id = SafeMode.newId(),
+          // 与引导页按钮同一权威来源（[SafeMode.isProductOwned]）：离线 CLI 与 UI 必须同口径。
+          hardNames = PluginMounts.hardNames(this@ConsoleActivity),
         )
         SafeAction.OFF -> SafeMode.exit(
           patch = SafeMode.patchFile(engine),

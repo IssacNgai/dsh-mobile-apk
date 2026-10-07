@@ -303,20 +303,87 @@ class SafeModeTest {
       .find(text)?.groupValues?.get(1)
       ?.split(",")?.map { it.trim().trim('\'', '"') }?.filter { it.isNotEmpty() }
       ?: throw AssertionError("真源里找不到 DSH_MOBILE_SHIPPED_PLUGIN_NAMES")
-    assertEquals("前缀白名单必须与真源一致", prefixes, SafeMode.SHIPPED_PREFIXES)
+    // 0.14.5（D-1(c)）起，两侧都**不得**再含上游命名空间 @deepseek-ai/：
+    // 前缀只说明谁发布的、不说明谁装配的，用它判归属会把用户自挂的官方包误当产品自有条目。
+    // 断言改成「必须等于真源**去掉上游命名空间后**的集合」——真源里那一项现在是 G3 的
+    // 「装配清单不完整时的保守回退」，与 Safe Mode 的判据不同源，故不能照搬。
+    val upstreamNamespaces = setOf("@deepseek-ai/")
+    assertEquals(
+      "前缀白名单必须与真源（去掉上游命名空间）一致",
+      prefixes.filterNot { it in upstreamNamespaces }, SafeMode.SHIPPED_PREFIXES,
+    )
     assertEquals("具名白名单必须与真源一致", names, SafeMode.SHIPPED_NAMES)
+    assertFalse(
+      "Safe Mode 白名单不得再拿上游命名空间判归属（D-1(c)）",
+      SafeMode.SHIPPED_PREFIXES.any { it in upstreamNamespaces },
+    )
   }
 
   @Test
   fun `白名单判据的正反例`() {
     assertTrue(SafeMode.isShippedPackage("@dsh-android/dsh-shell-termux"))
-    assertTrue(SafeMode.isShippedPackage("@deepseek-ai/dsh-llm-pi-ai"))
+    // 0.14.5（D-1(c)）：上游命名空间**不再**被静态判为自有（见 [SafeMode.isProductOwned] 的注释）。
+    // 我们真正自带的那 3 个 @deepseek-ai/* 条目由权威装配清单证明，不由前缀证明。
+    assertFalse("上游命名空间前缀不再判为自有", SafeMode.isShippedPackage("@deepseek-ai/dsh-llm-pi-ai"))
+    assertTrue(
+      "但其在权威装配清单里时仍算自有",
+      SafeMode.isProductOwned("@deepseek-ai/dsh-llm-pi-ai", setOf("@deepseek-ai/dsh-llm-pi-ai")),
+    )
     assertTrue(SafeMode.isShippedPackage("'dsh-undo-savepoint'"))
     assertTrue(SafeMode.isShippedPackage("dshmarketplace-plugin"))
     assertFalse("第三方不得被当自有", SafeMode.isShippedPackage("dsh-code-diff-viewer"))
     assertFalse(SafeMode.isShippedPackage("dsh-find-plugin"))
     assertFalse("空串", SafeMode.isShippedPackage(""))
     assertFalse("前缀相似但不同域", SafeMode.isShippedPackage("@dsh-android-not/foo"))
+  }
+  /**
+   * D-1(c) 的行为回归：**用户自装的官方包必须被 Safe Mode 摘掉**。
+   *
+   * 这是本轮修的真实缺陷：旧实现按 `@deepseek-ai/` 前缀判归属，会把用户自挂的官方包
+   * （实测 `@deepseek-ai/dsh-mcp-client`）当成产品自有条目**保留**，于是 Safe Mode 的
+   * 「不加载 Soft」对它失效——而 Safe Mode 存在的全部意义就是让坏插件不参与启动。
+   *
+   * 判据可证伪：把 [SafeMode.isProductOwned] 的 `hardNames` 分支去掉、退回纯前缀判，本条判红。
+   */
+  @Test
+  fun `用户自装的官方包必须被安全模式摘掉`() {
+    val patch = listOf(
+      "- insert:",
+      "    - id: llm-pi-ai",
+      "      name: '@deepseek-ai/dsh-llm-pi-ai'",
+      "    - id: mcp-lark",
+      "      name: '@deepseek-ai/dsh-mcp-client'",
+      "",
+    ).joinToString("\n")
+    // 权威装配清单只含我们自带的那一个；用户自挂的 mcp-client 不在其中。
+    val hardNames = setOf("@deepseek-ai/dsh-llm-pi-ai")
+    val after = SafeMode.filterThirdPartyInserts(patch, hardNames)
+    assertTrue("自带的必须保留", after.contains("@deepseek-ai/dsh-llm-pi-ai"))
+    assertFalse(
+      "用户自装的官方包必须被摘掉（旧实现在此恒保留，本条即其反证）",
+      after.contains("@deepseek-ai/dsh-mcp-client"),
+    )
+    val removed = SafeMode.removedPluginNames(patch, hardNames)
+    assertEquals("回执必须如实点名被摘的那个", listOf("@deepseek-ai/dsh-mcp-client"), removed)
+  }
+
+  /** 权威清单缺席（首次启动 / ensureHard 之前）时，静态名单仍须保住我们自己的命名空间。 */
+  @Test
+  fun `权威清单缺席时静态名单兜底且不误摘自有`() {
+    val patch = listOf(
+      "- insert:",
+      "    - id: shell-termux",
+      "      name: '@dsh-android/dsh-shell-termux'",
+      "    - id: marketplace",
+      "      name: 'dshmarketplace-plugin'",
+      "    - id: evil",
+      "      name: 'dsh-code-diff-viewer'",
+      "",
+    ).joinToString("\n")
+    val after = SafeMode.filterThirdPartyInserts(patch, emptySet())
+    assertTrue("自有命名空间必须保留", after.contains("@dsh-android/dsh-shell-termux"))
+    assertTrue("具名自有插件必须保留", after.contains("dshmarketplace-plugin"))
+    assertFalse("第三方必须摘掉", after.contains("dsh-code-diff-viewer"))
   }
 
   /** status 三态回执：未开启 / 开启中 / 状态文件损坏——三者必须可区分。 */
