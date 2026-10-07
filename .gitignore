@@ -29,3 +29,6 @@ __pycache__/
 # 两条打包链与来源审计的 APK 产物目录（云端与本地共用，不入库）
 out/
 
+# Windows 环境变量展开失败产生的幻影目录（字面量 %SystemDrive% 被当成目录名，
+# 内含 ProgramData\Microsoft\Windows\Caches\*.db）。它不是仓库内容，任何提交都不该带上。
+%SystemDrive%/

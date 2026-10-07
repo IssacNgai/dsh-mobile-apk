@@ -35,6 +35,66 @@ const TIMEOUT_S = Number(argOf('timeout') ?? 180)
 const KEEP = has('keep')
 const STAMP = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
 const EVID = join(ROOT, '.deploy-tmp', 'scope-matrix', STAMP)
+const ownedForwards = new Set()
+const VALID_SCOPES = new Set(['virtual-only', 'real-only', 'all'])
+
+/** Allocate an adb forward on an OS-selected host port and remember only our own mapping. */
+function adbForward(remote) {
+  const r = spawnSync('adb', ['-s', SERIAL, 'forward', 'tcp:0', remote], { encoding: 'utf8' })
+  if (r.status !== 0) throw new Error(`adb forward tcp:0 ${remote} failed: ${(r.stderr || '').trim()}`)
+  const port = Number((r.stdout || '').trim().match(/\d+/)?.[0])
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`adb forward did not return an allocated port: ${(r.stdout || '').trim()}`)
+  ownedForwards.add(port)
+  return port
+}
+
+function removeOwnedForwards() {
+  const errors = []
+  for (const port of ownedForwards) {
+    const r = spawnSync('adb', ['-s', SERIAL, 'forward', '--remove', `tcp:${port}`], { encoding: 'utf8' })
+    if (r.status !== 0) errors.push(`tcp:${port}: ${(r.stderr || '').trim()}`)
+    else ownedForwards.delete(port)
+  }
+  return errors
+}
+
+export function shouldDestroyVdisplay({ createdByRun, keep }) {
+  return createdByRun === true && keep !== true
+}
+
+export function reconcileCreatedVdisplay({ hadVirtualBefore, createReceipt, observedVirtual }) {
+  const accepted = createReceipt?.ok === true && createReceipt?.state === 'active'
+  if (hadVirtualBefore || !accepted || !observedVirtual) {
+    return { owned: false, receiptMatches: false }
+  }
+  const id = Number(createReceipt.displayId)
+  const alias = createReceipt.selected ?? createReceipt.aliases?.[0]
+  const receiptMatches = Number.isInteger(id) && id > 0 && id === observedVirtual.displayId
+    && (alias === undefined || alias === observedVirtual.alias)
+  // The initial registry was empty and the create call was accepted; own the one subsequent
+  // singleton for cleanup even if the receipt omitted its ID, while reporting weak evidence.
+  return { owned: true, receiptMatches }
+}
+
+export function isKnownScreenScope(scope) {
+  return VALID_SCOPES.has(scope)
+}
+
+/** Restore scope and require an independent readback; exceptions are surfaced as evidence failure. */
+export async function restoreScopeVerified(originalScope, setScope, getScope) {
+  try {
+    const setResult = await setScope(originalScope)
+    const setValue = typeof setResult === 'string' ? parseJson(setResult) ?? setResult : setResult
+    if (setValue === false || setValue?.ok === false) return { ok: false, actual: undefined, reason: 'scope restore rejected' }
+    const actualRaw = await getScope()
+    const actual = typeof actualRaw === 'string' ? parseJson(actualRaw) ?? actualRaw : actualRaw
+    return actual === originalScope
+      ? { ok: true, actual }
+      : { ok: false, actual, reason: `scope readback mismatch: expected ${originalScope}, got ${String(actual)}` }
+  } catch (error) {
+    return { ok: false, reason: `scope restore/readback failed: ${String(error?.message ?? error)}` }
+  }
+}
 
 /**
  * **不写进提示词的东西（用户口径，2026-09-19）**：不告诉模型用哪个工具、也不告诉它先解锁能力组。
@@ -83,47 +143,85 @@ async function bridge(exprs) {
   const sockets = sh('cat /proc/net/unix').split('\n').filter((l) => l.includes('webview_devtools_remote'))
     .map((l) => l.split('@').pop().trim())
   if (sockets.length === 0) throw new Error('找不到 webview_devtools_remote（应用未运行？）')
-  const PORT = 29225
-  adb(['forward', `tcp:${PORT}`, `localabstract:${sockets[sockets.length - 1]}`])
-  const targets = await (await fetch(`http://127.0.0.1:${PORT}/json`)).json()
-  const page = targets.find((t) => t.type === 'page') ?? targets[0]
-  const ws = new WebSocket(page.webSocketDebuggerUrl)
-  let seq = 0
+  const PORT = adbForward(`localabstract:${sockets[sockets.length - 1]}`)
+  let ws
   const pending = new Map()
-  ws.addEventListener('message', (ev) => {
-    const m = JSON.parse(ev.data)
-    const p = pending.get(m.id)
-    if (p === undefined) return
-    pending.delete(m.id)
-    m.error ? p.reject(new Error(JSON.stringify(m.error))) : p.resolve(m.result)
-  })
-  await new Promise((res, rej) => {
-    ws.addEventListener('open', res, { once: true })
-    ws.addEventListener('error', () => rej(new Error('CDP ws error')), { once: true })
-  })
-  const send = (method, params) => new Promise((resolve2, reject2) => {
-    const id = ++seq
-    pending.set(id, { resolve: resolve2, reject: reject2 })
-    ws.send(JSON.stringify({ id, method, params }))
-  })
-  const out = []
-  for (const expr of exprs) {
-    const r = await send('Runtime.evaluate', { expression: expr, awaitPromise: true, returnByValue: true })
-    out.push(r.exceptionDetails ? { __error: r.exceptionDetails.exception?.description } : r.result.value)
+  try {
+    const targets = await (await fetch(`http://127.0.0.1:${PORT}/json`, { signal: AbortSignal.timeout(10_000) })).json()
+    const page = targets.find((t) => t.type === 'page' && URL.canParse(t.url) && new URL(t.url).port === String(API_PORT))
+    if (!page?.webSocketDebuggerUrl) throw new Error('CDP 页面 target 缺少 websocket URL')
+    ws = new WebSocket(page.webSocketDebuggerUrl)
+    let seq = 0
+    ws.addEventListener('message', (ev) => {
+      const m = JSON.parse(ev.data)
+      const p = pending.get(m.id)
+      if (p === undefined) return
+      pending.delete(m.id)
+      clearTimeout(p.timer)
+      m.error ? p.reject(new Error(JSON.stringify(m.error))) : p.resolve(m.result)
+    })
+    ws.addEventListener('close', () => {
+      for (const [id, p] of pending) {
+        clearTimeout(p.timer)
+        p.reject(new Error(`CDP connection closed with request ${id} pending`))
+      }
+      pending.clear()
+    })
+    await new Promise((res, rej) => {
+      const timer = setTimeout(() => rej(new Error('CDP ws open timeout (10s)')), 10_000)
+      ws.addEventListener('open', () => { clearTimeout(timer); res() }, { once: true })
+      ws.addEventListener('error', () => { clearTimeout(timer); rej(new Error('CDP ws error')) }, { once: true })
+    })
+    const send = (method, params) => new Promise((resolve2, reject2) => {
+      const id = ++seq
+      const timer = setTimeout(() => {
+        pending.delete(id)
+        reject2(new Error(`CDP ${method} timeout (10s)`))
+      }, 10_000)
+      pending.set(id, { resolve: resolve2, reject: reject2, timer })
+      try { ws.send(JSON.stringify({ id, method, params })) } catch (error) {
+        clearTimeout(timer)
+        pending.delete(id)
+        reject2(error)
+      }
+    })
+    const out = []
+    for (const expr of exprs) {
+      const r = await send('Runtime.evaluate', { expression: expr, awaitPromise: true, returnByValue: true })
+      out.push(r.exceptionDetails ? { __error: r.exceptionDetails.exception?.description } : r.result.value)
+    }
+    return out
+  } finally {
+    for (const [id, p] of pending) {
+      clearTimeout(p.timer)
+      p.reject(new Error(`CDP bridge closing with request ${id} pending`))
+    }
+    pending.clear()
+    try { ws?.close() } catch { /* target may already be gone */ }
+    const r = spawnSync('adb', ['-s', SERIAL, 'forward', '--remove', `tcp:${PORT}`], { encoding: 'utf8' })
+    if (r.status !== 0) throw new Error(`无法移除本套件创建的 CDP forward tcp:${PORT}: ${(r.stderr || '').trim()}`)
+    ownedForwards.delete(PORT)
   }
-  ws.close()
-  return out
 }
 
 const parseJson = (v) => { try { return typeof v === 'string' ? JSON.parse(v) : v } catch { return undefined } }
 
 // ── 引擎面（HTTP，经 adb forward 到设备内引擎） ─────────────────────────────
 
+export const PRIVILEGE_STATUS_PROBE = `(async () => {
+  const response = await fetch('/api/android/privilege/status', { credentials: 'same-origin' });
+  return { status: response.status, ok: response.ok, body: response.ok ? await response.json() : null };
+})()`
+
+export async function readPrivilegeStatusFromPage(evaluate) {
+  const [response] = await evaluate([PRIVILEGE_STATUS_PROBE])
+  if (!response?.ok || response?.__error) throw new Error('privilege/status HTTP ' + String(response?.status ?? 'unavailable'))
+  return response.body
+}
+
 async function engineStatus() {
-  adb(['forward', `tcp:${API_PORT}`, `tcp:${API_PORT}`])
-  const r = await fetch(`http://127.0.0.1:${API_PORT}/api/android/privilege/status`)
-  if (!r.ok) throw new Error('privilege/status HTTP ' + r.status)
-  return await r.json()
+  // The page already holds the engine auth cookie; never copy it into a host request or evidence.
+  return readPrivilegeStatusFromPage(bridge)
 }
 
 /**
@@ -136,11 +234,18 @@ async function engineStatus() {
  * 输入框（`contenteditable`）与发送，等价于「真人在这里打字」——正好符合 AGENTS.md §2.1 第 3 条
  * （真实任务 + 由模型自己编排）。失败一律返回 `undefined`，由调用方判 INCONCLUSIVE（不得当通过）。
  */
+export function isTaskSubmitted(receipt) {
+  return receipt === 'clicked' || receipt === 'enter'
+}
+
 async function runModelTask(promptText) {
   const script = `(async () => {
     const box = document.querySelector('[contenteditable="true"][role="textbox"]')
       || document.querySelector('[contenteditable="true"]')
     if (!box) return 'no-composer'
+    if (document.querySelector('[role=dialog]')) return 'dialog-open'
+    if (document.querySelector('[data-composer-card] button[aria-label="停止生成"]')) return 'generation-active'
+    if ((box.textContent || '').trim() !== '') return 'composer-not-empty'
     box.focus()
     const sel = window.getSelection()
     sel.removeAllRanges()
@@ -152,15 +257,14 @@ async function runModelTask(promptText) {
     await new Promise((r) => setTimeout(r, 400))
     const btns = Array.from(document.querySelectorAll('button'))
     const send = btns.reverse().find((b) => /send|发送/i.test(String(b.getAttribute('aria-label') || '') + String(b.title || '')))
-      || btns.find((b) => b.querySelector('svg') && b.offsetParent !== null)
-    if (send) { send.click(); return 'clicked' }
+    if (send && !send.disabled) { send.click(); return 'clicked' }
     box.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }))
     return 'enter'
   })()`
   let sent
   try { sent = (await bridge([script]))[0] } catch (e) { return { sent: undefined, reason: String(e.message) } }
-  if (sent === 'no-composer' || sent?.__error !== undefined) {
-    return { sent: undefined, reason: '页面里找不到输入框（应用不在前台？）：' + JSON.stringify(sent).slice(0, 120) }
+  if (!isTaskSubmitted(sent)) {
+    return { sent: undefined, blocker: '', reason: '任务未提交：' + JSON.stringify(sent).slice(0, 120) }
   }
   // 等模型编排完成：断言在设备侧，这里只等一个宽松窗口（页面上出现「已完成/停止」类状态或超时）。
   // 完成判据（2026-09-19 设备实测修正）：**不能**去匹配「停止/Stop」——本界面在跑的时候显示
@@ -170,14 +274,17 @@ async function runModelTask(promptText) {
   const deadline = Date.now() + TIMEOUT_S * 1000
   const minWaitUntil = Date.now() + 60_000
   let prev = ''
+  let active = true
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 6000))
     const now = await pageConversationText()
+    const [generating] = await bridge([`!!document.querySelector('[data-composer-card] button[aria-label="停止生成"]')`])
+    active = generating === true
     if (/MISSING_CREDENTIAL|no API key for provider/i.test(now)) break
-    if (Date.now() > minWaitUntil && now !== '' && now === prev) break
+    if (!active && Date.now() > minWaitUntil && now !== '' && now === prev) break
     prev = now
   }
-  return { sent, blocker: detectBlocker(await pageConversationText()) }
+  return { sent, blocker: active ? '任务仍在生成，目标尚未完成；不得开始下一任务' : detectBlocker(await pageConversationText()) }
 }
 
 /**
@@ -281,19 +388,37 @@ async function main() {
   run('am start -n com.dsharnessmobile.shell/.MainActivity')
   await new Promise((r) => setTimeout(r, 2500))
 
-  const [scope, statusRaw] = await bridge(['androidBridge.getScreenScope()', 'androidBridge.vdisplayStatus()'])
+  let scope
+  let scopeMayHaveChanged = false
+  let vd
+  let createdVdisplay = false
+  try {
+  const [scopeRaw, statusRaw] = await bridge(['androidBridge.getScreenScope()', 'androidBridge.vdisplayStatus()'])
+  scope = typeof scopeRaw === 'string' ? parseJson(scopeRaw) ?? scopeRaw : scopeRaw
+  if (!isKnownScreenScope(scope)) throw new Error(`原 screen scope 不是已知枚举，拒绝猜测或写回：${JSON.stringify(scopeRaw)}`)
   const shell = parseJson(statusRaw)
   record('P0', '范围与虚拟屏', 'PASS', `scope=${scope} · 屏=${(shell?.screens ?? []).map((s) => s.alias + '#' + s.displayId).join(', ')}`)
-  let vd = (shell?.screens ?? []).find((s) => s.kind === 'virtual')
+  vd = (shell?.screens ?? []).find((s) => s.kind === 'virtual')
   if (vd === undefined) {
-    await bridge(['androidBridge.vdisplayCreate()'])
+    const [createdRaw] = await bridge(['androidBridge.vdisplayCreate()'])
+    const createResult = parseJson(createdRaw)
+    if (createResult?.ok === false || createResult?.success === false) throw new Error(`vdisplayCreate 拒绝：${JSON.stringify(createResult)}`)
     await new Promise((r) => setTimeout(r, 3000))
     const again = parseJson((await bridge(['androidBridge.vdisplayStatus()']))[0])
     vd = (again?.screens ?? []).find((s) => s.kind === 'virtual')
+    const ownership = reconcileCreatedVdisplay({ hadVirtualBefore: false, createReceipt: createResult, observedVirtual: vd })
+    createdVdisplay = ownership.owned
+    if (vd !== undefined && ownership.owned && !ownership.receiptMatches) {
+      record('P0', '虚拟屏创建回执绑定设备事实', 'INCONCLUSIVE',
+        `create 已受理且设备有新虚拟屏，但回执缺少/不匹配 displayId；该屏仍归本轮并将在收尾释放：回执=${JSON.stringify(createResult)}，设备=${vd.alias}#${vd.displayId}`)
+    } else if (vd !== undefined && !ownership.owned) {
+      record('P0', '虚拟屏创建回执绑定设备事实', 'INCONCLUSIVE',
+        `设备出现虚拟屏，但 create 未给出明确成功回执；为避免删除外部资源不认领该屏：${JSON.stringify(createResult)}`)
+    }
   }
   if (vd === undefined) {
     record('P0', '虚拟屏存在', 'INCONCLUSIVE', '建屏未成功（Shizuku 未就绪/未授权），本套件无法继续')
-    process.exit(2)
+    throw new Error('虚拟屏前置不满足')
   }
 
   // ── P1 跨面一致性（A1/A2）：引擎面 vs 壳侧面 vs 设备事实 ──
@@ -395,32 +520,65 @@ async function main() {
 
   // ── P4 real-only 反证：同一动作必须整体翻转 ──
   try {
-    await bridge([`androidBridge.setScreenScope('real-only')`])
-    await new Promise((r) => setTimeout(r, 1200))
-    const denyTask = await runModelTask(
-      `请在虚拟屏 ${vd.alias} 上点一下坐标 (10,10)。完成后只回复一行 DONE。`,
-    )
-    writeFileSync(join(EVID, 'p4-conversation.txt'), await pageConversationText())
-    const convo = (denyTask.sent === undefined ? '' : await pageConversationText())
-    const denied = /screen-out-of-scope|不允许访问|real-only|不在开放范围/i.test(convo)
-    record('P4', 'real-only 下虚拟屏操作被拒（反证）', denied ? 'PASS' : 'INCONCLUSIVE',
-      denyTask.sent === undefined || denyTask.blocker !== ''
-        ? (denyTask.blocker !== '' ? denyTask.blocker : '未能发起任务：' + String(denyTask.reason))
-        : (denied ? '拒绝文案在场（页面会话区）' : '未观察到拒绝文案——反证未成立，**不得视为通过**'))
-  } finally {
-    await bridge([`androidBridge.setScreenScope(${JSON.stringify(scope)})`]).catch(() => {})
+    scopeMayHaveChanged = true
+    const [setRaw] = await bridge([`androidBridge.setScreenScope('real-only')`])
+    const setResult = parseJson(setRaw)
+    if (setRaw === false || setResult?.ok === false || setResult?.success === false) {
+      record('P4', 'real-only 下虚拟屏操作被拒（反证）', 'INCONCLUSIVE', `setScreenScope 被拒：${JSON.stringify(setRaw)}`)
+    } else {
+      const [scopeAfterSetRaw] = await bridge(['androidBridge.getScreenScope()'])
+      const scopeAfterSet = typeof scopeAfterSetRaw === 'string' ? parseJson(scopeAfterSetRaw) ?? scopeAfterSetRaw : scopeAfterSetRaw
+      if (scopeAfterSet !== 'real-only') {
+        record('P4', 'real-only 下虚拟屏操作被拒（反证）', 'INCONCLUSIVE', `scope 写入未收敛：${String(scopeAfterSet)}`)
+      } else {
+        await new Promise((r) => setTimeout(r, 1200))
+        const denyTask = await runModelTask(
+          `请在虚拟屏 ${vd.alias} 上点一下坐标 (10,10)。完成后只回复一行 DONE。`,
+        )
+        writeFileSync(join(EVID, 'p4-conversation.txt'), await pageConversationText())
+        const convo = (denyTask.sent === undefined ? '' : await pageConversationText())
+        const denied = /screen-out-of-scope|不允许访问|real-only|不在开放范围/i.test(convo)
+        record('P4', 'real-only 下虚拟屏操作被拒（反证）', denied ? 'PASS' : 'INCONCLUSIVE',
+          denyTask.sent === undefined || denyTask.blocker !== ''
+            ? (denyTask.blocker !== '' ? denyTask.blocker : '未能发起任务：' + String(denyTask.reason))
+            : (denied ? '拒绝文案在场（页面会话区）' : '未观察到拒绝文案——反证未成立，**不得视为通过**'))
+      }
+    }
+  } catch (error) {
+    record('P4', 'real-only 下虚拟屏操作被拒（反证）', 'INCONCLUSIVE', `反证未能完成：${String(error?.message ?? error)}`)
   }
 
-  // ── 证据落盘 + 汇总 ──
+  } catch (error) {
+    record('DRIVER', '验收驱动收敛', 'INCONCLUSIVE', String(error?.message ?? error))
+  } finally {
+    if (scopeMayHaveChanged && scope !== undefined) {
+      const restored = await restoreScopeVerified(scope,
+        async (value) => (await bridge([`androidBridge.setScreenScope(${JSON.stringify(value)})`]))[0],
+        async () => (await bridge(['androidBridge.getScreenScope()']))[0])
+      record('CLEANUP', 'screen scope 还原并回读', restored.ok ? 'PASS' : 'INCONCLUSIVE', restored.ok ? String(restored.actual) : restored.reason)
+    }
+    if (shouldDestroyVdisplay({ createdByRun: createdVdisplay, keep: KEEP })) {
+      try {
+        await bridge(['androidBridge.vdisplayDestroy()'])
+        const afterDestroy = parseJson((await bridge(['androidBridge.vdisplayStatus()']))[0])
+        const remains = (afterDestroy?.screens ?? []).some((s) => s.kind === 'virtual')
+        record('CLEANUP', '仅销毁本轮创建的虚拟屏', remains ? 'INCONCLUSIVE' : 'PASS', remains ? '销毁后仍有 virtual screen' : '已销毁并回读确认')
+      } catch (error) {
+        record('CLEANUP', '仅销毁本轮创建的虚拟屏', 'INCONCLUSIVE', String(error?.message ?? error))
+      }
+    }
+    for (const error of removeOwnedForwards()) record('CLEANUP', '移除本轮 adb forward', 'INCONCLUSIVE', error)
+  }
+  // ── 证据落盘 + 汇总（必须在状态还原与资源清理之后） ──
   writeFileSync(join(EVID, 'commands.md'), cmds.map((c) => 'adb -s ' + SERIAL + ' shell ' + c).join('\n') + '\n')
   writeFileSync(join(EVID, 'results.json'), JSON.stringify({ serial: SERIAL, pkg: PKG, scope, vd, results }, null, 2))
   const failed = results.filter((r) => r.verdict === 'FAIL').length
   const inconclusive = results.filter((r) => r.verdict === 'INCONCLUSIVE').length
   console.log(`\n证据目录：${EVID}`)
   console.log(`结论：PASS ${results.length - failed - inconclusive} · FAIL ${failed} · INCONCLUSIVE ${inconclusive}`)
-  if (failed > 0) { console.error('VERIFY-SCREEN-SCOPE-MATRIX FAILED'); process.exit(1) }
-  if (inconclusive > 0) { console.error('VERIFY-SCREEN-SCOPE-MATRIX INCONCLUSIVE（证据不足 ≠ 通过）'); process.exit(2) }
-  console.log('VERIFY-SCREEN-SCOPE-MATRIX PASSED')
+  if (failed > 0) process.exitCode = 1
+  else if (inconclusive > 0) process.exitCode = 2
+  else console.log('VERIFY-SCREEN-SCOPE-MATRIX PASSED')
 }
 
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {

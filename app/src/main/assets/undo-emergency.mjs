@@ -16,7 +16,7 @@
 // 安全边界：本工具只写配置文件与插件代码树（同快照范围），不触碰用户数据目录
 // （sessions/storages/凭据真实值）；敏感文件快照为脱敏副本，真实值在本机 vault 中，
 // 恢复时优先从 vault 取真实值（与插件 applySnapshot 语义一致），vault 缺失才写占位。
-import { readdirSync, readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, rmSync, cpSync, renameSync, realpathSync } from 'node:fs'
+import { readdirSync, readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, rmSync, cpSync, renameSync, realpathSync, lstatSync } from 'node:fs'
 import { join, basename, dirname, sep, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { createHash, randomBytes } from 'node:crypto'
@@ -199,9 +199,14 @@ function safeModeBackup(autoDir, value, id, prefix) {
   try {
     const root = realpathSync(autoDir)
     const candidate = resolve(value)
-    if (dirname(candidate) !== root || basename(candidate) !== `${prefix}${id}.yml`) return null
-    if (realpathSync(candidate) !== candidate) return null
-    return candidate
+    const expectedName = `${prefix}${id}.yml`
+    if (basename(candidate) !== expectedName || realpathSync(dirname(candidate)) !== root) return null
+    // Permit a symlink alias for autoDir's parent; never follow a symlink backup.
+    const info = lstatSync(candidate)
+    if (!info.isFile() || info.isSymbolicLink()) return null
+    const canonical = join(root, expectedName)
+    if (realpathSync(candidate) !== canonical) return null
+    return canonical
   } catch { return null }
 }
 
@@ -238,6 +243,19 @@ export function safeMode(action, { atomicWrite = safeModeAtomicWrite } = {}) {
         return false
       }
     }
+    let hardEntries
+    try {
+      const filesRoot = dirname(dirname(DSH_HOME))
+      const manifest = JSON.parse(readFileSync(join(filesRoot, '.plugin-hard-manifest.json'), 'utf8'))
+      const installedFingerprint = readFileSync(join(filesRoot, '.snapshot-fingerprint'), 'utf8').trim()
+      if (manifest.schema !== 1 || manifest.complete !== true || manifest.fingerprint !== installedFingerprint ||
+        !Array.isArray(manifest.entries) || manifest.entries.length === 0 || manifest.entries.some((entry) =>
+          !entry || typeof entry.id !== 'string' || entry.id.length === 0 || typeof entry.name !== 'string' || entry.name.length === 0)) throw new Error('invalid identities')
+      hardEntries = manifest.entries
+    } catch {
+      console.error('安全模式未生效：本版本插件归属清单缺失或损坏，无法安全区分产品插件与用户插件；原配置未改动。')
+      return false
+    }
     const backup = join(autoDir, `safe-mode-backup-${id}.yml`)
     const homeBackup = join(autoDir, `safe-mode-home-backup-${id}.yml`)
     // 先做变更前建档（等价 Windows 版 pre-snapshot）。快照失败时原配置仍未动。
@@ -255,15 +273,8 @@ export function safeMode(action, { atomicWrite = safeModeAtomicWrite } = {}) {
     // 与插件核心（core.mjs 的 undo-safe-align-S1）同口径：只摘第三方 insert 子条目，
     // 保留我方装配的插件与全部顶层 disable 行。原实现整份覆写成最小文件，
     // 会摘掉 12 个 @dsh-android/* 引用与 7 条 disabled（含安全关键的 client-hmr）。
-    const SHIPPED_PREFIXES = ['@deepseek-ai/', '@dsh-android/']
-    const SHIPPED_NAMES = ['dsh-undo-savepoint', 'dshmarketplace-plugin']
-    const isShipped = (name) => {
-      const v = String(name ?? '').trim().replace(/^['"]+|['"]+$/g, '')
-      if (v === '') return false
-      if (SHIPPED_NAMES.includes(v)) return true
-      return SHIPPED_PREFIXES.some((p) => v.startsWith(p))
-    }
-    const filterThirdPartyInserts = (text) => {
+    // Publisher namespace is not product ownership: user-mounted official DSH packages are Soft.
+    const filterThirdPartyInserts = (text, ownershipEntries) => {
       const lines = String(text).split('\n')
       const out = []
       let i = 0
@@ -286,7 +297,8 @@ export function safeMode(action, { atomicWrite = safeModeAtomicWrite } = {}) {
         const kept = []
         for (const chunk of chunks) {
           const nm = /^\s*-?\s*name:\s*['"]?([^'"\s]+)/m.exec(chunk.join('\n'))
-          if (nm && !isShipped(nm[1])) continue
+          const id = /^\s*-\s+id:\s*['"]?([^'"\s]+)/m.exec(chunk[0])?.[1] ?? null
+          if (nm && !ownershipEntries.some((entry) => entry.id === id && entry.name === nm[1])) continue
           kept.push(...chunk)
         }
         if (kept.length === 0) { i = end; continue }
@@ -294,7 +306,7 @@ export function safeMode(action, { atomicWrite = safeModeAtomicWrite } = {}) {
       }
       return out.join('\n')
     }
-    const minimal = filterThirdPartyInserts(patchBytes.toString('utf8'))
+    const minimal = filterThirdPartyInserts(patchBytes.toString('utf8'), hardEntries)
     // Marker is the recovery authority. Persist it atomically before touching any live config.
     const state = {
       active: true, enteredAt: new Date().toISOString(), backup, homeBackup,

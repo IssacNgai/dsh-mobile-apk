@@ -8,17 +8,18 @@
 // 退出 0=通过；非 0=拒绝打包（build-apk-013.ps1 门禁接入）。
 //
 // 用法：node scripts/check-third-party.mjs <usrDir> [--write-notices <path>] [--licenses <dir>]
-import { readFileSync, existsSync, statSync, mkdirSync, writeFileSync } from 'node:fs'
+import { readFileSync, existsSync, statSync, readdirSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join, resolve, dirname } from 'node:path'
+import { createHash } from 'node:crypto'
 import { wslPath, sh } from './lib/shell.mjs'
 
-const usr = process.argv[2]
+const usr = process.argv[2]?.startsWith('--') ? null : process.argv[2]
 const licensesDir = process.argv.includes('--licenses') ? process.argv[process.argv.indexOf('--licenses') + 1] : 'LICENSES'
 const writeIdx = process.argv.indexOf('--write-notices')
 const noticesPath = writeIdx >= 0 ? process.argv[writeIdx + 1] : null
 const tarIdx = process.argv.indexOf('--tar')
 const tarPath = tarIdx >= 0 ? process.argv[tarIdx + 1] : null
-if ((!usr && !tarPath) || (!existsSync(join(usr, 'var/lib/dpkg/status')) && !tarPath)) {
+if ((!usr && !tarPath) || (!tarPath && !existsSync(join(usr, 'var/lib/dpkg/status')))) {
   console.error('用法: node scripts/check-third-party.mjs <usrDir|--tar <snapshot.tar.xz>> [--write-notices <path>]')
   process.exit(2)
 }
@@ -47,13 +48,19 @@ function availability() {
       }
     }
   } else {
+    const record = (rel) => {
+      try { map.set(rel, statSync(join(usr, rel.slice(4))).size) } catch { /* absent */ }
+    }
     for (const pkg of packagesAvailable()) {
-      const rel = `usr/share/doc/${pkg}/copyright`
       try {
-        const st = statSync(join(usr, rel))
-        map.set(rel, st.size)
+        for (const file of readdirSync(join(usr, 'share/doc', pkg))) {
+          if (file === 'copyright' || file.startsWith('COPYING')) record(`usr/share/doc/${pkg}/${file}`)
+        }
       } catch { /* absent */ }
     }
+    try {
+      for (const file of readdirSync(join(usr, 'share/LICENSES'))) record(`usr/share/LICENSES/${file}`)
+    } catch { /* absent */ }
   }
   return map
 }
@@ -156,13 +163,41 @@ for (const rel of neededTexts) {
   if (!existsSync(rel)) failures.push(`LICENSES 标准文本缺失: ${rel}`)
 }
 
+// Gradle SDKs are outside dpkg; validate the fixed metadata and packaged text too.
+const androidComponents = matrix.androidComponents
+if (!Array.isArray(androidComponents) || androidComponents.length === 0) {
+  failures.push('Android SDK 许可矩阵缺失')
+} else {
+  const gradlePath = existsSync('app/build.gradle.kts')
+    ? 'app/build.gradle.kts' : 'dsh-mobile-apk/app/build.gradle.kts'
+  const gradle = existsSync(gradlePath) ? readFileSync(gradlePath, 'utf8') : ''
+  const sdkDeps = [...gradle.matchAll(/implementation\("(dev\.rikka\.shizuku):([^:"]+):([^"\s]+)"\)/g)]
+  if (sdkDeps.length === 0) failures.push('Gradle Shizuku SDK 依赖不可核实')
+  for (const [, group, artifact, version] of sdkDeps) {
+    if (!androidComponents.some(c => c.group === group && c.artifacts?.includes(artifact) && c.version === version)) {
+      failures.push(`Android SDK 许可版本未登记: ${group}:${artifact}:${version}`)
+    }
+  }
+  for (const component of androidComponents) {
+    const text = join(licensesDir, component.licenseText ?? '')
+    if (!component.licenseText || !existsSync(text)) {
+      failures.push(`Android SDK 许可全文缺失: ${text}`)
+    } else if (createHash('sha256').update(readFileSync(text)).digest('hex') !== component.licenseSha256) {
+      failures.push(`Android SDK 许可全文 SHA256 不符: ${text}`)
+    }
+    if (!sdkDeps.some(([, group, artifact, version]) => group === component.group && component.artifacts?.includes(artifact) && version === component.version)) {
+      failures.push(`Android SDK 矩阵没有对应 Gradle 依赖: ${component.group}@${component.version}`)
+    }
+  }
+}
+
 if (noticesPath) {
   const lines = [
     '# THIRD_PARTY_NOTICES',
     '',
-    '> 本清单由 `scripts/check-third-party.mjs --write-notices` 从快照 dpkg 清单生成；',
+    '> 本清单由 `scripts/check-third-party.mjs --write-notices` 从快照 dpkg 清单与固定 Android SDK 许可矩阵生成；',
     '> 与快照一起分发（APK assets/）。每个组件的许可证全文随快照包分发于 `usr/share/doc/<pkg>/copyright`，',
-    '> 标准 GNU 文本副本另见仓库 `LICENSES/`。',
+    '> 标准 GNU 文本及 Android SDK 许可副本另见 APK `assets/licenses/` 与仓库 `LICENSES/`。',
     '',
     '| 组件 | 版本 | 许可证 | 上游源码 |',
     '|---|---|---|---|',
@@ -170,6 +205,14 @@ if (noticesPath) {
   const src = 'https://github.com/termux/termux-packages/tree/master/packages'
   for (const { pkg, version, license } of rows.sort((a, b) => a.pkg.localeCompare(b.pkg))) {
     lines.push(`| ${pkg} | ${version} | ${license} | [termux-packages/${pkg}](${src}/${pkg}) |`)
+  }
+  lines.push('')
+  lines.push('## Android SDK')
+  lines.push('')
+  lines.push('| 组件 | 版本 | 许可证 | 许可全文 | 上游源码 |')
+  lines.push('|---|---|---|---|---|')
+  for (const c of androidComponents ?? []) {
+    lines.push(`| ${c.group}:{${c.artifacts.join(', ')}} | ${c.version} | ${c.license} | ${c.licenseText}（assets/licenses/；仓库 LICENSES/） | [Shizuku-API](${c.source}) |`)
   }
   lines.push('')
   lines.push('## 源码要约（GPL §3）')

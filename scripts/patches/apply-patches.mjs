@@ -426,17 +426,30 @@ const IMPLS = {
   // 不变量：safe on -> off 后 patch 逐字节等于进入前（off 仍是整份 copyFile 还原，未改）。
   'undo-safe-align-S1': {
     file: 'dsh-undo-savepoint/lib/core.mjs',
-    check: (s) => s.includes('dsh-mobile safe keeps shipped plugins (S1)'),
+    check: (s) => s.includes('dsh-mobile safe ownership identity v2') &&
+      /entry\.id === id && entry\.name === name/.test(s) &&
+      !/entry\.id == null \|\| entry\.id === id/.test(s),
     apply: (s) => {
-      if (s.includes('dsh-mobile safe keeps shipped plugins (S1)')) return s
+      if (s.includes('dsh-mobile safe ownership identity v2') &&
+        /entry\.id === id && entry\.name === name/.test(s) &&
+        !/entry\.id == null \|\| entry\.id === id/.test(s)) return s
       // 上游文件是 CRLF：锚点用正则匹配（\r?\n），否则跨行锚点永远失配（实测踩到）。
       const MINIMAL_RE = /    const minimal = `# dsh-undo-savepoint SAFE MODE[\s\S]*?`;\r?\n    await fs\.writeFile\(patch, minimal, 'utf8'\);/;
-      if (!MINIMAL_RE.test(s)) throw new Error('undo-safe-align 锚点未命中：minimal 覆写段已变（上游改了 safe 生成逻辑，请人工核对）')
+      if (!MINIMAL_RE.test(s)) {
+        // Some vendor revisions already contain the S1 filter helper without its marker. Upgrade
+        // that exact helper region; do not bless it based on a name-only substring.
+        const helperStart = s.indexOf('/* dsh-mobile safe ownership identity v2:')
+        const helperEnd = helperStart >= 0 ? s.indexOf('function safeModeSha256(bytes) {', helperStart) : -1
+        if (helperStart < 0 || helperEnd < 0) throw new Error('undo-safe-align 锚点未命中：minimal 覆写段与既有 filter helper 均缺失')
+        const helper = readFileSync(join(HERE, 'data', 'undo-safe-filter-helper-snippet.mjs'), 'utf8')
+          .replace(/\n$/, '').replace(/\n/g, s.includes('\r\n') ? '\r\n' : '\n') + (s.includes('\r\n') ? '\r\n' : '\n')
+        return s.slice(0, helperStart) + helper + s.slice(helperEnd)
+      }
       // 注入片段从独立文件读入（LF），避免在补丁源码里嵌套转义：
       // 直接内联会让 \n/\s 被外层字符串先吃掉（实测踩到两处：字面换行与 \s 变 s）。
       const MINIMAL_NEW = readFileSync(join(HERE, 'data', 'undo-safe-align-snippet.mjs'), 'utf8').replace(/\n$/, '')
       s = s.replace(MINIMAL_RE, MINIMAL_NEW)
-      if (!s.includes('dsh-mobile safe keeps shipped plugins (S1)')) throw new Error('undo-safe-align 复核失败——不写回')
+      if (!s.includes('dsh-mobile safe ownership identity v2')) throw new Error('undo-safe-align 复核失败——不写回')
       return s
     },
   },
@@ -444,12 +457,25 @@ const IMPLS = {
   // ── undo-safe-transaction-S2：备份/marker 先提交，配置文件逐项原子替换 ──
   'undo-safe-transaction-S2': {
     file: 'dsh-undo-savepoint/lib/core.mjs',
-    check: (s) => s.includes('dsh-mobile safe mode transaction (S2)'),
+    check: (s) => s.includes('dsh-mobile safe mode transaction (S2)') &&
+      s.includes('dsh-mobile safe ownership identity v2') &&
+      s.includes('safeModeFilterInserts(patchBytes.toString(\'utf8\'), hardManifest.entries)') &&
+      s.includes('value.schema === 2') && s.includes('value.profileEntries') &&
+      s.includes('safeModeOwnershipManifest(filesRoot)') &&
+      s.includes('snapshot transaction marker is unknown or incomplete') &&
+      s.includes("const purpose = marker.purpose || 'FACTORY'"),
     apply: (s) => {
-      if (s.includes('dsh-mobile safe mode transaction (S2)')) return s
-      const safeStart = s.indexOf('async function safeModeSet(cfg, on) {')
+      if (s.includes('dsh-mobile safe mode transaction (S2)') &&
+        s.includes('dsh-mobile safe ownership identity v2') &&
+        s.includes('safeModeFilterInserts(patchBytes.toString(\'utf8\'), hardManifest.entries)') &&
+        s.includes('value.schema === 2') && s.includes('value.profileEntries') &&
+        s.includes('safeModeOwnershipManifest(filesRoot)') &&
+        s.includes('snapshot transaction marker is unknown or incomplete') &&
+        s.includes("const purpose = marker.purpose || 'FACTORY'")) return s
+      const safeStart = s.indexOf('async function safeModeSet(cfg, on')
+      const selectorStart = s.indexOf('async function safeModeOwnershipManifest(filesRoot)')
       const helperStart = s.indexOf('function safeModeSha256(bytes) {')
-      const start = helperStart >= 0 ? helperStart : safeStart
+      const start = selectorStart >= 0 ? selectorStart : helperStart >= 0 ? helperStart : safeStart
       const end = s.indexOf('// ── 跨机一致性预检', start)
       if (start < 0 || end < 0 || safeStart < 0) {
         throw new Error('undo-safe-transaction 锚点缺失：safeModeSet / preflight 边界已变')

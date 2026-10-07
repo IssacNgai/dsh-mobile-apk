@@ -1,6 +1,8 @@
 package com.dsharnessmobile.shell
 
 import java.io.File
+import java.nio.file.Files
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -20,6 +22,87 @@ import org.junit.Test
  * 固件取自设备实读的 `profiles/web/cordis.patch.yml`（MuMu x86_64 / 0.14.1-SN-1-17）形态。
  */
 class PluginMountsTest {
+
+  @Test
+  fun hardSelectorRejectsUnknownAndIncompatibleTransactionMarkers() {
+    val base = SnapshotTransaction.Marker(SnapshotTransaction.Phase.STAGED, "a".repeat(64), 1L)
+    assertTrue(PluginMounts.transactionMarkerAllowsHard(base))
+    assertTrue(PluginMounts.transactionMarkerAllowsHard(base.copy(purpose = SnapshotTransaction.Purpose.ONLINE_UPDATE)))
+    assertFalse(PluginMounts.transactionMarkerAllowsHard(base.copy(phase = SnapshotTransaction.Phase.UNKNOWN)))
+    assertFalse(PluginMounts.transactionMarkerAllowsHard(base.copy(purpose = SnapshotTransaction.Purpose.UNKNOWN)))
+    assertFalse(PluginMounts.transactionMarkerAllowsHard(base.copy(phase = SnapshotTransaction.Phase.ONLINE_COMMITTED)))
+  }
+
+  @Test
+  fun 在线Hard来源只用验证usr组合加嵌入profile并拒绝缺basepatch() {
+    val root = Files.createTempDirectory("online-hard-").toFile()
+    try {
+      val base = File(root, "usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-base/cordis.patch.yml")
+      val web = File(root, "usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-web-app/cordis.patch.yml")
+      val archiveProfile = File(root, "home/.dsh/profiles/web/cordis.patch.yml")
+      base.parentFile.mkdirs(); web.parentFile.mkdirs()
+      archiveProfile.parentFile.mkdirs()
+      base.writeText("- insert:\n  - id: base-v2\n    name: '@vendor/base-v2'\n")
+      web.writeText("- insert:\n  - id: web-v2\n    name: '@vendor/web-v2'\n")
+      archiveProfile.writeText("- insert:\n  - id: archive-profile\n    name: '@vendor/archive-profile'\n")
+      val profile = setOf(PluginMounts.HardEntry("profile-shell", "@dsh-android/shell"))
+      val entries = PluginMounts.onlineHardEntries(root, profile)
+      assertEquals(setOf(
+        PluginMounts.HardEntry("profile-shell", "@dsh-android/shell"),
+        PluginMounts.HardEntry("base-v2", "@vendor/base-v2"),
+        PluginMounts.HardEntry("web-v2", "@vendor/web-v2"),
+        PluginMounts.HardEntry("archive-profile", "@vendor/archive-profile"),
+      ), entries)
+      assertFalse("上一在线sidecar中已移除的profile身份不得混入新归档清单",
+        entries!!.contains(PluginMounts.HardEntry("retired-online-plugin", "@vendor/retired-online-plugin")))
+      archiveProfile.delete()
+      File(root, "home").deleteRecursively()
+      assertEquals("usr-only旧包回退到APK可信profile identities", setOf(
+        PluginMounts.HardEntry("profile-shell", "@dsh-android/shell"),
+        PluginMounts.HardEntry("base-v2", "@vendor/base-v2"),
+        PluginMounts.HardEntry("web-v2", "@vendor/web-v2"),
+      ), PluginMounts.onlineHardEntries(root, profile))
+      File(root, "home").mkdirs()
+      assertNull("full archive含home却缺factory profile时失败关闭", PluginMounts.onlineHardEntries(root, profile))
+      archiveProfile.parentFile.mkdirs()
+      archiveProfile.writeText("- insert:\n  - id: profile-shell\n    name: '@vendor/conflicting-name'\n")
+      assertNull("同id不同name冲突时拒绝扩大Hard集合", PluginMounts.onlineHardEntries(root, profile))
+      archiveProfile.parentFile.mkdirs()
+      archiveProfile.writeText("- insert:\n  - name: '@vendor/malformed'\n")
+      assertNull("存在但无法证明精确id的归档profile不得静默退回", PluginMounts.onlineHardEntries(root, profile))
+      File(root, "home").deleteRecursively()
+      val danglingHome = File(root, "home").toPath()
+      val symlinkCreated = runCatching { Files.createSymbolicLink(danglingHome, File(root, "missing-home").toPath()) }.isSuccess
+      if (symlinkCreated) {
+        assertNull("dangling home symlink仍表示归档提供了home入口，不能降级成usr-only", PluginMounts.onlineHardEntries(root, profile))
+        Files.deleteIfExists(danglingHome)
+      }
+      web.delete()
+      assertNull("缺失任一verified bundle来源时不产出partial Hard清单", PluginMounts.onlineHardEntries(root, profile))
+      assertNull("profile来源缺失时不伪造完整ownership", PluginMounts.onlineHardEntries(root, emptySet()))
+    } finally {
+      root.deleteRecursively()
+    }
+  }
+
+  @Test
+  fun 自动隔离保留原插件块和未知配置并追加禁用override() {
+    val original = "- insert:\n  - id: user-probe\n    name: '@deepseek-ai/user-probe'\n    config:\n      customField: keep-me\n- id: user-probe\n  disabled: false\n"
+    val isolated = PluginMounts.quarantineEntry(original, PluginMounts.FailedEntry("user-probe", "@deepseek-ai/user-probe"))
+    assertNotNull(isolated)
+    assertTrue(isolated!!.startsWith(original))
+    assertTrue(isolated.contains("customField: keep-me"))
+    assertTrue(isolated.endsWith("# dsh-mobile-quarantine-v1 reason=loader-failure\n- id: \"user-probe\"\n  name: \"@deepseek-ai/user-probe\"\n  disabled: true\n"))
+    assertEquals("重复隔离保持幂等", isolated, PluginMounts.quarantineEntry(isolated, PluginMounts.FailedEntry("user-probe", "@deepseek-ai/user-probe")))
+  }
+
+  @Test
+  fun 自动隔离拒绝只命中顶层覆盖或歧义条目() {
+    val topLevelOnly = "- id: user-probe\n  name: '@deepseek-ai/user-probe'\n"
+    assertNull(PluginMounts.quarantineEntry(topLevelOnly, PluginMounts.FailedEntry("user-probe", "@deepseek-ai/user-probe")))
+    val ambiguous = "- insert:\n  - id: user-probe\n    name: '@deepseek-ai/user-probe'\n- insert:\n  - id: user-probe\n    name: '@deepseek-ai/user-probe'\n"
+    assertNull(PluginMounts.quarantineEntry(ambiguous, PluginMounts.FailedEntry("user-probe", "@deepseek-ai/user-probe")))
+  }
 
   /** 设备实读形状的缩略固件：含我们的、上游的、用户的条目 + 块内注释 + 空 insert 残留。 */
   private val fixture = """
@@ -132,6 +215,61 @@ class PluginMountsTest {
     assertEquals("同内容同指纹", a, PluginMounts.digest(fixture))
     assertTrue("内容变化指纹必须变", a != PluginMounts.digest(fixture + "\n# x"))
     assertEquals("sha256 十六进制 64 位", 64, a.length)
+  }
+
+  @Test
+  fun `Soft digest 需跨两个不同引擎启动并在健康窗口内才转 Stable`() {
+    val empty = JSONObject()
+    val identities = listOf(PluginMounts.HardEntry("hard-id", "hard"), PluginMounts.HardEntry("soft-id", "soft"))
+    val first = PluginMounts.softHealthTransition(empty, "digest-a", identities, 101L, 1_000_000L)
+    assertNotNull("首次完整健康只建立 Candidate", first)
+    assertFalse(first!!.promoted)
+    assertEquals("digest-a", first.state.getString("candidateDigest"))
+    assertFalse(first.state.has("stableDigest"))
+
+    assertNull("同一次引擎启动重复探活不得充当 cold boot", PluginMounts.softHealthTransition(
+      first.state, "digest-a", identities, 101L, 1_060_000L,
+    ))
+    val promoted = PluginMounts.softHealthTransition(
+      first.state, "digest-a", identities, 202L, 1_060_000L,
+    )
+    assertNotNull(promoted)
+    assertTrue(promoted!!.promoted)
+    assertEquals("digest-a", promoted.state.getString("stableDigest"))
+    assertEquals(202L, promoted.state.getLong("stableBoot"))
+    assertFalse(promoted.state.has("candidateDigest"))
+  }
+
+  @Test
+  fun `Soft digest 变化或超出窗口时重置 Candidate 且不能误升 Stable`() {
+    val previous = JSONObject().put("candidateDigest", "digest-a").put("candidateBoot", 101L).put("candidateAt", 1_000_000L)
+    val changed = PluginMounts.softHealthTransition(previous, "digest-b", listOf(PluginMounts.HardEntry("hard-id", "hard"), PluginMounts.HardEntry("new-id", "new")), 202L, 1_060_000L)
+    assertNotNull(changed)
+    assertFalse(changed!!.promoted)
+    assertEquals("digest-b", changed.state.getString("candidateDigest"))
+    assertFalse(changed.state.has("stableDigest"))
+
+    val expired = PluginMounts.softHealthTransition(previous, "digest-a", listOf(PluginMounts.HardEntry("hard-id", "hard"), PluginMounts.HardEntry("soft-id", "soft")), 303L, 1_000_000L + 604_800_001L)
+    assertNotNull(expired)
+    assertFalse(expired!!.promoted)
+    assertEquals(303L, expired.state.getLong("candidateBoot"))
+    assertFalse(expired.state.has("stableDigest"))
+    assertNull("缺完整健康 / 无效 boot 身份不得落盘或推进", PluginMounts.softHealthTransition(previous, "digest-a", listOf(PluginMounts.HardEntry("soft-id", "soft")), 0L, 2_000_000L))
+  }
+
+  @Test
+  fun `自动隔离与用户手动禁用有不同可诊断状态`() {
+    val original = "- insert:\n  - id: plugin-a\n    name: plugin-a\n    config:\n      unknown: keep\n- id: plugin-b\n  name: plugin-b\n  disabled: true\n"
+    val quarantined = PluginMounts.quarantineEntry(original, PluginMounts.FailedEntry("plugin-a", "plugin-a"))!!
+    assertTrue("原用户配置必须保留", quarantined.contains("unknown: keep"))
+    assertTrue("隔离 marker 必须可读", quarantined.contains("dsh-mobile-quarantine-v1"))
+    assertTrue("手动禁用 override 仍保留", quarantined.contains("plugin-b"))
+    val entry = PluginMounts.HardEntry("plugin-a", "plugin-a")
+    val stable = setOf(entry)
+    assertEquals(PluginMounts.SoftEntryState.QUARANTINED, PluginMounts.classifySoftEntry(entry, stable, disabled = true, quarantined = true))
+    assertEquals(PluginMounts.SoftEntryState.DISABLED, PluginMounts.classifySoftEntry(entry, stable, disabled = true, quarantined = false))
+    assertEquals(PluginMounts.SoftEntryState.STABLE, PluginMounts.classifySoftEntry(entry, stable, disabled = false, quarantined = false))
+    assertEquals(PluginMounts.SoftEntryState.CANDIDATE, PluginMounts.classifySoftEntry(entry, emptySet(), disabled = false, quarantined = false))
   }
 
   // ── 0.14.2 D12：显示名不得进入插件集合 ────────────────────────────────

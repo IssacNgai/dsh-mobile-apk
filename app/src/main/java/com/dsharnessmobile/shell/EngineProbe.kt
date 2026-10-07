@@ -7,6 +7,7 @@ import java.net.Proxy
 import java.net.Socket
 import java.net.SocketTimeoutException
 import java.net.URL
+import android.content.Context
 import org.json.JSONObject
 
 /**
@@ -193,6 +194,93 @@ object EngineProbe {
       JSONObject().put("running", false).put("listening", false)
         .put("auth", "unknown").put("error", err)
     }
+  }
+
+  /**
+   * Full, read-only health evidence for Soft promotion. A public HTTP 200 alone is deliberately
+   * insufficient: require authenticated Cordis inventory, every enabled Loader fiber ACTIVE,
+   * enabled preset composition fibers ACTIVE, and working
+   * session/list plus modelCatalog APIs. Provider-specific execution remains outside this proof.
+   */
+  fun completeSoftHealth(context: Context, hard: PluginMounts.HardManifest): Boolean {
+    return try {
+    val inventory = rpc(context, "pluginInventory/list", JSONObject()) ?: return false
+    val sessions = rpc(context, "session/list", JSONObject().put("_request", JSONObject())) ?: return false
+    val catalog = rpc(context, "session/modelCatalog", JSONObject()) ?: return false
+    completeSoftHealthEvidence(inventory, sessions, catalog, hard)
+    } catch (_: Throwable) { false }
+  }
+
+  internal fun completeSoftHealthEvidence(
+    inventory: JSONObject,
+    sessions: JSONObject,
+    catalog: JSONObject,
+    hard: PluginMounts.HardManifest,
+  ): Boolean {
+    return try {
+    if (hard.entries.isEmpty() || hard.entries.any { it.id.isNullOrBlank() || it.name.isBlank() } ||
+      !hard.fingerprint.matches(Regex("[0-9a-f]{64}"))) return false
+    val value = inventory.optJSONObject("result")?.optJSONObject("value") ?: return false
+    val rows = value.optJSONArray("entries") ?: return false
+    if (rows.length() == 0) return false
+    val seenHard = HashSet<PluginMounts.HardEntry>()
+    for (i in 0 until rows.length()) {
+      val row = rows.optJSONObject(i) ?: return false
+      val id = row.optString("entryId", "")
+      val name = row.optString("moduleName", "")
+      if (id.isBlank() || name.isBlank()) return false
+      if (row.opt("enabled") !is Boolean) return false
+      val enabled = row.optBoolean("enabled", false)
+      val phase = row.optString("fiberPhase", "")
+      if (hard.entries.any { it.id == id && it.name == name }) seenHard.add(PluginMounts.HardEntry(id, name))
+      if (enabled && phase != "active") return false
+    }
+    if (!seenHard.containsAll(hard.entries)) return false
+    val presets = value.optJSONArray("agentPresets") ?: return false
+    for (i in 0 until presets.length()) {
+      val preset = presets.optJSONObject(i) ?: return false
+      if (!preset.isNull("broken")) return false
+      val rows = preset.optJSONArray("rows") ?: return false
+      for (j in 0 until rows.length()) {
+        val row = rows.optJSONObject(j) ?: return false
+        when (row.opt("enabled")) {
+          true -> if (row.optString("fiberPhase") != "active") return false
+          false -> Unit
+          "conditional" -> return false
+          else -> return false
+        }
+      }
+    }
+    if (sessions.optJSONObject("result")?.optJSONObject("value")?.optJSONArray("items") == null) return false
+    val catalogValue = catalog.optJSONObject("result")?.optJSONObject("value") ?: return false
+    val default = catalogValue.optJSONObject("default") ?: return false
+    if (default.optString("provider").isBlank() || default.optString("model").isBlank()) return false
+    catalogValue.optJSONArray("routableProviders") != null &&
+      catalogValue.optJSONArray("groups") != null && catalogValue.optJSONArray("failures") != null
+    } catch (_: Throwable) { false }
+  }
+
+  private fun rpc(context: Context, method: String, args: JSONObject): JSONObject? {
+    return try {
+      val conn = URL("$ENGINE_URL/api/$method").openConnection(Proxy.NO_PROXY) as HttpURLConnection
+      conn.requestMethod = "POST"
+      conn.connectTimeout = 1_000
+      conn.readTimeout = 1_500
+      conn.doOutput = true
+      conn.setRequestProperty("content-type", "application/json")
+      EngineAuth.attach(context, conn)
+      val envelope = JSONObject().put("type", "client-request")
+        .put("rpcId", "soft-health-${System.currentTimeMillis()}")
+        .put("method", method)
+        .put("payload", JSONObject().put("args", args))
+      conn.outputStream.use { it.write(envelope.toString().toByteArray(Charsets.UTF_8)) }
+      if (conn.responseCode != 200) { conn.disconnect(); null }
+      else {
+        val body = conn.inputStream.bufferedReader().use { it.readText() }
+        conn.disconnect()
+        JSONObject(body)
+      }
+    } catch (_: Throwable) { null }
   }
 
   /**

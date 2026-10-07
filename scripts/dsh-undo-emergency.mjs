@@ -27,6 +27,72 @@ const UNDO_ROOT = process.env.DSH_UNDO_ROOT || join(DSH_HOME, 'undo-snapshots')
 const PROFILE = process.env.DSH_UNDO_PROFILE || 'web'
 const PROFILE_ROOT = join(DSH_HOME, 'profiles', PROFILE)
 
+function selectHardOwnershipManifest(filesRoot) {
+  const readJson = (path) => { try { return JSON.parse(readFileSync(path, 'utf8')) } catch { return null } }
+  const valid = (value) => value && value.schema === 2 && value.complete === true &&
+    /^[0-9a-f]{64}$/.test(value.fingerprint ?? '') && Array.isArray(value.entries) && value.entries.length > 0 &&
+    value.entries.every((entry) => entry && typeof entry.id === 'string' && entry.id.length > 0 && typeof entry.name === 'string' && entry.name.length > 0) &&
+    Array.isArray(value.profileEntries) && value.profileEntries.length > 0 &&
+    value.profileEntries.every((entry) => entry && typeof entry.id === 'string' && typeof entry.name === 'string' &&
+      value.entries.some((hard) => hard.id === entry.id && hard.name === entry.name))
+  const cache = readJson(join(filesRoot, '.plugin-hard-manifest.json'))
+  const installed = readFileSync(join(filesRoot, '.snapshot-fingerprint'), 'utf8').trim().toLowerCase()
+  if (!valid(cache) || !/^[0-9a-f]{64}$/.test(installed)) throw new Error('ownership cache/fingerprint unavailable')
+  const sidecar = (archive, base) => {
+    if (!/^[0-9a-f]{64}$/.test(archive ?? '') || !/^[0-9a-f]{64}$/.test(base ?? '')) return null
+    const value = readJson(join(filesRoot, `.plugin-hard-manifest-online-${archive}.json`))
+    return valid(value) && value.fingerprint === archive && value.baseFingerprint === base ? value : null
+  }
+  let marker = null
+  try {
+    const fields = Object.fromEntries(readFileSync(join(filesRoot, '.snapshot-transaction'), 'utf8').split(/\r?\n/)
+      .map((line) => { const at = line.indexOf('='); return at > 0 ? [line.slice(0, at), line.slice(at + 1)] : null }).filter(Boolean))
+    marker = fields
+  } catch { /* no transaction marker */ }
+  if (marker) {
+    const purpose = marker.purpose || 'FACTORY' // Legacy markers omitted purpose and mean FACTORY.
+    if (!['STAGED', 'SWAPPING', 'SWAPPED', 'ONLINE_COMMITTED'].includes(marker.phase) ||
+      !['FACTORY', 'ONLINE_UPDATE'].includes(purpose) || marker.phase === 'SWAPPING' ||
+      (marker.phase === 'ONLINE_COMMITTED' && purpose !== 'ONLINE_UPDATE')) {
+      throw new Error('snapshot transaction marker is unknown or incomplete')
+    }
+    if (purpose === 'ONLINE_UPDATE') {
+      const base = (marker.baseFingerprint ?? '').toLowerCase()
+      if (!/^[0-9a-f]{64}$/.test(base) || (cache.baseFingerprint || cache.fingerprint).toLowerCase() !== base) throw new Error('online base ownership mismatch')
+      if (marker.phase === 'SWAPPED' || marker.phase === 'ONLINE_COMMITTED') {
+        const selected = sidecar((marker.fingerprint ?? '').toLowerCase(), base)
+        if (selected) return selected
+        throw new Error('online ownership sidecar missing')
+      }
+      if (marker.phase === 'STAGED') {
+        const prior = (marker.priorFingerprint || installed).toLowerCase()
+        if (prior !== base) {
+          const selected = sidecar(prior, base)
+          if (selected) return selected
+          throw new Error('prior online ownership sidecar missing')
+        }
+        if (cache.fingerprint === prior) return cache
+        throw new Error('staged ownership unavailable')
+      }
+      throw new Error('unknown online transaction phase')
+    }
+  }
+  try {
+    const fields = Object.fromEntries(readFileSync(join(filesRoot, '.online-snapshot'), 'utf8').split(/\r?\n/)
+      .map((line) => { const at = line.indexOf('='); return at > 0 ? [line.slice(0, at), line.slice(at + 1)] : null }).filter(Boolean))
+    const base = (fields.base ?? '').toLowerCase(), archive = (fields.archive ?? '').toLowerCase()
+    if (archive === installed && base === (cache.baseFingerprint || cache.fingerprint).toLowerCase()) {
+      const selected = sidecar(archive, base)
+      if (selected) return selected
+      throw new Error('committed online ownership sidecar missing')
+    }
+  } catch (error) {
+    if (String(error?.message ?? error).includes('sidecar missing')) throw error
+  }
+  if (cache.fingerprint !== installed) throw new Error('cached ownership belongs to another snapshot')
+  return cache
+}
+
 function storeDirs() {
   const scoped = join(UNDO_ROOT, PROFILE)
   const scopedExists = existsSync(join(scoped, 'manual')) || existsSync(join(scoped, 'auto'))
@@ -243,6 +309,15 @@ export function safeMode(action, { atomicWrite = safeModeAtomicWrite } = {}) {
         return false
       }
     }
+    let hardEntries
+    try {
+      const filesRoot = dirname(dirname(DSH_HOME))
+      const manifest = selectHardOwnershipManifest(filesRoot)
+      hardEntries = manifest.entries
+    } catch {
+      console.error('安全模式未生效：本版本插件归属清单缺失或损坏，无法安全区分产品插件与用户插件；原配置未改动。')
+      return false
+    }
     const backup = join(autoDir, `safe-mode-backup-${id}.yml`)
     const homeBackup = join(autoDir, `safe-mode-home-backup-${id}.yml`)
     // 先做变更前建档（等价 Windows 版 pre-snapshot）。快照失败时原配置仍未动。
@@ -260,15 +335,8 @@ export function safeMode(action, { atomicWrite = safeModeAtomicWrite } = {}) {
     // 与插件核心（core.mjs 的 undo-safe-align-S1）同口径：只摘第三方 insert 子条目，
     // 保留我方装配的插件与全部顶层 disable 行。原实现整份覆写成最小文件，
     // 会摘掉 12 个 @dsh-android/* 引用与 7 条 disabled（含安全关键的 client-hmr）。
-    const SHIPPED_PREFIXES = ['@deepseek-ai/', '@dsh-android/']
-    const SHIPPED_NAMES = ['dsh-undo-savepoint', 'dshmarketplace-plugin']
-    const isShipped = (name) => {
-      const v = String(name ?? '').trim().replace(/^['"]+|['"]+$/g, '')
-      if (v === '') return false
-      if (SHIPPED_NAMES.includes(v)) return true
-      return SHIPPED_PREFIXES.some((p) => v.startsWith(p))
-    }
-    const filterThirdPartyInserts = (text) => {
+    // Publisher namespace is not product ownership: user-mounted official DSH packages are Soft.
+    const filterThirdPartyInserts = (text, ownershipEntries) => {
       const lines = String(text).split('\n')
       const out = []
       let i = 0
@@ -291,7 +359,8 @@ export function safeMode(action, { atomicWrite = safeModeAtomicWrite } = {}) {
         const kept = []
         for (const chunk of chunks) {
           const nm = /^\s*-?\s*name:\s*['"]?([^'"\s]+)/m.exec(chunk.join('\n'))
-          if (nm && !isShipped(nm[1])) continue
+          const id = /^\s*-\s+id:\s*['"]?([^'"\s]+)/m.exec(chunk[0])?.[1] ?? null
+          if (nm && !ownershipEntries.some((entry) => entry.id === id && entry.name === nm[1])) continue
           kept.push(...chunk)
         }
         if (kept.length === 0) { i = end; continue }
@@ -299,7 +368,7 @@ export function safeMode(action, { atomicWrite = safeModeAtomicWrite } = {}) {
       }
       return out.join('\n')
     }
-    const minimal = filterThirdPartyInserts(patchBytes.toString('utf8'))
+    const minimal = filterThirdPartyInserts(patchBytes.toString('utf8'), hardEntries)
     // Marker is the recovery authority. Persist it atomically before touching any live config.
     const state = {
       active: true, enteredAt: new Date().toISOString(), backup, homeBackup,

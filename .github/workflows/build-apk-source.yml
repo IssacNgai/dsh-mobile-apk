@@ -484,7 +484,9 @@ jobs:
           # 注意：这里**不含** vendor/dshmarketplace-plugin —— 它是固定 npm 发布产物，tarball 里已带
           # 打好包的 lib/；再跑一次 `npm run build` 会用不同工具链产出不同字节，把我们按发布字节定义的
           # market-* 补丁全部锚空（0.1.5 时代就是这么踩的）。
-          for d in plugins/dsh-android-bridge plugins/dsh-android-manage dsh-shell-termux plugins/dsh-android-linux-env plugins/dsh-android-file-open plugins/dsh-model-capability plugins/dsh-android-browser plugins/dsh-android-vdisplay dsh-client-ui-responsive; do
+          mapfile -t plugin_dirs < <(node -e "const fs=require('node:fs'); const {dirs}=require('./scripts/plugin-dirs.json'); console.log(dirs.filter(d=>JSON.parse(fs.readFileSync(d+'/package.json','utf8')).scripts?.build).join('\n'))")
+          test "${#plugin_dirs[@]}" -gt 0
+          for d in "${plugin_dirs[@]}"; do
             echo "== source build $d =="
             # Declaration roots alone are not a resolved graph. Resolve lock-only first, then npm ci.
             node scripts/source-build/install-project-dependencies.mjs "$d" \
@@ -788,45 +790,13 @@ jobs:
             .deploy-tmp/source-build/source-build-policy.json
           cp scripts/source-build/check-dsh-source-snapshot-gate.mjs scripts/check-engine-overlay.mjs
           node scripts/build-apk.mjs --abi arm64 --suffix -source
-          echo "构建步骤退出，开始产出侧签名断言"
+          echo "构建步骤退出，记录产物来源；上传前统一验证三签与证书"
           find out -type f -name '*.apk' -print -exec sha256sum {} \; > .deploy-tmp/source-build/apk-sha256.txt
           echo "apk-sha256.txt 行数: $(wc -l < .deploy-tmp/source-build/apk-sha256.txt)"
           if [ ! -s .deploy-tmp/source-build/apk-sha256.txt ]; then
             echo "::error::未产出 APK 清单（.deploy-tmp/source-build/apk-sha256.txt 为空）"
             exit 1
           fi
-          # 产出断言（坑 202）：APK 必须真由仓库固定 keystore 签。判据放在产出侧而不是输入侧，
-          # 因为「keystore 文件在、构建却用了别的密钥」这条断链只有产出能证伪；顺带也挡回
-          # 「现场生成一次性证书」那种改法。apksigner 的输出不随语言/JDK 版本变（keytool 会）。
-          # 期望值是 keystore/debug.keystore 的证书 SHA-256（小写；keytool 打印为大写同值）。
-          # 路径由前面的「Resolve the Android SDK apksigner」步骤解析并落盘（拿不到即早失败）。
-          expected_signing_certificate='1dde9d980f62b715f29c20b421063f1d3d796085adf7de7e9907dd16d845bcbd'
-          apksigner_bin=$(cat .deploy-tmp/source-build/apksigner-path.txt)
-          echo "apksigner: $apksigner_bin"
-          if [ ! -x "$apksigner_bin" ]; then
-            echo "::error::apksigner 不可执行: '$apksigner_bin'"
-            exit 1
-          fi
-          apk_count=0
-          while read -r apk_path; do
-            apk_count=$((apk_count + 1))
-            # 判据刻意不依赖任何行的前缀与措辞：抓 stdout+stderr、加 --verbose、去掉冒号转小写后
-            # 只要求「期望指纹出现在输出里」。apksigner 各版本的输出布局与流向并不一致
-            # （实测 build-tools 37.0.0 上按 `Signer #1 certificate SHA-256 digest:` 行首解析会取空，
-            # 且失败时输出被管道吞掉、日志里什么都看不到——坑 203）。
-            cert_output=$("$apksigner_bin" verify --print-certs --verbose "$apk_path" 2>&1 || true)
-            normalized=$(printf '%s' "$cert_output" | tr 'A-F' 'a-f' | tr -d ':')
-            echo "签名检查 $apk_path -> $(printf '%s' "$normalized" | grep -o "$expected_signing_certificate" || echo '<未出现期望指纹>')"
-            if ! printf '%s' "$normalized" | grep -q "$expected_signing_certificate"; then
-              echo "::error::$apk_path 的签名证书不是仓库固定 keystore 的 $expected_signing_certificate（坑 202：产物必须能覆盖安装，签名必须固定）"
-              echo "--- apksigner 原始输出开始 ---"
-              printf '%s\n' "$cert_output"
-              echo "--- apksigner 原始输出结束 ---"
-              exit 1
-            fi
-            printf '%s\n' "$expected_signing_certificate" > .deploy-tmp/source-build/signing-certificate-sha256.txt
-          done < <(find out -type f -name '*.apk')
-          echo "签名断言通过: $apk_count 个 APK 均由仓库固定 keystore 签"
           find .deploy-tmp/engine-overlay -maxdepth 1 -type f -name '*.tgz' -print0 \
             | sort -z | xargs -0 -r sha256sum \
             > .deploy-tmp/source-build/engine-overlay-sha256.txt
@@ -886,7 +856,12 @@ jobs:
           [ "${#apks[@]}" -gt 0 ] || { echo "::error::source build has no final APKs"; exit 1; }
           args=()
           for apk in "${apks[@]}"; do args+=(--apk "$apk"); done
-          node scripts/check-apk-signatures.mjs "${args[@]}"
+          node scripts/check-apk-signatures.mjs "${args[@]}" --apksigner "$(cat .deploy-tmp/source-build/apksigner-path.txt)" --keystore keystore/debug.keystore
+          node --input-type=module <<'NODE'
+          import { writeFileSync } from 'node:fs'
+          import { readKeystoreCertificate } from './scripts/check-apk-signatures.mjs'
+          writeFileSync('.deploy-tmp/source-build/signing-certificate-sha256.txt', readKeystoreCertificate('keystore/debug.keystore') + '\n')
+          NODE
 
       - name: Upload APK and provenance
         uses: actions/upload-artifact@v4

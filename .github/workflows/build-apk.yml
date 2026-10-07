@@ -4,7 +4,7 @@
 # 整套构建链（build-snapshot/inject/门禁脚本、@dsh-android 插件、插架子仓库、vendor、底座、LICENSES）
 # 均随本仓库提交；本 workflow 只操作本仓库（GITHUB_REPOSITORY = dsh-mobile-apk）。
 #
-# 流程：检出自仓库(node/python/java) -> npm 构建 6 个缺 lib/ 的插件 -> stage 底座 base/
+# 流程：检出自仓库(node/python/java) -> 按统一清单准备并构建插件一次 -> stage 底座 base/
 #       -> node scripts/build-snapshot-013.mjs <abi>（Termux 源装配 + 注入 + 门禁 + 归档）
 #       -> node scripts/build-apk.mjs <abi>（注入插件 + 门禁 + gradle + 产物）
 #       -> upload-artifact（不出 Release）。
@@ -42,15 +42,14 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        abi: [arm64, x86_64]
+        abi: ${{ fromJSON(inputs.abi == 'both' && '["arm64","x86_64"]' || format('["{0}"]', inputs.abi)) }}
       fail-fast: false
     env:
       # build-apk.mjs 依赖本仓库顶层 scripts/plugins/vendor/base；apk 仓库 = $GITHUB_WORKSPACE
       DSH_APK_DIR: ${{ github.workspace }}
     steps:
-      # LFS 流量治理（0.14.5）：原先 `lfs: true` = `git lfs fetch --all`，会把历史上所有 LFS 对象
-      # 拉全（本仓共约 481 MB，其中 294 MB 是已从 HEAD 删除的 snapshots/* 死对象）。
-      # 本 job 只 stage 本 ABI 的底座 + 共用 base-dsh，故改为按需拉取 + 目录缓存。
+      # 每个 ABI job 只需要本 ABI 的 base-usr 与共用 base-dsh；先缓存，未命中才按路径拉取。
+      # checkout 的 lfs:true 是按 ref fetch，不能从 fetch-depth:0 推断它会下载历史全部 LFS。
       - name: 检出本仓库（不含 LFS 归档；底座下方按需拉取）
         uses: actions/checkout@v4
         with:
@@ -89,29 +88,15 @@ jobs:
         uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: '17' }
 
-      # 0.14.0 CI/CD 修复 C-3：有锁文件的目录一律走 `npm ci`（按锁文件可复现装配）。
-      # 原实现全用 `npm install`——它**忽略锁文件**、现场重新解析依赖：dsh-client-ui-responsive 的
-      # @deepseek-ai 链路被 ^ 区间放大到 0.1.5-rc.2，与本包精确钉 0.1.5-rc.1 冲突，npm install
-      # 直接 ERESOLVE，云端重建链自 2026-08-28 起从未成功过（本地 CI 同样是这条根因）。
-      # 无锁文件的目录（dsh-host-web-compat 用已提交 lib；dsh-model-capability 无锁）保持 install。
-      - name: 构建插件（有锁文件走 npm ci；dsh-host-web-compat 用已提交 lib）
+      - name: 准备并构建插件（统一清单、锁解析与单次构建）
         shell: bash
         run: |
-          set -e
-          install_deps() {
-            if [ -f "$1/package-lock.json" ]; then
-              echo "  deps: npm ci（锁文件在场，可复现）"
-              (cd "$1" && npm ci --no-audit --no-fund)
-            else
-              echo "  deps: npm install（无锁文件，按 package.json 解析）"
-              (cd "$1" && npm install --no-audit --no-fund)
-            fi
-          }
-          # 顺序有意义：dsh-shell-termux 必须**先**构建 —— plugins/dsh-android-linux-env 通过 `file:../../dsh-shell-termux`
-          # 依赖它，编译期解析其 lib/ 类型面；若它尚未构建，tsc 报 TS2307 Cannot find module。
-          for d in dsh-shell-termux dsh-client-ui-responsive plugins/dsh-android-bridge plugins/dsh-android-manage plugins/dsh-android-linux-env plugins/dsh-android-file-open plugins/dsh-model-capability plugins/dsh-android-browser plugins/dsh-android-vdisplay; do
-            echo "== npm build $d =="
-            install_deps "$d"
+          set -euo pipefail
+          # 清单保证 termux 先于 linux-env；host-web-compat 使用登记的发布产物。
+          mapfile -t plugin_dirs < <(node -e "const fs=require('node:fs'); const {dirs}=require('./scripts/plugin-dirs.json'); console.log(dirs.filter(d=>JSON.parse(fs.readFileSync(d+'/package.json','utf8')).scripts?.build).join('\n'))")
+          test "${#plugin_dirs[@]}" -gt 0
+          for d in "${plugin_dirs[@]}"; do
+            node scripts/source-build/install-project-dependencies.mjs "$d" .deploy-tmp/source-build/plugin-lock-resolution-build.json
             (cd "$d" && npm run build)
           done
 
@@ -147,7 +132,7 @@ jobs:
           node scripts/check-apk-signatures.mjs --self-test
           mapfile -t apks < <(find out -type f -name '*.apk' | sort)
           [ "${#apks[@]}" -eq 1 ] || { echo "::error::当前 ABI 产物数不是 1: ${#apks[@]}"; exit 1; }
-          node scripts/check-apk-signatures.mjs --apk "${apks[0]}"
+          node scripts/check-apk-signatures.mjs --apk "${apks[0]}" --keystore keystore/debug.keystore
 
       - name: 上传 APK 产物（本地下载 debug；不出 Release）
         uses: actions/upload-artifact@v4

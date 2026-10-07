@@ -1,6 +1,8 @@
 package com.dsharnessmobile.shell
 
+import java.io.File
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -16,6 +18,35 @@ import org.junit.Test
 class UndoGateDecisionTest {
 
   private val t0 = 1_000_000L
+
+  @Test
+  fun retryMarkerSuppressesOnlyTheSameInstallAndFailedPatch() {
+    val identity = UndoGate.RetryIdentity("install-a", "patch-a")
+    val marker = """{"schema":2,"at":$t0,"installFingerprint":"install-a","patchDigest":"patch-a"}"""
+    assertEquals(t0, UndoGate.retrySuppression(marker, identity, t0 + 1_000L).atMs)
+    assertEquals(null, UndoGate.retrySuppression(marker, identity.copy(patchDigest = "patch-b"), t0 + 1_000L).atMs)
+    assertEquals(null, UndoGate.retrySuppression(marker, identity.copy(installFingerprint = "install-b"), t0 + 1_000L).atMs)
+    assertEquals(null, UndoGate.retrySuppression(marker, identity, t0 + UndoGate.RETRY_WINDOW_MS).atMs)
+    assertEquals(true, UndoGate.retrySuppression(marker, identity.copy(patchDigest = "patch-b"), t0 + 1_000L).resetWatch)
+    assertEquals(true, UndoGate.retrySuppression(marker, identity.copy(installFingerprint = "install-b"), t0 + 1_000L).resetWatch)
+  }
+
+  @Test
+  fun legacyTimestampRemainsConservativelySuppressedUntilItsWindowExpires() {
+    val result = UndoGate.retrySuppression(t0.toString(), UndoGate.RetryIdentity("new", "candidate"), t0 + 1_000L)
+    assertEquals(t0, result.atMs)
+    assertEquals(true, result.legacyMarker)
+    assertEquals(null, UndoGate.retrySuppression(t0.toString(), UndoGate.RetryIdentity("new", "candidate"), t0 + UndoGate.RETRY_WINDOW_MS).atMs)
+  }
+
+  @Test
+  fun onlyTheExplicitUserRestartClearsTheRetryEpoch() {
+    val src = File("src/main/java/com/dsharnessmobile/shell/EngineStartFlow.kt").readText()
+    val clearCalls = Regex("UndoGate\\.clearRetryEpochForUserRestart\\(").findAll(src).count()
+    val restart = src.substringAfter("fun restart(): Boolean").substringBefore("fun ")
+    assertEquals("automatic start/retry paths must not clear suppression", 1, clearCalls)
+    assertTrue("the explicit restart clears only after proving its child stopped", restart.indexOf("stopOwnedEngine()") < restart.indexOf("clearRetryEpochForUserRestart"))
+  }
 
   @Test
   fun belowTriggerThresholdStaysIdle() {

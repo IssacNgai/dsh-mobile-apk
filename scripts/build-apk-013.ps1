@@ -22,7 +22,7 @@ if ($Fast) {
 $apkDir = Join-Path $Root "dsh-mobile-apk"
 if (-not (Test-Path $apkDir)) { $apkDir = $Root }
 Write-Host "== APK scheme / version suffix regression tests =="
-node --test (Join-Path $Root "scripts\check-apk-signatures.test.mjs") (Join-Path $Root "scripts\resolve-version-suffix.test.mjs") (Join-Path $Root "scripts\build-apk-engine.test.mjs")
+node --test (Join-Path $Root "scripts\check-apk-signatures.test.mjs") (Join-Path $Root "scripts\resolve-version-suffix.test.mjs") (Join-Path $Root "scripts\build-apk-engine.test.mjs") (Join-Path $Root "scripts\check-third-party.test.mjs")
 if ($LASTEXITCODE -ne 0) { throw "APK scheme/version regression tests failed" }
 
 # 统一 per-ABI 拒绝记账（坑 94 / review C2，2026-09-14）：曾有三处拒绝路径只 `continue` 不记账
@@ -74,7 +74,7 @@ if ($LASTEXITCODE -ne 0) { Write-Host "夹具未随版，拒绝打包（跑 node
 
 # 0.14.5（上游对齐审计 C-1）：26 个补丁回归里此前只有 6 个有自动化入口，其余只被 node --check 解析过。
 # 本门禁把全部 26 个真的串行跑起来；存量失败用带理由的显式白名单记账，新增失败立刻判红。
-Write-Host "== 补丁回归清单门禁 ==
+Write-Host "== 补丁回归清单门禁 =="
 node (Join-Path $Root "scripts\check-patch-test-manifest.mjs") 2>&1
 if ($LASTEXITCODE -ne 0) { Write-Host "补丁回归出现未声明失败，拒绝打包（修掉，或按既有格式加带 reason/since 的白名单）"; exit 1 }
 
@@ -401,7 +401,7 @@ foreach ($abi in @('arm64', 'x86_64')) {
     }
     # 第三方许可合规（GPL 义务 A1/A2 门禁 2026-08-23）：copyleft 包许可证全文须随快照分发，
     # 矩阵须覆盖 dpkg status 全部包；缺失直接拒绝打包（--- tar 视图：9p 权限不影响判定）。
-    node (Join-Path $Root "scripts\check-third-party.mjs") (Join-Path $work "x") --tar $snapIn 2>&1 | Select-Object -First 4
+    node (Join-Path $Root "scripts\check-third-party.mjs") (Join-Path $work "x") --tar $snapIn --write-notices (Join-Path $Root "THIRD_PARTY_NOTICES.md") 2>&1 | Select-Object -First 4
     if ($LASTEXITCODE -ne 0) { Deny-Abi $abi "THIRD-PARTY CHECK FAILED（许可合规）"; continue }
     # 许可资产（LICENSES 标准文本 + notices）打入 APK assets（A2：随包分发）
     $licAssets = Join-Path $apkDir "app\src\main\assets\licenses"

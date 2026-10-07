@@ -160,7 +160,7 @@ if (DRY_RUN) {
 
 try {
   log('APK scheme and version suffix regression tests…')
-  run(process.execPath, ['--test', gate('check-apk-signatures.test.mjs'), gate('resolve-version-suffix.test.mjs'), gate('build-apk-engine.test.mjs'), gate('check-perf-instrumentation.test.mjs')])
+  run(process.execPath, ['--test', gate('check-apk-signatures.test.mjs'), gate('resolve-version-suffix.test.mjs'), gate('build-apk-engine.test.mjs'), gate('build-hard-manifest.test.mjs'), gate('check-perf-instrumentation.test.mjs')])
   mkdirSync(OUT, { recursive: true })
   mkdirSync(work, { recursive: true })
 
@@ -341,7 +341,7 @@ try {
     else throw new Error('快照权限模式校验失败')
   }
   log('门禁：第三方许可…')
-  run('node', [gate('check-third-party.mjs'), 'x', '--tar', snapIn])
+  run('node', [gate('check-third-party.mjs'), 'x', '--tar', snapIn, '--write-notices', join(ROOT, 'THIRD_PARTY_NOTICES.md')])
   log('门禁：机密（严格：归档不可读/成员为空即失败）…')
   run('node', [gate('check-snapshot-secrets.mjs'), snapIn, '--require'])
   log('门禁：ELF 架构…')

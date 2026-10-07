@@ -980,7 +980,115 @@ async function safeModeStatus(cfg) {
   }
   return st;
 }
+/* dsh-mobile safe ownership identity v2: publisher namespaces are not ownership proofs. */
+export function safeModeFilterInserts(text, hardEntries = []) {
+  const entries = Array.isArray(hardEntries) ? hardEntries : [];
+  const owns = (id, name) => entries.some((entry) => entry && typeof entry.id === 'string' && entry.id.length > 0 && entry.id === id && entry.name === name);
+  const lines = String(text).split('\n');
+  const out = [];
+  let i = 0;
+  while (i < lines.length) {
+    if (!/^- insert:\s*$/.test(lines[i])) { out.push(lines[i++]); continue; }
+    let end = i + 1;
+    while (end < lines.length && !/^-\s/.test(lines[end]) && lines[end] !== '-') end++;
+    const body = lines.slice(i + 1, end);
+    const rows = body.map((line, index) => {
+      const match = /^(\s*)-\s+(id|name):\s*(.*)$/.exec(line);
+      return match ? { index, indent: match[1].length, key: match[2], value: match[3].trim().replace(/^['"]|['"]$/g, '') } : null;
+    }).filter(Boolean);
+    const itemIndent = rows.length ? Math.min(...rows.map((row) => row.indent)) : null;
+    if (itemIndent === null) { out.push(lines[i], ...body); i = end; continue; }
+    const starts = rows.filter((row) => row.indent === itemIndent).map((row) => row.index);
+    const kept = [];
+    for (let n = 0; n < starts.length; n++) {
+      const start = starts[n], stop = starts[n + 1] ?? body.length;
+      const chunk = body.slice(start, stop);
+      const head = rows.find((row) => row.index === start);
+      const id = head.key === 'id' ? head.value : null;
+      const name = head.key === 'name' ? head.value : chunk.map((line) => {
+        const match = new RegExp('^\\s{' + (itemIndent + 2) + '}name:\\s*(.*)$').exec(line);
+        return match ? match[1].trim().replace(/^['"]|['"]$/g, '') : null;
+      }).find(Boolean) ?? null;
+      // An entry without a module name cannot be proven Soft, so preserve its bytes.
+      if (name !== null && !owns(id, name)) continue;
+      kept.push(...chunk);
+    }
+    if (kept.length) out.push(lines[i], ...kept);
+    i = end;
+  }
+  return out.join('\n');
+}
 // dsh-mobile safe mode transaction (S2): backups and state precede atomic per-file replacement.
+// dsh-mobile safe mode transaction (S2): backups and state precede atomic per-file replacement.
+// dsh-mobile safe mode transaction (S2): backups and state precede atomic per-file replacement.
+async function safeModeOwnershipManifest(filesRoot) {
+  const readJson = async (path) => { try { return JSON.parse(await fs.readFile(path, 'utf8')) } catch { return null } };
+  const valid = (value) => value && value.schema === 2 && value.complete === true &&
+    /^[0-9a-f]{64}$/.test(value.fingerprint ?? '') && Array.isArray(value.entries) && value.entries.length > 0 &&
+    value.entries.every((entry) => entry && typeof entry.id === 'string' && entry.id.length > 0 && typeof entry.name === 'string' && entry.name.length > 0) &&
+    Array.isArray(value.profileEntries) && value.profileEntries.length > 0 &&
+    value.profileEntries.every((entry) => entry && typeof entry.id === 'string' && typeof entry.name === 'string' &&
+      value.entries.some((hard) => hard.id === entry.id && hard.name === entry.name));
+  const cache = await readJson(join(filesRoot, '.plugin-hard-manifest.json'));
+  const installed = (await fs.readFile(join(filesRoot, '.snapshot-fingerprint'), 'utf8')).trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(installed) || !valid(cache)) throw new Error('ownership cache/fingerprint unavailable');
+  const sidecar = async (archive, base) => {
+    if (!/^[0-9a-f]{64}$/.test(archive ?? '') || !/^[0-9a-f]{64}$/.test(base ?? '')) return null;
+    const value = await readJson(join(filesRoot, `.plugin-hard-manifest-online-${archive}.json`));
+    return valid(value) && value.fingerprint === archive && value.baseFingerprint === base ? value : null;
+  };
+  const markerPath = join(filesRoot, '.snapshot-transaction');
+  let marker = null;
+  try {
+    const fields = Object.fromEntries((await fs.readFile(markerPath, 'utf8')).split(/\r?\n/)
+      .map((line) => { const at = line.indexOf('='); return at > 0 ? [line.slice(0, at), line.slice(at + 1)] : null }).filter(Boolean));
+    marker = fields;
+  } catch { /* no transaction marker */ }
+  if (marker) {
+    const purpose = marker.purpose || 'FACTORY'; // Legacy markers omitted purpose and mean FACTORY.
+    if (!['STAGED', 'SWAPPING', 'SWAPPED', 'ONLINE_COMMITTED'].includes(marker.phase) ||
+      !['FACTORY', 'ONLINE_UPDATE'].includes(purpose) || marker.phase === 'SWAPPING' ||
+      (marker.phase === 'ONLINE_COMMITTED' && purpose !== 'ONLINE_UPDATE')) {
+      throw new Error('snapshot transaction marker is unknown or incomplete');
+    }
+    if (purpose === 'ONLINE_UPDATE') {
+      const base = (marker.baseFingerprint ?? '').toLowerCase();
+      const cacheBase = (cache.baseFingerprint || cache.fingerprint).toLowerCase();
+      if (!/^[0-9a-f]{64}$/.test(base) || cacheBase !== base) throw new Error('online base ownership does not match');
+      if (marker.phase === 'SWAPPED' || marker.phase === 'ONLINE_COMMITTED') {
+        const selected = await sidecar((marker.fingerprint ?? '').toLowerCase(), base);
+        if (selected) return selected;
+        throw new Error('online ownership sidecar missing');
+      }
+      if (marker.phase === 'STAGED') {
+        const prior = (marker.priorFingerprint || installed).toLowerCase();
+        if (prior !== base) {
+          const selected = await sidecar(prior, base);
+          if (selected) return selected;
+          throw new Error('prior online ownership sidecar missing');
+        }
+        if (cache.fingerprint === prior) return cache;
+        throw new Error('staged base ownership unavailable');
+      }
+      throw new Error('unknown online transaction phase');
+    }
+  }
+  try {
+    const fields = Object.fromEntries((await fs.readFile(join(filesRoot, '.online-snapshot'), 'utf8')).split(/\r?\n/)
+      .map((line) => { const at = line.indexOf('='); return at > 0 ? [line.slice(0, at), line.slice(at + 1)] : null }).filter(Boolean));
+    const base = (fields.base ?? '').toLowerCase(), archive = (fields.archive ?? '').toLowerCase();
+    const cacheBase = (cache.baseFingerprint || cache.fingerprint).toLowerCase();
+    if (archive === installed && base === cacheBase) {
+      const selected = await sidecar(archive, base);
+      if (selected) return selected;
+      throw new Error('committed online ownership sidecar missing');
+    }
+  } catch (error) {
+    if (String(error?.message ?? error).includes('sidecar missing')) throw error;
+  }
+  if (cache.fingerprint !== installed) throw new Error('cached ownership belongs to another snapshot');
+  return cache;
+}
 function safeModeSha256(bytes) {
   return createHash('sha256').update(bytes).digest('hex');
 }
@@ -1002,8 +1110,8 @@ async function safeModeBackupPath(cfg, value, id, prefix, suffix = '.yml') {
     const candidate = resolve(value);
     const expectedName = `${prefix}${id}${suffix}`;
     if (basename(candidate) !== expectedName || await fs.realpath(dirname(candidate)) !== root) return null;
-    // cfg.autoDir and the persisted backup path may both use a symlink alias.
-    // Resolve the parent first, then reject a symlink at the backup leaf itself.
+    // autoDir and stored paths may use a symlink alias; only allow that on the
+    // parent path. The backup file itself must remain a regular, non-symlink file.
     const info = await fs.lstat(candidate);
     if (!info.isFile() || info.isSymbolicLink()) return null;
     const canonical = join(root, expectedName);
@@ -1088,50 +1196,10 @@ async function safeModeSet(cfg, on, { atomicWrite = safeModeAtomicWrite } = {}) 
     } catch (error) {
       return { ok: false, error: t('safe.err.backupWrite', { backup }) + ` (${String(error?.message ?? error)})` };
     }
-    // dsh-mobile safe keeps shipped plugins (S1): 只摘第三方 insert 子条目，保留我方装配的插件
-    // 与全部顶层 disable 行（与壳侧 SafeMode.kt 同口径）。原实现整份覆写成最小文件，会摘掉
-    // 12 个 @dsh-android/* 引用与 7 条 disabled（含安全关键的 client-hmr）。
-    const dshMobileSafeShippedPrefixes = ["@deepseek-ai/", "@dsh-android/"];
-    const dshMobileSafeShippedNames = ["dsh-undo-savepoint", "dshmarketplace-plugin"];
-    const dshMobileSafeIsShipped = (name) => {
-      const v = String(name ?? "").trim().replace(/^['\"]+|['\"]+$/g, "");
-      if (v === "") return false;
-      if (dshMobileSafeShippedNames.includes(v)) return true;
-      return dshMobileSafeShippedPrefixes.some((p) => v.startsWith(p));
-    };
-    const dshMobileSafeFilterInserts = (text) => {
-      const lines = String(text).split("\n");
-      const out = [];
-      let i = 0;
-      while (i < lines.length) {
-        if (!/^- insert:\s*$/.test(lines[i])) { out.push(lines[i]); i += 1; continue; }
-        let end = i + 1;
-        while (end < lines.length && !/^-/.test(lines[end])) end += 1;
-        const body = lines.slice(i + 1, end);
-        const firstItem = body.find((l) => /^(\s*)-\s+(id|name):/.test(l));
-        const itemIndent = firstItem ? firstItem.length - firstItem.replace(/^\s+/, "").length : null;
-        if (itemIndent === null) { out.push(lines[i]); out.push(...body); i = end; continue; }
-        // 按缩进切子条目块
-        const chunks = [];
-        let cur = null;
-        for (const line of body) {
-          const m = /^(\s*)-\s+/.exec(line);
-          if (m && m[1].length === itemIndent) { if (cur) chunks.push(cur); cur = [line]; }
-          else if (cur) cur.push(line);
-        }
-        if (cur) chunks.push(cur);
-        const kept = [];
-        for (const chunk of chunks) {
-          const nm = /^\s*-?\s*name:\s*['\"]?([^'\"\s]+)/m.exec(chunk.join("\n"));
-          if (nm && !dshMobileSafeIsShipped(nm[1])) continue; // 第三方：整条摘掉
-          kept.push(...chunk);
-        }
-        if (kept.length === 0) { i = end; continue; } // 空 insert 会让引擎 boot 抛
-        out.push(lines[i]); out.push(...kept); i = end;
-      }
-      return out.join("\n");
-    };
-    const minimal = dshMobileSafeFilterInserts(patchBytes.toString('utf8'));
+    // dsh-mobile safe mode transaction (S2): require final-snapshot ownership identities.
+    const filesRoot = dirname(dirname(DSH_HOME));
+    const hardManifest = await safeModeOwnershipManifest(filesRoot);
+    const minimal = safeModeFilterInserts(patchBytes.toString('utf8'), hardManifest.entries);
     const state = {
       active: true, enteredAt: new Date().toISOString(), backup, snapshotId: snap.id,
       backupSha256: safeModeSha256(patchBytes),

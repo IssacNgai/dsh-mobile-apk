@@ -88,9 +88,9 @@
     {
       "id": "undo-safe-align-S1",
       "target": "dsh-undo-savepoint/lib/core.mjs",
-      "summary": "safe 生成逻辑对齐壳侧 SafeMode.kt：只摘第三方 insert 子条目，保留我方装配的插件（@deepseek-ai/*、@dsh-android/* 及两个具名插件）与全部顶层 disable 行",
+      "summary": "safe 生成逻辑使用最终快照的 exact entry id/name 权属：只隔离无法匹配工厂身份的 insert 子条目，保留用户源码、unknown fields 与全部顶层 disable 行",
       "provenance": "2026-09-26 追版 0.4.9；用户口径「undo 要确保保留我们自己的插件」。上游 safeModeSet 原把 cordis.patch.yml 整份覆写成只含一条 insert 的最小文件，实测会摘掉 12 个 @dsh-android/* 引用与 7 条 disabled: true（含安全关键的 client-hmr，会重开 /plugins/events 无鉴权 SSE）",
-      "marker": "dsh-mobile safe keeps shipped plugins (S1)"
+      "marker": "dsh-mobile safe ownership identity v2"
     },
     {
       "id": "undo-safe-transaction-S2",

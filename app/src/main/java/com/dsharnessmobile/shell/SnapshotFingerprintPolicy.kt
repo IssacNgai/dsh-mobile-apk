@@ -20,4 +20,21 @@ internal object SnapshotFingerprintPolicy {
   fun fresh(nodeExists: Boolean, bundled: Bundled, committed: String?): Boolean =
     nodeExists && bundled.fingerprint != null &&
       committed?.trim()?.lowercase(java.util.Locale.ROOT) == bundled.fingerprint
+
+  /** Online runtime archives remain fresh for the APK snapshot against which they were installed. */
+  fun onlineFresh(
+    nodeExists: Boolean,
+    bundledFingerprint: String?,
+    committedFingerprint: String?,
+    onlineBaseFingerprint: String?,
+    onlineArchiveFingerprint: String?,
+  ): Boolean {
+    fun normalized(value: String?): String? = value?.trim()?.lowercase(java.util.Locale.ROOT)
+      ?.takeIf { Regex("[0-9a-f]{64}").matches(it) }
+    val bundled = normalized(bundledFingerprint) ?: return false
+    val committed = normalized(committedFingerprint) ?: return false
+    val base = normalized(onlineBaseFingerprint) ?: return false
+    val archive = normalized(onlineArchiveFingerprint) ?: return false
+    return nodeExists && bundled == base && committed == archive
+  }
 }

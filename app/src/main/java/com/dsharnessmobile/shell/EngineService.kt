@@ -183,6 +183,11 @@ class EngineService : Service() {
     engineManager.recoverInterruptedRefresh()
     // Recovery can wait in root/Binder/disk; never install after that wait without a new epoch check.
     if (!isEpochCurrent(epoch)) return
+    if (engineManager.snapshotRecoveryBlocksRuntime()) {
+      Log.e("dsh-engine", "startup held: snapshot recovery journal remains unresolved")
+      epoch.startupQueued.set(false)
+      return
+    }
     WatchdogV2.acquireWakeLock(this, epoch.wakeOwner)
     if (!isEpochCurrent(epoch)) { WatchdogV2.releaseWakeLock(epoch.wakeOwner); return }
     val exec = Executors.newSingleThreadScheduledExecutor()
@@ -246,6 +251,7 @@ class EngineService : Service() {
                     portOwnedByApp = engineManager.engineProcessAlive(),
                     slowOnly = WatchdogV2.lastProbeTimedOut,
                   ),
+                  engine = engineManager,
                 )
               },
               callerCurrent = { isEpochCurrent(epoch) },

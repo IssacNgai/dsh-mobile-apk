@@ -75,13 +75,13 @@ class UndoGateKnownGoodTest {
     val restoreAt = code.indexOf("listOf(\"restore\", known)")
     assertTrue("必须存在外科拔除调用", pullAt > 0)
     assertTrue("整份回滚必须排在外科拔除之后", pullAt < restoreAt)
-    assertTrue("硬清单内的插件不得被拔（我们自己插的强制保留）", code.contains("failed.name !in hard"))
+    assertTrue("失败插件必须按权威Hard exact id/name清单判归属", code.contains("!hard.owns(failed.id, failed.name)"))
     assertTrue("清单变了又点不出名时不得回滚", code.contains("aborted mount-changed-and-unattributed") &&
       code.contains("PluginMounts.mountUnchangedSinceHealthy(context, patch)"))
     assertTrue("拔不动的名单要落探针（不许静默）", code.contains("pull failed (block not located) plugin="))
     // 两份清单必须在「壳侧确认健康」那一拍维护
-    assertTrue("硬清单按安装指纹并入", code.contains("PluginMounts.ensureHard(context, patch, fp)"))
-    assertTrue("软清单只在清单变化时写", code.contains("PluginMounts.noteHealthy(context, patch)"))
+    assertTrue("硬清单按当前安装指纹选择", code.contains("PluginMounts.ensureHard(context, installFingerprint(context))"))
+    assertTrue("软清单按spawn与完整健康证据推进", code.contains("PluginMounts.noteHealthy(context, patch, launchId, complete)"))
   }
 
   @Test

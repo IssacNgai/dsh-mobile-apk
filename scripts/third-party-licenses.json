@@ -12,7 +12,6 @@
     "busybox": "GPL-2.0",
     "bzip2": "BSD-2-Clause",
     "ca-certificates": "MPL-2.0",
-    "c-ares": "MIT",
     "coreutils": "GPL-3.0+",
     "curl": "MIT",
     "dash": "BSD-style (dash)",
@@ -44,7 +43,6 @@
     "libffi": "MIT",
     "libgmp": "GPL-2.0+/GPL-3.0+/LGPL-3.0+",
     "libiconv": "LGPL-2.1+",
-    "libicu": "custom",
     "liblz4": "BSD-2-Clause",
     "liblzma": "PD + LGPL-2.1+ + GPL-2.0+",
     "libmd": "BSD-2-Clause",
@@ -60,7 +58,6 @@
     "libyaml": "MIT",
     "ncurses": "MIT",
     "ncurses-ui-libs": "MIT",
-    "nodejs-lts": "MIT",
     "openssl": "Apache-2.0",
     "openssl-tool": "Apache-2.0",
     "pcre2": "BSD-3-Clause",
@@ -70,7 +67,6 @@
     "python": "PSF-2.0",
     "python-pip": "MIT",
     "readline": "GPL-3.0+",
-    "resolv-conf": "Public Domain",
     "ripgrep": "MIT",
     "ruby": "GPL-2.0+ / Ruby-1.8",
     "sed": "GPL-3.0+",
@@ -91,5 +87,29 @@
     "zsh": "MIT-style (zsh)",
     "zstd": "BSD-3-Clause"
   },
-  "copyleftFamilies": ["GPL-1.0+", "GPL-2.0", "GPL-2.0+", "GPL-3.0+", "LGPL-2.1+", "LGPL-3.0+"]
+  "copyleftFamilies": [
+    "GPL-1.0+",
+    "GPL-2.0",
+    "GPL-2.0+",
+    "GPL-3.0+",
+    "LGPL-2.1+",
+    "LGPL-3.0+"
+  ],
+  "androidComponents": [
+    {
+      "group": "dev.rikka.shizuku",
+      "artifacts": [
+        "api",
+        "provider",
+        "aidl",
+        "shared"
+      ],
+      "version": "13.1.5",
+      "license": "MIT",
+      "licenseText": "Shizuku-API-MIT.txt",
+      "licenseSha256": "64870037f294b6f2b75c8ebe77cc0702acb3b64f86b4b0e58bf8558525303686",
+      "source": "https://github.com/RikkaApps/Shizuku-API",
+      "licenseSource": "https://github.com/RikkaApps/Shizuku-API/blob/master/LICENSE"
+    }
+  ]
 }

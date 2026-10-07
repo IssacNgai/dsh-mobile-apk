@@ -30,6 +30,11 @@ test('shared terminal engine installs snapshot and fingerprint, builds, then cop
   const runner = (command, args, options) => {
     calls.push({ command, args, options })
     if (args[0]?.endsWith('check-snapshot-fingerprint.mjs')) return { status: 0 }
+    if (args[0]?.endsWith('build-hard-manifest.mjs')) {
+      const out = args[args.indexOf('--out') + 1]
+      writeFileSync(out, JSON.stringify({ schema: 1, complete: true, fingerprint: 'fixture', entries: [{ id: 'factory', name: 'factory-plugin' }] }))
+      return { status: 0 }
+    }
     assert.equal(command, process.platform === 'win32' ? 'gradlew.bat' : './gradlew')
     assert.deepEqual(args, [':app:assembleDebug', '--no-daemon', '-PversionNameSuffix=-preview'])
     const built = join(f.apkDir, 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk')
@@ -54,13 +59,19 @@ test('shared terminal engine installs snapshot and fingerprint, builds, then cop
   assert.equal(readFileSync(join(f.apkDir, 'app', 'src', 'main', 'assets', 'snapshot.sha256'), 'utf8'),
     createHash('sha256').update(readFileSync(f.snapshot)).digest('hex'))
   assert.equal(readFileSync(result).toString(), 'signed-test-apk')
+  assert.ok(existsSync(join(f.apkDir, 'app', 'src', 'main', 'assets', 'plugin-hard-manifest.json')))
   assert.equal(existsSync(oldIntermediates), false)
-  assert.equal(calls.length, 2)
-  assert.deepEqual(calls[0].args.slice(-1), ['--require'])
+  assert.equal(calls.length, 3)
+  assert.equal(calls[0].args[0].endsWith('build-hard-manifest.mjs'), true)
+  assert.equal(calls[0].args[calls[0].args.indexOf('--snapshot') + 1], resolve(f.snapshot))
+  assert.equal(calls[0].args[calls[0].args.indexOf('--out') + 1], join(f.apkDir, 'app', 'src', 'main', 'assets', 'plugin-hard-manifest.json'))
   assert.equal(calls[0].options.cwd, resolve(fileURLToPath(new URL('.', import.meta.url))))
-  assert.equal(calls[0].options.shell, false, 'Node gates execute directly so Windows paths with spaces remain intact')
-  assert.equal(calls[1].options.cwd, resolve(f.apkDir))
-  assert.equal(calls[1].options.shell, process.platform === 'win32')
+  assert.equal(calls[0].options.shell, false, 'Node build hooks execute directly on Windows')
+  assert.deepEqual(calls[1].args.slice(-1), ['--require'])
+  assert.equal(calls[1].options.cwd, resolve(fileURLToPath(new URL('.', import.meta.url))))
+  assert.equal(calls[1].options.shell, false)
+  assert.equal(calls[2].options.cwd, resolve(f.apkDir))
+  assert.equal(calls[2].options.shell, process.platform === 'win32')
 })
 
 test('fingerprint rejection stops before Gradle and a Gradle failure does not copy an artifact', (t) => {
@@ -71,6 +82,7 @@ test('fingerprint rejection stops before Gradle and a Gradle failure does not co
     artifactName: 'failed.apk', fingerprintGate: '/tools/check-snapshot-fingerprint.mjs', log() {},
   }, (command, args) => {
     if (args[0]?.endsWith('check-snapshot-fingerprint.mjs')) return { status: 1 }
+    if (args[0]?.endsWith('build-hard-manifest.mjs')) return { status: 0 }
     gradleCalls += 1
     return { status: 0 }
   }), /failed \(1\)/)
@@ -79,7 +91,8 @@ test('fingerprint rejection stops before Gradle and a Gradle failure does not co
   assert.throws(() => assembleApk({
     snapshot: f.snapshot, apkDir: f.apkDir, outputDir: f.outputDir,
     artifactName: 'failed.apk', fingerprintGate: '/tools/check-snapshot-fingerprint.mjs', log() {},
-  }, (command, args) => args[0]?.endsWith('check-snapshot-fingerprint.mjs') ? { status: 0 } : { status: 7 }), /failed \(7\)/)
+  }, (command, args) => args[0]?.endsWith('check-snapshot-fingerprint.mjs') ? { status: 0 }
+    : args[0]?.endsWith('build-hard-manifest.mjs') ? { status: 0 } : { status: 7 }), /failed \(7\)/)
   assert.equal(existsSync(join(f.outputDir, 'failed.apk')), false)
 })
 
@@ -93,6 +106,7 @@ test('release mode preserves existing intermediates when clean is not requested'
     artifactName: 'release-arm64-v8a.apk', suffix: '', gradleCommand: 'custom-gradle', log() {},
   }, (command, args) => {
     if (args[0]?.endsWith('check-snapshot-fingerprint.mjs')) return { status: 0 }
+    if (args[0]?.endsWith('build-hard-manifest.mjs')) return { status: 0 }
     assert.equal(command, 'custom-gradle')
     const built = join(f.apkDir, 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk')
     mkdirSync(join(built, '..'), { recursive: true })

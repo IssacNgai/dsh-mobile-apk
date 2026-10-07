@@ -1,5 +1,7 @@
 package com.dsharnessmobile.shell
 
+import org.json.JSONArray
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -18,6 +20,39 @@ import org.junit.Test
  * 判据全部抽成 [EngineProbe] 内的纯函数，故本测试不依赖设备/网络。
  */
 class EngineProbeTest {
+
+  @Test
+  fun `Soft完整健康要求Hard fibers preset fibers session和modelCatalog`() {
+    val hard = PluginMounts.HardManifest("a".repeat(64), setOf(
+      PluginMounts.HardEntry("factory", "@product/core"),
+      PluginMounts.HardEntry("factory-optional-disabled", "@product/optional-disabled"),
+    ))
+    val enabledHard = JSONObject().put("entryId", "factory").put("moduleName", "@product/core")
+      .put("enabled", true).put("fiberPhase", "active")
+    val disabledHard = JSONObject().put("entryId", "factory-optional-disabled")
+      .put("moduleName", "@product/optional-disabled").put("enabled", false).put("fiberPhase", JSONObject.NULL)
+    val presetFiber = JSONObject().put("entryId", "model-tool").put("moduleName", "@product/model-tool")
+      .put("enabled", true).put("fiberPhase", "active")
+    val inventoryValue = JSONObject().put("entries", JSONArray().put(enabledHard).put(disabledHard))
+      .put("agentPresets", JSONArray().put(JSONObject().put("id", "default").put("rows", JSONArray().put(presetFiber))))
+    val inventory = JSONObject().put("result", JSONObject().put("value", inventoryValue))
+    val sessions = JSONObject().put("result", JSONObject().put("value", JSONObject().put("items", JSONArray())))
+    val catalog = JSONObject().put("result", JSONObject().put("value", JSONObject()
+      .put("default", JSONObject().put("provider", "local").put("model", "model-a"))
+      .put("routableProviders", JSONArray().put("local")).put("groups", JSONArray()).put("failures", JSONArray())))
+
+    assertTrue(EngineProbe.completeSoftHealthEvidence(inventory, sessions, catalog, hard))
+    assertFalse("preset pending fiber must keep digest Candidate", EngineProbe.completeSoftHealthEvidence(
+      JSONObject(inventory.toString().replace("active", "pending")), sessions, catalog, hard,
+    ))
+    assertFalse("missing modelCatalog response must not be treated as healthy", EngineProbe.completeSoftHealthEvidence(
+      inventory, sessions, JSONObject(), hard,
+    ))
+    val missingHard = JSONObject(inventory.toString().replace("factory-optional-disabled", "changed-id"))
+    assertFalse("disabled factory identity must still be present in Cordis inventory", EngineProbe.completeSoftHealthEvidence(
+      missingHard, sessions, catalog, hard,
+    ))
+  }
 
   // ── (a) 可用性四态 ──────────────────────────────────────────────────────────
 

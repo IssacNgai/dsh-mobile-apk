@@ -3,6 +3,7 @@ package com.dsharnessmobile.shell
 import android.content.Context
 import android.util.Log
 import java.io.File
+import org.json.JSONObject
 
 /**
  * 崩溃自动回退（PRD F3 / D6 方案 a）：壳侧「undo 全自动」闸门。
@@ -16,8 +17,8 @@ import java.io.File
  * - 本类：配置/插件代码回退（dsh-undo-savepoint 快照，F3 主引擎）
  *
  * 幂等约束：
- * - 每个「崩溃纪元」只自动执行一次（.undo-auto-done 标记 + 时间戳），
- *   成功回滚后进入重试抑制窗；
+ * - `.undo-auto-done` 记录成功回滚前冻结的安装指纹与失败 patch digest；
+ *   仅同一身份在 30 分钟内受抑制，新身份重新观察；
  * - 仅在急救 CLI 存在快照时执行（list 非空）；
  * - 仅在引擎确实无法启动时触发（不误伤正常慢启动）。
  */
@@ -98,6 +99,7 @@ object UndoGate {
     context: Context,
     consecutiveFailures: Int,
     evidence: RollbackEvidence = RollbackEvidence.NONE,
+    engine: EngineManager? = null,
   ): Boolean {
     val now = System.currentTimeMillis()
     val refusal = rollbackEvidenceRefusal(evidence)
@@ -111,13 +113,23 @@ object UndoGate {
       return false
     }
     evidenceNoted = false
-    return when (decide(consecutiveFailures, now, lastUndoAt(context), armedAt(context))) {
+    val retryIdentity = currentRetryIdentity(context, engine)
+    val retry = retrySuppression(markerFile(context), retryIdentity, now)
+    if (retry.resetWatch) {
+      runCatching { armFile(context).delete() }
+      record(context, "retry epoch changed; observation window restarted")
+    }
+    if (retry.legacyMarker && consecutiveFailures >= TRIGGER_CONSEC_FAILURES && !suppressNoted) {
+      suppressNoted = true
+      record(context, "legacy undo marker conservatively suppresses until retry window expires")
+    }
+    return when (decide(consecutiveFailures, now, retry.atMs, armedAt(context))) {
       GateDecision.IDLE -> false
       GateDecision.SUPPRESS -> {
         // 只记一次：重试窗口内每 5s 一拍，逐拍落盘会刷爆观测文件（真实原因由 .undo-auto-done 承载）。
         if (!suppressNoted) {
           suppressNoted = true
-          record(context, "suppressed retry-window failures=" + consecutiveFailures + " lastUndoAt=" + lastUndoAt(context))
+          record(context, "suppressed retry-window failures=" + consecutiveFailures + " lastUndoAt=" + retry.atMs)
         }
         false
       }
@@ -162,9 +174,11 @@ object UndoGate {
    * @param detail 失败原文/原因短句（进观测面，供设备侧归因；不参与判定）
    * @return true = 现在就执行回滚；false = 距上次成功回滚不足 [RETRY_WINDOW_MS]，防循环抑制
    */
-  fun onClientPluginTreeFailure(context: Context, detail: String): Boolean {
+  fun onClientPluginTreeFailure(context: Context, detail: String, engine: EngineManager? = null): Boolean {
     val now = System.currentTimeMillis()
-    val decision = decide(TRIGGER_CONSEC_FAILURES, now, lastUndoAt(context), armedAt(context))
+    val retry = retrySuppression(markerFile(context), currentRetryIdentity(context, engine), now)
+    if (retry.resetWatch) runCatching { armFile(context).delete() }
+    val decision = decide(TRIGGER_CONSEC_FAILURES, now, retry.atMs, armedAt(context))
     record(context, "client-plugin-tree-failed decision=" + decision + " detail=" + detail.take(160).replace('\n', ' '))
     return clientPluginFailureDecision(decision)
   }
@@ -216,6 +230,28 @@ object UndoGate {
 
   /** [decide] 的取值域。 */
   internal enum class GateDecision { IDLE, ARM, WAIT, SUPPRESS, EXECUTE }
+
+  internal data class RetryIdentity(val installFingerprint: String, val patchDigest: String)
+  internal data class RetrySuppression(val atMs: Long?, val legacyMarker: Boolean, val resetWatch: Boolean = false)
+
+  internal fun retrySuppression(fileText: String?, identity: RetryIdentity, nowMs: Long): RetrySuppression {
+    if (fileText.isNullOrBlank()) return RetrySuppression(null, false)
+    val raw = fileText.trim()
+    val legacy = raw.toLongOrNull()
+    if (legacy != null) {
+      val active = nowMs >= legacy && nowMs - legacy < RETRY_WINDOW_MS
+      return RetrySuppression(legacy.takeIf { active }, true, resetWatch = !active)
+    }
+    return try {
+      val value = JSONObject(raw)
+      val at = value.optLong("at", 0L)
+      val matches = value.optInt("schema", 0) == 2 &&
+        value.optString("installFingerprint") == identity.installFingerprint &&
+        value.optString("patchDigest") == identity.patchDigest
+      val active = matches && at > 0L && nowMs >= at && nowMs - at < RETRY_WINDOW_MS
+      RetrySuppression(at.takeIf { active }, false, resetWatch = !active)
+    } catch (_: Throwable) { RetrySuppression(null, false, resetWatch = true) }
+  }
 
   // ── 可观测性（0.14.1）：不受 DevLogPrefs 闸门的独立落盘 ─────────────────────
   //
@@ -278,14 +314,23 @@ object UndoGate {
   fun noteHealthy(context: Context, engine: EngineManager) {
     val fp = installFingerprint(context)
     val patch = PluginMounts.patchFile(engine)
-    // 清单式回滚的两份清单都在这里维护（与「已知良好」同一时刻：**壳侧确认健康的那一拍**）：
-    //  - 硬清单：安装指纹变化（新装/升级）即把本版本自带的插件并进去（只增不减，绝不被拔）
-    //  - 软清单：只在挂载清单**有变化**时写（没变化直接跳过），它回答「故障是不是清单变化引起的」
-    if (PluginMounts.ensureHard(context, patch, fp)) {
-      record(context, "hard-manifest updated names=" + PluginMounts.hardNames(context).size + " fp=" + (fp?.take(12) ?: "none"))
-    }
-    if (PluginMounts.noteHealthy(context, patch)) {
-      record(context, "soft-manifest updated names=" + (PluginMounts.softNames(context)?.size ?: 0))
+    // Hard ownership is packaged from the final snapshot composition. Live patch entries are user-editable
+    // and must never be promoted to product-owned merely because the install fingerprint changed.
+    val hard = PluginMounts.ensureHard(context, fp)
+    if (hard == null) {
+      record(context, "hard-manifest unavailable; ownership actions fail closed fp=" + (fp?.take(12) ?: "none"))
+    } else {
+      val launchId = EngineManager.lastStartAttemptAt
+      if (PluginMounts.shouldProbeHealth(context, patch, launchId)) {
+        val complete = EngineProbe.completeSoftHealth(context, hard)
+        if (PluginMounts.noteHealthy(context, patch, launchId, complete)) {
+          record(context, "soft-manifest stable after two healthy engine launches " + PluginMounts.softStateSummary(context, patch))
+        } else if (complete) {
+          record(context, "soft-manifest candidate observed launch=" + launchId + " " + PluginMounts.softStateSummary(context, patch))
+        } else if (!complete) {
+          record(context, "soft-manifest candidate not confirmed: complete Cordis/API health unavailable launch=" + launchId)
+        }
+      }
     }
     val id = newestSnapshotId(autoSnapshotIds(engine)) ?: return
     // 无安装指纹就不记：没有指纹就无法回答「这份快照属于哪次安装」，而跨版本的配置回滚正是要禁止的
@@ -364,6 +409,8 @@ object UndoGate {
   ): UndoResult {
     if (!autoUndoRunning.compareAndSet(false, true)) return UndoResult(false, "自动回撤已在执行", null)
     try {
+      // Freeze the failing runtime/config identity before any surgical isolation or whole-patch restore.
+      val failedIdentity = currentRetryIdentity(context, engine)
       val dsh = File(engine.homeDir, ".dsh")
       val cli = File(context.filesDir, "undo-emergency.mjs")
       if (!cli.exists()) {
@@ -396,8 +443,12 @@ object UndoGate {
       // 比页面侧文本可靠；两者都不成立时行为与改动前一字不差（failed == null，继续走整份
       // 回滚或如实拒绝）。
       val failed = PluginMounts.failedEntryOf(PluginMounts.readEngineLogTail(context)) ?: clientFailure
-      val hard = PluginMounts.hardNames(context)
-      if (failed != null && failed.name != null && failed.name !in hard) {
+      val hard = PluginMounts.ensureHard(context, installFingerprint(context))
+      if (hard == null) {
+        record(context, "aborted ownership-unverified; no plugin isolation or rollback")
+        return UndoResult(false, "插件归属清单缺失或与当前快照不匹配：未自动隔离或回滚，用户配置保持原样", null)
+      }
+      if (failed != null && failed.name != null && !hard.owns(failed.id, failed.name)) {
         if (PluginMounts.pull(context, patch, failed)) {
           record(context, "pulled plugin=" + failed.name + " id=" + (failed.id ?: "?"))
           return UndoResult(true, "已从装配里拔出失败插件（其余插件未改动）：" + failed.name, failed.name)
@@ -431,7 +482,7 @@ object UndoGate {
       val ok = out.any { it.contains("完成：还原") }
       val summary = out.joinToString("\n")
       if (ok) {
-        markerFile(context).writeText(System.currentTimeMillis().toString())
+        writeRetryMarker(context, failedIdentity, System.currentTimeMillis())
         record(context, "executed ok snapshot=" + (restoreTarget(out) ?: known) + " via=known-good")
       } else {
         Log.e(TAG, "auto-undo failed: " + summary)
@@ -518,12 +569,42 @@ object UndoGate {
   private fun markerFile(context: Context) = File(context.filesDir, ".undo-auto-done")
   private fun armFile(context: Context) = File(context.filesDir, ".undo-auto-armed")
 
+  private fun currentRetryIdentity(context: Context, engine: EngineManager?): RetryIdentity {
+    val install = runCatching { installFingerprint(context)?.lowercase(java.util.Locale.ROOT) }.getOrNull() ?: "unavailable"
+    val patchDigest = engine?.let { manager ->
+      runCatching { PluginMounts.digest(PluginMounts.patchFile(manager).readText()) }.getOrNull()
+    } ?: "unavailable"
+    return RetryIdentity(install, patchDigest)
+  }
+
+  private fun writeRetryMarker(context: Context, identity: RetryIdentity, atMs: Long) {
+    val target = markerFile(context)
+    val parent = target.absoluteFile.parentFile ?: return
+    val temp = File.createTempFile(".undo-auto-done-", ".tmp", parent)
+    try {
+      temp.writeText(JSONObject().put("schema", 2).put("at", atMs)
+        .put("installFingerprint", identity.installFingerprint)
+        .put("patchDigest", identity.patchDigest).toString())
+      java.nio.file.Files.move(temp.toPath(), target.toPath(), java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+        java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+    } catch (t: Throwable) {
+      record(context, "retry-marker write failed: " + (t.message ?: t.javaClass.simpleName))
+    } finally { if (temp.exists()) temp.delete() }
+  }
+
+  /** Called only by an explicit user-requested engine restart; automatic retries keep the guard. */
+  fun clearRetryEpochForUserRestart(context: Context) {
+    runCatching { markerFile(context).delete() }
+    runCatching { armFile(context).delete() }
+    suppressNoted = false
+  }
+
   /** 壳侧确认过健康的那份快照 id（[noteHealthy] 写、[execute] 读）。 */
   private fun knownGoodFile(context: Context) = File(context.filesDir, ".undo-known-good")
 
-  /** 上次自动 undo 时间（毫秒）；从未执行返回 null。 */
-  private fun lastUndoAt(context: Context): Long? =
-    markerFile(context).takeIf { it.exists() }?.readText()?.trim()?.toLongOrNull()
+  private fun retrySuppression(marker: File, identity: RetryIdentity, nowMs: Long): RetrySuppression = try {
+    if (marker.isFile) retrySuppression(marker.readText(), identity, nowMs) else RetrySuppression(null, false)
+  } catch (_: Throwable) { RetrySuppression(null, false) }
 
   data class UndoResult(val executed: Boolean, val summary: String, val snapshotId: String?)
 }

@@ -10,19 +10,14 @@ import java.security.MessageDigest
  * 启动失败页「安全模式启动」的状态机（缺陷 D / fx-2）。
  *
  * ── 它和 `undo-emergency.mjs safe-mode` 是什么关系 ────────────────────────────
- * 同一个状态文件、同一套备份命名（`<autoDir>/safe-mode.json`、`autoDir/safe-mode-backup-<id>.yml` …），
- * 所以壳内按钮与离线 CLI 看到的是**同一份状态**，不会各说各话。差别只在策略：
- *  - 离线 CLI（vendor 插件同款）把装配最小化成**只剩 undo 一条**；
- *  - 本状态机按用户口径**保留我们自己的插件**——只摘掉第三方插件条目。
- * 用户原话要的是「以 safe 状态运行」且「确保保留我们自己的插件」，
- * 「只剩 undo」会把手机操控/虚拟屏/模型能力一起摘掉，那是把可用性也一起修没了，故不采用。
+ * 壳内入口、离线 CLI 与 vendor 插件共享状态文件和备份命名。所有入口都按 fingerprint-bound
+ * exact `{id,name}` Hard manifest 保留产品装配项，并只隔离第三方 insert entries。
  *
  * ── 摘谁、留谁（判据故意保守）────────────────────────────────────────────────
- * 只动 `- insert:` 组里的**子条目**，且只摘掉 `name:` 不属于产品白名单的那些。
+ * 只动 `- insert:` 组里的**子条目**，且只摘掉不属于当前 Hard manifest 的那些。
  * 组外的一切（上游行禁用位、config-only 条、llm-pi-ai 的用户 providers）**一字不动**——
  * 它们不是「插件」，动它们等于改语义而不是降风险。
- * 白名单与 `scripts/patches/apply-patches.mjs` 的 `DSH_MOBILE_SHIPPED_PLUGIN_*` 同源
- * （该文件自述「名单就是『谁算我们自己的插件』的单一真源」）。
+ * 归属只来自构建期 Hard asset，资产的精确 profile entries 与 snapshot fingerprint 一起校验。
  *
  * ── 边界（如实写清，不假装能治百病）──────────────────────────────────────────
  * 安全模式只摘**第三方插件的装配条目**；它不修我们自己的插件坏掉、不修快照损坏、
@@ -41,49 +36,35 @@ internal object SafeMode {
   const val STATE_FILE = "safe-mode.json"
 
   /**
-   * 产品自有插件的白名单（与 `scripts/patches/apply-patches.mjs` 的
-   * `DSH_MOBILE_SHIPPED_PLUGIN_PREFIXES` / `DSH_MOBILE_SHIPPED_PLUGIN_NAMES` 同口径）。
-   *
-   * 为什么在 Kotlin 里复述一遍而不是去读那个 .mjs：那个文件在 assets 之外、随补丁脚本分发，
-   * 引擎侧的 `PluginMounts`/`FactoryProfilePatch` 同样各自持有本仓口径的常量副本——
-   * 这是既有约定。漂移由 `SafeModeTest.productWhitelistMatchesThePatchScriptSource` 钉住
-   * （它按源码文本解析那两行，两边不一致即判红）。
+  * Legacy source-contract placeholders. Production ownership never uses these values; it comes from
+  * the fingerprint-bound `HardManifest` passed to the transaction.
    */
-  internal val SHIPPED_PREFIXES = listOf("@dsh-android/")
-  internal val SHIPPED_NAMES = listOf("dsh-undo-savepoint", "dshmarketplace-plugin")
+  internal val SHIPPED_NAMES = emptyList<String>()
+  internal val SHIPPED_PREFIXES = emptyList<String>()
 
-  /** 某个包名是否属于产品自有插件（**静态名单**口径，仅作 manifest 缺席时的回退）。 */
+  /** Package names alone never prove that an entry belongs to this product. */
   internal fun isShippedPackage(name: String): Boolean {
     val v = name.trim().trim('\'', '"')
     if (v.isEmpty()) return false
-    if (SHIPPED_PREFIXES.any { v.startsWith(it) }) return true
-    return SHIPPED_NAMES.contains(v)
+    return false
   }
 
   /**
-   * 归属判定的**权威口径**：本版本实际装配的条目清单（[PluginMounts.hardNames]）优先。
+   * Ownership is established only by the exact `{id,name}` manifest packaged for this snapshot.
    *
    * 0.14.5（D-1(c)，与 G3 同源缺陷第二次出现）：原先只用 `SHIPPED_PREFIXES` 的 `@deepseek-ai/`
    * 前缀判归属。**包名前缀只说明谁发布的，不说明谁装配的**——用户完全可以自己挂一个官方包
    * （实测 `@deepseek-ai/dsh-mcp-client`）。按前缀判会把**用户的合法扩展**当成产品自有条目**保留**，
    * 于是 Safe Mode 的「不加载 Soft」目标对它失效。
    *
-   * 这不是新发明的修法：`scripts/patches/apply-patches.mjs` 的 G3 启动隔离补丁**正是因为同一实测原因**
-   * 弃用了前缀判据、改用构建期装配清单（见该文件 `dshMobileIsShippedPlugin`）。此处与它同源——
-   * 壳侧已有等价的权威来源 [PluginMounts.hardNames]（`.plugin-hard-manifest.json`，本版本自带、只增不减）。
-   *
-   * 为什么仍保留静态名单做并集：manifest 可能尚未建立（首次启动 / `ensureHard` 之前），
-   * 那时若只认 manifest 会把**产品自有插件也摘掉**，等于把引擎拆残——风险更高。
-   * 并集是安全的：静态名单里 `@dsh-android/` 是**我们自己的命名空间**（无他人发布），
-   * 两个具名插件也是我们的；上游 `@deepseek-ai/` 前缀已从这里移除（正是误判来源）。
-   *
-   * @param hardNames 权威装配清单；空集表示不可用，回退到静态名单。
+   * Missing or invalid manifests are rejected before mutation. Names and publisher namespaces
+   * are not ownership evidence.
    */
-  internal fun isProductOwned(name: String, hardNames: Set<String>): Boolean {
+  internal fun isProductOwned(name: String, hardNames: Set<String>, hardEntries: Set<PluginMounts.HardEntry>? = null, id: String? = null): Boolean {
     val v = name.trim().trim('\'', '"')
     if (v.isEmpty()) return false
-    if (hardNames.contains(v)) return true
-    return isShippedPackage(v)
+    if (hardEntries == null || id.isNullOrEmpty()) return false
+    return hardEntries.any { it.id == id && it.name == v }
   }
 
   // ── 纯逻辑：装配清单过滤 ────────────────────────────────────────────────────
@@ -94,7 +75,7 @@ internal object SafeMode {
    * 算法（按行，不做 YAML 解析——与 `PluginMounts.removeEntry` 同风格，避免引入 YAML 依赖）：
    *  - 定位列 0 的 `- insert:` 组；
    *  - 组内子条目 = 组内**最浅缩进**的 `- ` 列表项；
-   *  - 子条目若含 `name:` 且该 name 不在白名单 → 整条（含其 config）删除；
+   *  - 子条目若含 `name:` 且 exact `{id,name}` 不在 Hard manifest → 整条（含其 config）删除；
    *  - 子条目若**没有** `name:`（例如只有 `- id: xyz`）→ **保留**（无法判定是第三方，
    *    宁可不摘也不误伤；摘错一个我们能跑的东西比漏摘一个更糟）；
    *  - 组内条目全被摘光 → 连同 `- insert:` 包装行一起删（空 insert 会让引擎 boot 抛）。
@@ -102,7 +83,7 @@ internal object SafeMode {
    * @param patchText 装配清单全文。
    * @returns 过滤后全文；无改动时与输入**逐字节相同**（调用方据此跳过写盘）。
    */
-  internal fun filterThirdPartyInserts(patchText: String, hardNames: Set<String> = emptySet()): String {
+  internal fun filterThirdPartyInserts(patchText: String, hardNames: Set<String> = emptySet(), hardEntries: Set<PluginMounts.HardEntry>? = null): String {
     val lines = patchText.split("\n").toMutableList()
     val out = ArrayList<String>(lines.size)
     var i = 0
@@ -120,7 +101,8 @@ internal object SafeMode {
       val kept = ArrayList<String>()
       for (item in insertChildChunks(body, itemIndent)) {
         val name = itemName(item.lines)
-        if (name != null && !isProductOwned(name, hardNames)) continue // 第三方条目：整条摘掉
+        val id = itemId(item.lines)
+        if (name != null && !isProductOwned(name, hardNames, hardEntries, id)) continue // 第三方条目：整条摘掉
         kept.addAll(item.lines)
       }
       if (kept.none { ITEM.containsMatchIn(it) }) {
@@ -195,9 +177,14 @@ internal object SafeMode {
     autoDir: File,
     id: String,
     atomicWrite: (File, ByteArray) -> Unit = ::replaceAtomically,
-    // 权威装配清单（[PluginMounts.hardNames]）。默认空集 = 不可用，回退静态名单（见 [isProductOwned]）。
+    // 权威装配清单（[PluginMounts.hardNames]）。缺席时拒绝开启，避免把无法识别归属的 Hard 当 Soft。
     hardNames: Set<String> = emptySet(),
+    hardManifestAvailable: Boolean = true,
+    hardEntries: Set<PluginMounts.HardEntry>? = null,
   ): Result {
+    if (!hardManifestAvailable || hardEntries.isNullOrEmpty()) {
+      return Result(false, "安全模式未生效：本版本插件归属清单缺失，无法安全区分产品插件与用户插件；原配置未改动。请先修复/重建插件清单后重试。")
+    }
     val stateFile = File(autoDir, STATE_FILE)
     if (stateFile.isFile) {
       try {
@@ -242,11 +229,11 @@ internal object SafeMode {
           .toString(2)
       ).toByteArray(Charsets.UTF_8))
       // ⑤ 最后改 patch。
-      val filtered = filterThirdPartyInserts(String(original, Charsets.UTF_8), hardNames)
+      val filtered = filterThirdPartyInserts(String(original, Charsets.UTF_8), hardNames, hardEntries)
       patch.parentFile?.mkdirs()
       atomicWrite(patch, filtered.toByteArray(Charsets.UTF_8))
       if (homeExisted) atomicWrite(homePatch, "# dsh safe mode (home level)\n[]\n".toByteArray(Charsets.UTF_8))
-      val removed = removedPluginNames(String(original, Charsets.UTF_8), hardNames)
+      val removed = removedPluginNames(String(original, Charsets.UTF_8), hardNames, hardEntries)
       Result(
         true,
         if (removed.isEmpty())
@@ -363,13 +350,14 @@ internal object SafeMode {
   }.getOrDefault(false)
 
   /** 被摘掉的第三方插件名（供回执如实报数；纯函数）。 */
-  internal fun removedPluginNames(patchText: String, hardNames: Set<String> = emptySet()): List<String> {
-    val kept = entryNamesOfInsertChildren(patchText)
-    return kept.filter { !isProductOwned(it, hardNames) }.distinct()
+  internal fun removedPluginNames(patchText: String, hardNames: Set<String> = emptySet(), hardEntries: Set<PluginMounts.HardEntry>? = null): List<String> {
+    return insertChildren(patchText).filter { row -> row.name != null && !isProductOwned(row.name, hardNames, hardEntries, row.id) }
+      .mapNotNull { it.name }.distinct()
   }
 
   /** insert 组内的一个子条目（原始行片段）。 */
   private class InsertChild(val lines: List<String>)
+  private data class InsertEntry(val id: String?, val name: String?)
 
   /**
    * 按**条目**切分 insert 组的子条目（组内最浅缩进起始，含其 config 与嵌套内容）。
@@ -400,6 +388,26 @@ internal object SafeMode {
   /** 条目的包名：取条目片段里**第一个** `name:`（条目自身的 name 行总在 config 之前）。 */
   private fun itemName(chunk: List<String>): String? =
     chunk.firstNotNullOfOrNull { NAME_KEY.find(it)?.groupValues?.get(1)?.trim('\'', '"') }
+
+  private fun itemId(chunk: List<String>): String? = chunk.firstNotNullOfOrNull {
+    Regex("""^\s*-\s+id:\s*['"]?([^'"\s]+)""").find(it)?.groupValues?.get(1)
+  }
+
+  private fun insertChildren(patchText: String): List<InsertEntry> {
+    val lines = patchText.split("\n")
+    val out = ArrayList<InsertEntry>()
+    var i = 0
+    while (i < lines.size) {
+      if (!TOP_INSERT.matches(lines[i])) { i++; continue }
+      var end = i + 1
+      while (end < lines.size && !TOP_LEVEL.matches(lines[end])) end++
+      val body = lines.subList(i + 1, end)
+      val indent = body.firstOrNull { ITEM.containsMatchIn(it) }?.indexOfFirst { !it.isWhitespace() }
+      if (indent != null) for (chunk in insertChildChunks(body, indent)) out += InsertEntry(itemId(chunk.lines), itemName(chunk.lines))
+      i = end
+    }
+    return out
+  }
 
   /** insert 组内所有子条目的 `name:`（纯函数；配置块内的显示名不计）。 */
   internal fun entryNamesOfInsertChildren(patchText: String): List<String> {

@@ -58,13 +58,31 @@ internal object SnapshotTransaction {
    */
   private const val TAG_RELINK = "dsh-snapshot-relink"
 
-  enum class Phase { STAGED, SWAPPING, SWAPPED }
+  enum class Phase { STAGED, SWAPPING, SWAPPED, ONLINE_COMMITTED, UNKNOWN }
+  enum class Purpose { FACTORY, ONLINE_UPDATE, UNKNOWN }
+
+  /** Pure admission decisions used under EngineManager's shared transaction-state lock. */
+  internal fun canBeginFactoryTransaction(factoryBusy: Boolean, onlineBusy: Boolean): Boolean =
+    !factoryBusy && !onlineBusy
+
+  internal fun canBeginOnlineTransaction(
+    factoryBusy: Boolean,
+    onlineBusy: Boolean,
+    markerPresent: Boolean,
+    previousRuntimePresent: Boolean,
+    stageResiduePresent: Boolean = false,
+  ): Boolean = !factoryBusy && !onlineBusy && !markerPresent && !previousRuntimePresent && !stageResiduePresent
 
   data class Marker(
     val phase: Phase,
     val fingerprint: String,
     val startedAt: Long,
     val moved: List<String> = emptyList(),
+    /** Missing on existing marker files: their historical meaning is factory refresh. */
+    val purpose: Purpose = Purpose.FACTORY,
+    val priorFingerprint: String = "",
+    /** Embedded APK snapshot identity authorizing any online Hard sidecar. */
+    val baseFingerprint: String = "",
   )
 
   enum class Outcome { NONE, DISCARDED_STAGE, ROLLED_BACK, ROLLED_FORWARD, ROLLBACK_FAILED }
@@ -102,6 +120,8 @@ internal object SnapshotTransaction {
     val outcome: Outcome,
     val fingerprintToCommit: String? = null,
     val failures: List<String> = emptyList(),
+    val fingerprintToRestore: String? = null,
+    val onlineUpdateCommit: Boolean = false,
   )
 
   /**
@@ -198,11 +218,14 @@ internal object SnapshotTransaction {
       file.readText()
     } catch (_: Throwable) {
       // Unreadable marker: treat it as an interrupted swap (the conservative choice).
-      return Marker(Phase.SWAPPING, "", 0L)
+      return Marker(Phase.UNKNOWN, "", 0L, purpose = Purpose.UNKNOWN)
     }
     var phase: Phase? = null
     var fingerprint = ""
     var startedAt = 0L
+    var purpose = Purpose.FACTORY
+    var priorFingerprint = ""
+    var baseFingerprint = ""
     val moved = mutableListOf<String>()
     text.lineSequence().forEach { line ->
       val separator = line.indexOf('=')
@@ -215,12 +238,16 @@ internal object SnapshotTransaction {
         }
         "fingerprint" -> fingerprint = line.substring(separator + 1)
         "started" -> startedAt = line.substring(separator + 1).toLongOrNull() ?: 0L
+        "purpose" -> purpose = try { Purpose.valueOf(line.substring(separator + 1)) } catch (_: Throwable) { Purpose.UNKNOWN }
+        "priorFingerprint" -> priorFingerprint = line.substring(separator + 1)
+        "baseFingerprint" -> baseFingerprint = line.substring(separator + 1)
         "moved" -> moved += line.substring(separator + 1)
       }
     }
     // An unknown phase is an interrupted swap: rolling back is the only outcome
     // that cannot leave a half-activated runtime behind.
-    return Marker(phase ?: Phase.SWAPPING, fingerprint, startedAt, moved)
+    val parsedPhase = phase ?: Phase.UNKNOWN
+    return Marker(parsedPhase, fingerprint, startedAt, moved, purpose, priorFingerprint, baseFingerprint)
   }
 
   fun clearMarker(filesDir: File) {
@@ -474,9 +501,16 @@ internal object SnapshotTransaction {
      * （Windows 无建链权限）拿不到判红证据，必须让它们可被测试构造。
      */
     links: LinkPrimitives = PRODUCTION_LINKS,
+    purpose: Purpose = Purpose.FACTORY,
+    priorFingerprint: String = "",
+    baseFingerprint: String = "",
   ): List<String> {
     val stagedUsr = File(stagedRoot, "usr")
     if (!SnapshotFs.exists(stagedUsr)) throw IOException("staged runtime is missing usr/")
+    // An online archive may be the same full usr/ + home/ snapshot used for factory
+    // installation. Its staged home is evidence/input only; online updates never
+    // activate it because home contains user data. Keep it under this transaction's
+    // private stage until commit/rollback cleanup removes the owned stage root.
     // ── issue #271 ③：动第一棵树之前的**可写性预检** ──────────────────────────────
     //
     // 缺陷形态：`.snapshot-previous` 下留着历史孤儿（issue 现场是一份 9 天前的 `usr/lib`），
@@ -495,7 +529,7 @@ internal object SnapshotTransaction {
     //   · `mergeTree` 把 staged 里 live 缺的文件补进去（相对小）。
     // 其余（usr/home 顶层条目、profiles 换位）都是 rename，不占新空间。
     // 余量取 25% + 64MB：覆盖补入文件与文件系统元数据（小文件多时块开销可观）。
-    if (spaceCheck != null) {
+    if (spaceCheck != null && purpose == Purpose.FACTORY) {
       val liveProfiles = File(File(homeDir, ".dsh"), "profiles")
       val backupBytes = SnapshotFs.sizeOf(liveProfiles)
       val required = backupBytes + backupBytes / 4 + 64L * 1024L * 1024L
@@ -508,15 +542,15 @@ internal object SnapshotTransaction {
     requireDeletableResidue(previous, ownerProbe)
     SnapshotFs.deletePathStrict(previous)
     SnapshotFs.createDirectories(previous)
-    writeMarker(filesDir, Marker(Phase.SWAPPING, fingerprint, startedAt))
+    writeMarker(filesDir, Marker(Phase.SWAPPING, fingerprint, startedAt, purpose = purpose, priorFingerprint = priorFingerprint, baseFingerprint = baseFingerprint))
     val moved = mutableListOf<String>()
     // #214：profiles 合并期间的工厂语义纠正说明（返回给调用方写日志/诊断）。
     val notes = mutableListOf<String>()
 
-    replaceEntry(filesDir, moved, fingerprint, startedAt, "usr", stagedUsr, usrDir, File(previous, "usr"), onEntry, move)
+    replaceEntry(filesDir, moved, fingerprint, startedAt, "usr", stagedUsr, usrDir, File(previous, "usr"), onEntry, move, purpose, priorFingerprint, baseFingerprint)
 
     val stagedHome = File(stagedRoot, "home")
-    if (SnapshotFs.exists(stagedHome)) {
+    if (purpose == Purpose.FACTORY && SnapshotFs.exists(stagedHome)) {
       for (entry in stagedHome.listFiles() ?: emptyArray()) {
         if (entry.name == ".dsh") {
           val liveDsh = File(homeDir, ".dsh")
@@ -566,7 +600,7 @@ internal object SnapshotTransaction {
         }
       }
     }
-    writeMarker(filesDir, Marker(Phase.SWAPPED, fingerprint, startedAt, moved))
+    writeMarker(filesDir, Marker(Phase.SWAPPED, fingerprint, startedAt, moved, purpose, priorFingerprint, baseFingerprint))
     return notes
   }
 
@@ -1111,16 +1145,33 @@ internal object SnapshotTransaction {
     homeDir: File,
   ): Recovery {
     val marker = readMarker(filesDir) ?: return Recovery(Outcome.NONE)
+    if (marker.phase == Phase.UNKNOWN || marker.purpose == Purpose.UNKNOWN ||
+      (marker.phase == Phase.ONLINE_COMMITTED && marker.purpose != Purpose.ONLINE_UPDATE)) {
+      return Recovery(Outcome.ROLLBACK_FAILED, failures = listOf("transaction marker has unknown or incompatible phase/purpose; retained for recovery"))
+    }
     if (marker.phase == Phase.STAGED) {
       SnapshotFs.deletePath(stagedRoot)
       SnapshotFs.deletePath(previousRoot(filesDir))
       clearMarker(filesDir)
       return Recovery(Outcome.DISCARDED_STAGE)
     }
+    if (marker.phase == Phase.ONLINE_COMMITTED && marker.purpose == Purpose.ONLINE_UPDATE) {
+      return Recovery(Outcome.ROLLED_FORWARD, marker.fingerprint.ifEmpty { null }, onlineUpdateCommit = true)
+    }
     if (marker.phase == Phase.SWAPPED) {
+      if (marker.purpose == Purpose.ONLINE_UPDATE) {
+        val result = rollbackOnlineUpdate(filesDir, stagedRoot, usrDir, homeDir, marker)
+        if (!result.ok) return Recovery(Outcome.ROLLBACK_FAILED, failures = result.failures)
+        clearMarker(filesDir)
+        return Recovery(Outcome.ROLLED_BACK, fingerprintToRestore = marker.priorFingerprint)
+      }
       return Recovery(Outcome.ROLLED_FORWARD, marker.fingerprint.ifEmpty { null })
     }
-    val result = rollback(filesDir, stagedRoot, usrDir, homeDir, marker)
+    val result = if (marker.purpose == Purpose.ONLINE_UPDATE) {
+      rollbackOnlineUpdate(filesDir, stagedRoot, usrDir, homeDir, marker)
+    } else {
+      rollback(filesDir, stagedRoot, usrDir, homeDir, marker)
+    }
     if (!result.ok) {
       // 【D-3 / 审查 §7.7.5】回滚失败**不得无条件清 marker**。
       //
@@ -1131,7 +1182,10 @@ internal object SnapshotTransaction {
       return Recovery(Outcome.ROLLBACK_FAILED, null, result.failures)
     }
     clearMarker(filesDir)
-    return Recovery(Outcome.ROLLED_BACK)
+    return Recovery(
+      Outcome.ROLLED_BACK,
+      fingerprintToRestore = marker.priorFingerprint.takeIf { marker.purpose == Purpose.ONLINE_UPDATE },
+    )
   }
 
   /**
@@ -1184,6 +1238,31 @@ internal object SnapshotTransaction {
     }
   }
 
+  /** Online updates always replace an existing runtime, so its displaced usr is mandatory rollback evidence. */
+  fun rollbackOnlineUpdate(
+    filesDir: File,
+    stagedRoot: File,
+    usrDir: File,
+    homeDir: File,
+    marker: Marker,
+  ): RollbackResult {
+    if (marker.purpose != Purpose.ONLINE_UPDATE) return RollbackResult(false, listOf("marker purpose mismatch"))
+    val previousUsr = File(previousRoot(filesDir), "usr")
+    // The journal is written before the first rename. A cold kill in that tiny
+    // window leaves the complete old runtime live and no previous/usr yet; this
+    // is a safe no-op rollback, not missing recovery evidence.
+    if (marker.phase == Phase.SWAPPING && !SnapshotFs.exists(previousUsr) &&
+      File(usrDir, "bin/node").isFile) {
+      SnapshotFs.deletePath(stagedRoot)
+      SnapshotFs.deletePath(previousRoot(filesDir))
+      return RollbackResult(true, emptyList())
+    }
+    if (!SnapshotFs.exists(previousUsr) || !File(previousUsr, "bin/node").isFile) {
+      return RollbackResult(false, listOf("usr (online rollback source missing; live runtime retained)"))
+    }
+    return rollback(filesDir, stagedRoot, usrDir, homeDir, marker)
+  }
+
   private fun replaceEntry(
     filesDir: File,
     moved: MutableList<String>,
@@ -1195,13 +1274,16 @@ internal object SnapshotTransaction {
     previous: File,
     onEntry: (String) -> Unit,
     move: (File, File) -> Unit,
+    purpose: Purpose = Purpose.FACTORY,
+    priorFingerprint: String = "",
+    baseFingerprint: String = "",
   ) {
     SnapshotFs.createDirectories(live.parentFile ?: filesDir)
     SnapshotFs.createDirectories(previous.parentFile ?: filesDir)
     // Journal first: if the process dies between the two renames the recovery
     // path still knows this entry was in flight.
     moved += journalName
-    writeMarker(filesDir, Marker(Phase.SWAPPING, fingerprint, startedAt, moved.toList()))
+    writeMarker(filesDir, Marker(Phase.SWAPPING, fingerprint, startedAt, moved.toList(), purpose, priorFingerprint, baseFingerprint))
     if (SnapshotFs.exists(live)) {
       // issue #271：目标必须先清空。容错版 deletePath 可能正常返回而目录仍非空，
       // 随后 move 就抛 Directory not empty（半搬态的起点）——此处用严格版，删不净即抛。
@@ -1422,6 +1504,9 @@ internal object SnapshotTransaction {
     append("phase=").append(marker.phase.name).append('\n')
     append("fingerprint=").append(marker.fingerprint).append('\n')
     append("started=").append(marker.startedAt).append('\n')
+    if (marker.purpose != Purpose.FACTORY) append("purpose=").append(marker.purpose.name).append('\n')
+    if (marker.priorFingerprint.isNotEmpty()) append("priorFingerprint=").append(marker.priorFingerprint).append('\n')
+    if (marker.baseFingerprint.isNotEmpty()) append("baseFingerprint=").append(marker.baseFingerprint).append('\n')
     for (entry in marker.moved) append("moved=").append(entry).append('\n')
   }
 }

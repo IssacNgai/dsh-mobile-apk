@@ -1,6 +1,7 @@
 package com.dsharnessmobile.shell
 
 import java.io.File
+import java.nio.file.Files
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -18,9 +19,41 @@ import org.junit.rules.TemporaryFolder
  * 反证方式（每条判据都有对应变异会判红，见回报）：
  *  - 把 `enter` 里「先写状态文件再改 patch」调换成旧顺序 → `crashWindowLeavesNoWayBack` 判红；
  *  - 把 `exit` 的备份校验去掉 → `exitRefusesWhenBackupMissing` 判红；
- *  - 把白名单前缀删掉任一条 → `shippedPluginsSurvive` / `productWhitelistMatchesPatchScriptSource` 判红。
+ *  - 从 exact Hard fixture 删除任一出厂 `{id,name}` → 产品条目保留/第三方摘除用例判红；用户同包条目不会被误保留。
  */
 class SafeModeTest {
+  @Test
+  fun `缺失归属清单时拒绝开启且不改配置`() {
+    val dir = Files.createTempDirectory("safe-mode-no-hard-manifest").toFile()
+    val patch = File(dir, "patch.yml")
+    val home = File(dir, "home.yml")
+    val auto = File(dir, "auto")
+    val original = "- insert:\n  - id: user-hard\n    name: '@deepseek-ai/user-hard'\n"
+    patch.writeText(original)
+    val result = SafeMode.enter(patch, home, auto, "missing-manifest", hardManifestAvailable = false)
+    assertFalse(result.ok)
+    assertTrue(result.message.contains("未生效"))
+    assertTrue(result.message.contains("归属清单缺失"))
+    assertEquals(original, patch.readText())
+    assertFalse(File(auto, SafeMode.STATE_FILE).exists())
+    assertFalse(File(auto, "safe-mode-backup-missing-manifest.yml").exists())
+  }
+
+  @Test
+  fun `归属清单空或无exact entries时拒绝开启且不改配置`() {
+    val dir = Files.createTempDirectory("safe-mode-empty-hard-manifest").toFile()
+    val patch = File(dir, "patch.yml")
+    val home = File(dir, "home.yml")
+    val auto = File(dir, "auto")
+    val original = "- insert:\n  - id: user-entry\n    name: '@dsh-android/user-entry'\n"
+    patch.writeText(original)
+    val result = SafeMode.enter(patch, home, auto, "empty-manifest", hardManifestAvailable = true, hardEntries = emptySet())
+    assertFalse(result.ok)
+    assertTrue(result.message.contains("归属清单缺失"))
+    assertEquals(original, patch.readText())
+    assertFalse(File(auto, SafeMode.STATE_FILE).exists())
+  }
+
 
   @get:Rule
   val tmp = TemporaryFolder()
@@ -45,6 +78,47 @@ class SafeModeTest {
     return Triple(patch, homePatch, autoDir)
   }
 
+  /** Verified product rows represented by this fixture; user entries never become Hard by parsing the fixture. */
+  private val fixtureHardEntries = setOf(
+    PluginMounts.HardEntry("shell-termux", "@dsh-android/dsh-shell-termux"),
+    PluginMounts.HardEntry("host-web-compat", "@dsh-android/dsh-host-web-compat"),
+    PluginMounts.HardEntry("ui-responsive", "@dsh-android/dsh-client-ui-responsive"),
+    PluginMounts.HardEntry("android-bridge", "@dsh-android/dsh-android-bridge"),
+    PluginMounts.HardEntry("android-manage", "@dsh-android/dsh-android-manage"),
+    PluginMounts.HardEntry("android-linux-env", "@dsh-android/dsh-android-linux-env"),
+    PluginMounts.HardEntry("android-file-open", "@dsh-android/dsh-android-file-open"),
+    PluginMounts.HardEntry("model-capability", "@dsh-android/dsh-model-capability"),
+    PluginMounts.HardEntry("android-browser", "@dsh-android/dsh-android-browser"),
+    PluginMounts.HardEntry("android-vdisplay", "@dsh-android/dsh-android-vdisplay"),
+    PluginMounts.HardEntry("dsh-undo-savepoint", "dsh-undo-savepoint"),
+    PluginMounts.HardEntry("dshmarketplace", "dshmarketplace-plugin"),
+    PluginMounts.HardEntry("llm-pi-ai", "@deepseek-ai/dsh-llm-pi-ai"),
+  )
+
+  private fun enterWithProductManifest(
+    patch: File, homePatch: File, autoDir: File, id: String,
+    atomicWrite: ((File, ByteArray) -> Unit)? = null,
+  ): SafeMode.Result {
+    val entries = fixtureHardEntries
+    val names = entries.map { it.name }.toSet()
+    return if (atomicWrite == null) SafeMode.enter(
+      patch, homePatch, autoDir, id, hardNames = names, hardManifestAvailable = entries.isNotEmpty(), hardEntries = entries,
+    ) else SafeMode.enter(
+      patch, homePatch, autoDir, id, atomicWrite,
+      hardNames = names, hardManifestAvailable = entries.isNotEmpty(), hardEntries = entries,
+    )
+  }
+
+  private fun filterWithProductManifest(text: String): String {
+    val entries = fixtureHardEntries
+    return SafeMode.filterThirdPartyInserts(text, entries.map { it.name }.toSet(), entries)
+  }
+
+  private fun removedWithProductManifest(text: String): List<String> {
+    val entries = fixtureHardEntries
+    return SafeMode.removedPluginNames(text, entries.map { it.name }.toSet(), entries)
+  }
+
   // ── ① 事务纪律：备份缺失/崩溃窗口 ──────────────────────────────────────────
 
   /**
@@ -56,7 +130,7 @@ class SafeModeTest {
     val (patch, homePatch, autoDir) = fixture()
     val original = realisticPatch()
     patch.writeText(original)
-    val r = SafeMode.enter(patch, homePatch, autoDir, "t1")
+    val r = enterWithProductManifest(patch, homePatch, autoDir, "t1")
     assertTrue("enter 必须成功：" + r.message, r.ok)
     // ① 状态文件在场（这是 off 能还原的前提）。
     val state = File(autoDir, SafeMode.STATE_FILE)
@@ -80,7 +154,7 @@ class SafeModeTest {
     val blocker = File(tmp.root, "blocker")
     blocker.writeText("not a dir")
     val badAuto = File(blocker, "auto")
-    val r = SafeMode.enter(patch, homePatch, badAuto, "t2")
+    val r = enterWithProductManifest(patch, homePatch, badAuto, "t2")
     assertFalse("无法建目录时必须拒绝进入", r.ok)
     assertTrue("回执必须给出理由", r.message.isNotBlank())
     assertEquals("拒绝进入时 patch 必须一字未动", original, patch.readText())
@@ -92,7 +166,7 @@ class SafeModeTest {
   fun `备份缺失时 exit 拒绝且不动任何文件`() {
     val (patch, homePatch, autoDir) = fixture()
     patch.writeText(realisticPatch())
-    assertTrue(SafeMode.enter(patch, homePatch, autoDir, "t3").ok)
+    assertTrue(enterWithProductManifest(patch, homePatch, autoDir, "t3").ok)
     val afterEnter = patch.readText()
     // 删掉备份，模拟「备份丢了」。
     val state = File(autoDir, SafeMode.STATE_FILE)
@@ -126,7 +200,7 @@ class SafeModeTest {
     val (patch, homePatch, autoDir) = fixture()
     val original = realisticPatch()
     patch.writeText(original)
-    assertTrue(SafeMode.enter(patch, homePatch, autoDir, "t4").ok)
+    assertTrue(enterWithProductManifest(patch, homePatch, autoDir, "t4").ok)
     val r = SafeMode.exit(patch, homePatch, autoDir)
     assertTrue("exit 必须成功：" + r.message, r.ok)
     assertEquals("必须整份还原（含第三方插件条目与全部注释/config）", original, patch.readText())
@@ -140,7 +214,7 @@ class SafeModeTest {
     patch.writeText(realisticPatch())
     val homeOriginal = "- id: user-home-entry\n  name: some-user-plugin\n"
     homePatch.writeText(homeOriginal)
-    assertTrue(SafeMode.enter(patch, homePatch, autoDir, "t5").ok)
+    assertTrue(enterWithProductManifest(patch, homePatch, autoDir, "t5").ok)
     assertFalse("home 级必须被改写", homePatch.readText() == homeOriginal)
     assertTrue(SafeMode.exit(patch, homePatch, autoDir).ok)
     assertEquals("home 级必须整份还原", homeOriginal, homePatch.readText())
@@ -151,11 +225,11 @@ class SafeModeTest {
     val (patch, homePatch, autoDir) = fixture()
     val original = realisticPatch()
     patch.writeText(original)
-    assertTrue(SafeMode.enter(patch, homePatch, autoDir, "repeat-a").ok)
+    assertTrue(enterWithProductManifest(patch, homePatch, autoDir, "repeat-a").ok)
     val stateFile = File(autoDir, SafeMode.STATE_FILE)
     val stateBefore = stateFile.readText()
     val filtered = patch.readBytes()
-    assertTrue(SafeMode.enter(patch, homePatch, autoDir, "repeat-b").ok)
+    assertTrue(enterWithProductManifest(patch, homePatch, autoDir, "repeat-b").ok)
     assertEquals("重复 on 必须保留第一次 marker", stateBefore, stateFile.readText())
     assertTrue("重复 on 不得再改 live patch", filtered.contentEquals(patch.readBytes()))
     assertTrue(SafeMode.exit(patch, homePatch, autoDir).ok)
@@ -169,7 +243,7 @@ class SafeModeTest {
     val (patch, homePatch, autoDir) = fixture()
     val original = realisticPatch()
     patch.writeText(original)
-    assertTrue(SafeMode.enter(patch, homePatch, autoDir, "damaged").ok)
+    assertTrue(enterWithProductManifest(patch, homePatch, autoDir, "damaged").ok)
     val stateFile = File(autoDir, SafeMode.STATE_FILE)
     val state = org.json.JSONObject(stateFile.readText())
     File(state.getString("backup")).writeText("corrupted")
@@ -193,7 +267,7 @@ class SafeModeTest {
       target.parentFile?.mkdirs()
       target.writeBytes(bytes)
     }
-    val entered = SafeMode.enter(patch, homePatch, autoDir, "interrupted", interruptPatchWrite)
+    val entered = enterWithProductManifest(patch, homePatch, autoDir, "interrupted", interruptPatchWrite)
     assertFalse("注入的写入中断必须回报失败", entered.ok)
     assertTrue("marker 已先提交，off 仍可恢复", File(autoDir, SafeMode.STATE_FILE).isFile)
     assertTrue(SafeMode.exit(patch, homePatch, autoDir).ok)
@@ -203,11 +277,11 @@ class SafeModeTest {
 
   // ── ② 用户口径：保留我们自己的插件 ──────────────────────────────────────────
 
-  /** safe 态下 10 个自有 android 插件必须一个不少（`@dsh-android` 前缀域）。 */
+  /** safe 态下 10 个自有 Android 插件必须一个不少，依据测试中固定的 exact `{id,name}` 清单。 */
   @Test
   fun `safe 态保留全部十个自有插件`() {
     val before = realisticPatch()
-    val after = SafeMode.filterThirdPartyInserts(before)
+    val after = filterWithProductManifest(before)
     for (p in listOf(
       "@dsh-android/dsh-shell-termux",
       "@dsh-android/dsh-host-web-compat",
@@ -229,7 +303,7 @@ class SafeModeTest {
   /** 第三方条目必须被摘掉，且摘得**干净**（不留悬空 id、不留空 insert 组）。 */
   @Test
   fun `第三方条目被摘除且不留悬空结构`() {
-    val after = SafeMode.filterThirdPartyInserts(realisticPatch())
+    val after = filterWithProductManifest(realisticPatch())
     assertFalse("第三方 name 必须消失", after.contains("dsh-code-diff-viewer"))
     assertFalse("第三方 name 必须消失", after.contains("dsh-find-plugin"))
     // 它们的 config 行也必须一起走（只删 name 行会留下悬空 config）。
@@ -249,7 +323,7 @@ class SafeModeTest {
    */
   @Test
   fun `组外条目与原样内容一字不动`() {
-    val after = SafeMode.filterThirdPartyInserts(realisticPatch())
+    val after = filterWithProductManifest(realisticPatch())
     assertTrue("禁用位必须保留", after.contains("- id: bash-sandbox\n  disabled: true"))
     assertTrue("禁用位必须保留", after.contains("- id: client-hmr\n  disabled: true"))
     assertTrue("config-only 条目必须保留", after.contains("ptc-runtime"))
@@ -262,31 +336,23 @@ class SafeModeTest {
   @Test
   fun `没有第三方条目时输出逐字节等于输入`() {
     val clean = realisticPatch(extraThirdParty = false)
-    assertEquals("无改动即逐字节相同", clean, SafeMode.filterThirdPartyInserts(clean))
+    assertEquals("无改动即逐字节相同", clean, filterWithProductManifest(clean))
   }
 
   /** 回执里的「摘了几个」必须与实际摘除一致（否则用户拿到自相矛盾的信息）。 */
   @Test
   fun `摘除名单与实际摘除一致`() {
     val before = realisticPatch()
-    val removed = SafeMode.removedPluginNames(before)
+    val removed = removedWithProductManifest(before)
     assertEquals("两个第三方插件", listOf("dsh-code-diff-viewer", "dsh-find-plugin"), removed)
-    val after = SafeMode.filterThirdPartyInserts(before)
+    val after = filterWithProductManifest(before)
     for (name in removed) assertFalse("回执点名的插件必须真的不在结果里：$name", after.contains("name: $name"))
-    assertTrue("自有插件不得出现在摘除名单里", removed.none { SafeMode.isShippedPackage(it) })
+    assertTrue("无包名启发式兜底", removed.none { SafeMode.isShippedPackage(it) })
   }
 
-  // ── ③ 白名单与真源同源 ─────────────────────────────────────────────────────
-
-  /**
-   * 白名单必须与 `scripts/patches/apply-patches.mjs` 的 `DSH_MOBILE_SHIPPED_PLUGIN_*` 同口径。
-   *
-   * 该文件自述「名单就是『谁算我们自己的插件』的单一真源」；Kotlin 侧复述一份常量是既有做法
-   * （`PluginMounts`/`FactoryProfilePatch` 同样各自持有本仓口径），漂移由本条钉住。
-   * 两侧镜像逐字节相同（铁律 6），故读 apk 侧副本即可。
-   */
+  // ── ③ exact identity ownership and shared policy fixture ───────────────────
   @Test
-  fun `产品白名单与补丁脚本真源一致`() {
+  fun `不再使用前缀或包名名单判断产品归属`() {
     val candidates = listOf(
       File("scripts/patches/apply-patches.mjs"),
       File("../scripts/patches/apply-patches.mjs"),
@@ -295,42 +361,71 @@ class SafeModeTest {
     val src = candidates.firstOrNull { it.isFile }
       ?: throw AssertionError("找不到 apply-patches.mjs（白名单真源）；cwd=" + File(".").absolutePath)
     val text = src.readText()
-    val prefixes = Regex("DSH_MOBILE_SHIPPED_PLUGIN_PREFIXES\\s*=\\s*\\[([^]]*)]")
-      .find(text)?.groupValues?.get(1)
-      ?.split(",")?.map { it.trim().trim('\'', '"') }?.filter { it.isNotEmpty() }
-      ?: throw AssertionError("真源里找不到 DSH_MOBILE_SHIPPED_PLUGIN_PREFIXES")
-    val names = Regex("DSH_MOBILE_SHIPPED_PLUGIN_NAMES\\s*=\\s*\\[([^]]*)]")
-      .find(text)?.groupValues?.get(1)
-      ?.split(",")?.map { it.trim().trim('\'', '"') }?.filter { it.isNotEmpty() }
-      ?: throw AssertionError("真源里找不到 DSH_MOBILE_SHIPPED_PLUGIN_NAMES")
-    // 0.14.5（D-1(c)）起，两侧都**不得**再含上游命名空间 @deepseek-ai/：
-    // 前缀只说明谁发布的、不说明谁装配的，用它判归属会把用户自挂的官方包误当产品自有条目。
-    // 断言改成「必须等于真源**去掉上游命名空间后**的集合」——真源里那一项现在是 G3 的
-    // 「装配清单不完整时的保守回退」，与 Safe Mode 的判据不同源，故不能照搬。
-    val upstreamNamespaces = setOf("@deepseek-ai/")
-    assertEquals(
-      "前缀白名单必须与真源（去掉上游命名空间）一致",
-      prefixes.filterNot { it in upstreamNamespaces }, SafeMode.SHIPPED_PREFIXES,
+    assertTrue("补丁器采用 exact identity manifest", text.contains("safe ownership identity v2"))
+    // 判据必须落在「补丁器实际复核什么」上：它用字面量 /entry\.id === id && entry\.name === name/
+    // 复核注入结果，而不是靠某个 .mjs 片段里的 JS 拼写（那只管实现细节，换个引号风格就假红）。
+    // 注意这里是**字面文本**比对：源码里本来就有一个反斜杠，用 Regex 写 \. 只会去匹配点号。
+    assertTrue(
+      "补丁器必须按 exact {id,name} 复核所有权，不得回退到包名或前缀",
+      text.contains("""entry\.id === id && entry\.name === name"""),
     )
-    assertEquals("具名白名单必须与真源一致", names, SafeMode.SHIPPED_NAMES)
-    assertFalse(
-      "Safe Mode 白名单不得再拿上游命名空间判归属（D-1(c)）",
-      SafeMode.SHIPPED_PREFIXES.any { it in upstreamNamespaces },
+    // 单一权威实现：共享过滤助手是 Kotlin / vendor / CLI 三方对齐的那个源。
+    val helper = listOf(
+      File("scripts/patches/data/undo-safe-filter-helper-snippet.mjs"),
+      File("../scripts/patches/data/undo-safe-filter-helper-snippet.mjs"),
+      File("dsh-mobile-apk/scripts/patches/data/undo-safe-filter-helper-snippet.mjs"),
+    ).firstOrNull { it.isFile }
+      ?: throw AssertionError("找不到共享 safe-mode 过滤助手（唯一权威源）；cwd=" + File(".").absolutePath)
+    val helperText = helper.readText()
+    assertTrue("助手只认 exact id", helperText.contains("typeof entry.id === 'string'"))
+    assertTrue("助手同时比对 id 与 name", helperText.contains("entry.id === id && entry.name === name"))
+    assertTrue(SafeMode.SHIPPED_NAMES.isEmpty())
+    assertTrue(SafeMode.SHIPPED_PREFIXES.isEmpty())
+    assertFalse(SafeMode.isShippedPackage("@deepseek-ai/dsh-mcp-client"))
+    assertFalse(SafeMode.isShippedPackage("@dsh-android/user-created"))
+  }
+
+  @Test
+  fun `Safe Mode策略与共享黄金夹具一致`() {
+    val candidates = listOf(
+      File("scripts/patches/tests/fixtures/safe-mode-policy.yml"),
+      File("../scripts/patches/tests/fixtures/safe-mode-policy.yml"),
+      File("dsh-mobile-apk/scripts/patches/tests/fixtures/safe-mode-policy.yml"),
+    )
+    val fixture = candidates.firstOrNull { it.isFile }
+      ?: throw AssertionError("找不到共享 Safe Mode 策略夹具；cwd=" + File(".").absolutePath)
+    val expected = File(fixture.parentFile, "safe-mode-policy.expected.yml").readText()
+    val input = fixture.readText()
+    assertEquals(
+      "Kotlin壳过滤必须与共享黄金输出一致",
+      expected,
+      SafeMode.filterThirdPartyInserts(input, setOf("@dsh-android/dsh-shell-termux", "@deepseek-ai/dsh-shipped-core", "dsh-undo-savepoint", "@dsh-android/dsh-host-web-compat"), setOf(
+        PluginMounts.HardEntry("mobile-hard", "@dsh-android/dsh-shell-termux"),
+        PluginMounts.HardEntry("upstream-hard", "@deepseek-ai/dsh-shipped-core"),
+        PluginMounts.HardEntry("undo", "dsh-undo-savepoint"),
+        PluginMounts.HardEntry("disabled-product", "@dsh-android/dsh-host-web-compat"),
+      )),
+    )
+    assertEquals(
+      "回执只能点名被移除的insert插件",
+      listOf("@deepseek-ai/dsh-mcp-client", "dsh-code-diff-viewer", "user-disabled-plugin"),
+      SafeMode.removedPluginNames(input, setOf("@dsh-android/dsh-shell-termux", "@deepseek-ai/dsh-shipped-core", "dsh-undo-savepoint", "@dsh-android/dsh-host-web-compat"), setOf(
+        PluginMounts.HardEntry("mobile-hard", "@dsh-android/dsh-shell-termux"),
+        PluginMounts.HardEntry("upstream-hard", "@deepseek-ai/dsh-shipped-core"),
+        PluginMounts.HardEntry("undo", "dsh-undo-savepoint"),
+        PluginMounts.HardEntry("disabled-product", "@dsh-android/dsh-host-web-compat"),
+      )),
     )
   }
 
   @Test
   fun `白名单判据的正反例`() {
-    assertTrue(SafeMode.isShippedPackage("@dsh-android/dsh-shell-termux"))
-    // 0.14.5（D-1(c)）：上游命名空间**不再**被静态判为自有（见 [SafeMode.isProductOwned] 的注释）。
-    // 我们真正自带的那 3 个 @deepseek-ai/* 条目由权威装配清单证明，不由前缀证明。
-    assertFalse("上游命名空间前缀不再判为自有", SafeMode.isShippedPackage("@deepseek-ai/dsh-llm-pi-ai"))
-    assertTrue(
-      "但其在权威装配清单里时仍算自有",
-      SafeMode.isProductOwned("@deepseek-ai/dsh-llm-pi-ai", setOf("@deepseek-ai/dsh-llm-pi-ai")),
-    )
-    assertTrue(SafeMode.isShippedPackage("'dsh-undo-savepoint'"))
-    assertTrue(SafeMode.isShippedPackage("dshmarketplace-plugin"))
+    assertFalse(SafeMode.isShippedPackage("@dsh-android/dsh-shell-termux"))
+    assertFalse("上游命名空间前缀不判归属", SafeMode.isShippedPackage("@deepseek-ai/dsh-llm-pi-ai"))
+    assertTrue("精确 id/name 清单可证明产品身份", SafeMode.isProductOwned("@deepseek-ai/dsh-llm-pi-ai", emptySet(), setOf(PluginMounts.HardEntry("llm-pi-ai", "@deepseek-ai/dsh-llm-pi-ai")), "llm-pi-ai"))
+    assertFalse("同包名但不同 id 不属于工厂条目", SafeMode.isProductOwned("@deepseek-ai/dsh-llm-pi-ai", setOf("@deepseek-ai/dsh-llm-pi-ai"), setOf(PluginMounts.HardEntry("llm-pi-ai", "@deepseek-ai/dsh-llm-pi-ai")), "user-created-id"))
+    assertFalse(SafeMode.isShippedPackage("'dsh-undo-savepoint'"))
+    assertFalse(SafeMode.isShippedPackage("dshmarketplace-plugin"))
     assertFalse("第三方不得被当自有", SafeMode.isShippedPackage("dsh-code-diff-viewer"))
     assertFalse(SafeMode.isShippedPackage("dsh-find-plugin"))
     assertFalse("空串", SafeMode.isShippedPackage(""))
@@ -355,21 +450,22 @@ class SafeModeTest {
       "      name: '@deepseek-ai/dsh-mcp-client'",
       "",
     ).joinToString("\n")
-    // 权威装配清单只含我们自带的那一个；用户自挂的 mcp-client 不在其中。
-    val hardNames = setOf("@deepseek-ai/dsh-llm-pi-ai")
-    val after = SafeMode.filterThirdPartyInserts(patch, hardNames)
+    // 权威装配清单只含我们自带的 exact id/name；用户自挂的 mcp-client 不在其中。
+    val hardEntries = setOf(PluginMounts.HardEntry("llm-pi-ai", "@deepseek-ai/dsh-llm-pi-ai"))
+    val hardNames = hardEntries.map { it.name }.toSet()
+    val after = SafeMode.filterThirdPartyInserts(patch, hardNames, hardEntries)
     assertTrue("自带的必须保留", after.contains("@deepseek-ai/dsh-llm-pi-ai"))
     assertFalse(
       "用户自装的官方包必须被摘掉（旧实现在此恒保留，本条即其反证）",
       after.contains("@deepseek-ai/dsh-mcp-client"),
     )
-    val removed = SafeMode.removedPluginNames(patch, hardNames)
+    val removed = SafeMode.removedPluginNames(patch, hardNames, hardEntries)
     assertEquals("回执必须如实点名被摘的那个", listOf("@deepseek-ai/dsh-mcp-client"), removed)
   }
 
-  /** 权威清单缺席（首次启动 / ensureHard 之前）时，静态名单仍须保住我们自己的命名空间。 */
+  /** 清单缺席时包名与命名空间都不能冒充 ownership；生产 enter 会在写数据前拒绝。 */
   @Test
-  fun `权威清单缺席时静态名单兜底且不误摘自有`() {
+  fun `权威清单缺席时不得使用名字或前缀静态兜底`() {
     val patch = listOf(
       "- insert:",
       "    - id: shell-termux",
@@ -380,10 +476,10 @@ class SafeModeTest {
       "      name: 'dsh-code-diff-viewer'",
       "",
     ).joinToString("\n")
-    val after = SafeMode.filterThirdPartyInserts(patch, emptySet())
-    assertTrue("自有命名空间必须保留", after.contains("@dsh-android/dsh-shell-termux"))
-    assertTrue("具名自有插件必须保留", after.contains("dshmarketplace-plugin"))
-    assertFalse("第三方必须摘掉", after.contains("dsh-code-diff-viewer"))
+    val after = SafeMode.filterThirdPartyInserts(patch, emptySet(), null)
+    assertFalse("名字相同不能证明工厂归属", after.contains("@dsh-android/dsh-shell-termux"))
+    assertFalse("具名包名不能证明工厂归属", after.contains("dshmarketplace-plugin"))
+    assertFalse("未知 entry 必须被纯过滤器视作 Soft", after.contains("dsh-code-diff-viewer"))
   }
 
   /** status 三态回执：未开启 / 开启中 / 状态文件损坏——三者必须可区分。 */
@@ -393,7 +489,7 @@ class SafeModeTest {
     autoDir.mkdirs()
     assertTrue(SafeMode.status(autoDir).message.contains("未开启"))
     patch.writeText(realisticPatch())
-    assertTrue(SafeMode.enter(patch, homePatch, autoDir, "t6").ok)
+    assertTrue(enterWithProductManifest(patch, homePatch, autoDir, "t6").ok)
     val on = SafeMode.status(autoDir)
     assertTrue("开启后必须说开启中：" + on.message, on.message.contains("开启中"))
     assertTrue("必须带档 id（可追溯）", on.message.contains("t6"))
@@ -453,7 +549,7 @@ class SafeModeTest {
         "office-to-pdf",
       ).joinToString("") { "- id: " + it + "\n  disabled: true\n" }
     }
-    val after = SafeMode.filterThirdPartyInserts(before)
+    val after = filterWithProductManifest(before)
     for (id in listOf(
       "bash-sandbox",
       "open-in-app",

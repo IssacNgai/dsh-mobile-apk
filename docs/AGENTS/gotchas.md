@@ -1439,15 +1439,55 @@
     **现象**：compose仅数毫秒，C3已收敛为2，但真实C4仍反复超过100ms。
     **真因**：client/typert每个dirty名称重新遍历Loader；nearestPackage与resolveMeta复读同一manifest；本方模型能力初次投影、离线目录解析和最终fresh签名在同一事件循环turn堆叠。constructor首TOTAL样本为0，deferred末尾同步TOTAL尚未采到该flush阻塞，故phase wall time本身不是C4 p99。
     **修法与证据**：同步flush临时索引、当前manifest复用及自动pass分段yield；同步错误回调后重建索引、异步typert完成后live复验、CAS与最新签名重读保留。定量计时、五轮真预算和最终APK边界统一见 `RUNTIME-PATCHES.md` §7.6，不把SKIP或诊断profile当作绿。
-256. **`actions/checkout` 的 `lfs: true` 等价于 `git lfs fetch --all`，会为「历史里已删除的对象」持续付费（2026-10-07 用户 LFS 配额耗尽后定位）**：
-    **现象**：用户的 GitHub Git LFS 月流量（10 GB）被耗尽；而日常开发的 diff、构建产物都不走 LFS，无从判断流量花在哪。
-    **真因**：`lfs: true` 不是「把工作区里的 LFS 文件取下来」，而是 `git lfs fetch --all` —— 它按**仓库历史**拉取所有 LFS 对象，包括**当前 HEAD 里已不存在**的。本仓实测：`git lfs ls-files --all` 共 5 个对象约 481 MB，其中 `snapshots/{arm64,x86_64}/snapshot.tar.xz`（143.7 MB + 150.6 MB = **294 MB，占 61%**）已不在 HEAD，但每次检出仍会被拉取。叠加因素：`release.yml` 的 snapshot 与 release 两个 job **各检出一次**，且两者都用 `fetch-depth: 0`（= `git lfs fetch --all` 口径，而非 `fetch --recent`）；`build-apk.yml` 亦然。
-    **修法**：
-      - 不再用 `lfs: true`；改为 `lfs: false` + 只拉本 job 真正需要的路径：`git lfs pull --include="base/base-usr-<abi>.tar.xz,base/base-dsh.tar.xz"`（单 ABI 约 110-121 MB）；
-      - 对 `base/` 目录加 `actions/cache`，缓存键取 **pointer 文件哈希**（pointer 内含 oid+size，对象一变键即变，不会命中陈旧归档），命中时完全跳过 LFS 拉取；
-      - **去掉 release job 的 LFS**：取证 `scripts/build-apk-013.ps1:252` 只消费 `.deploy-tmp/snapshot-013/<abi>/snapshot.tar.xz`、从不读 `base/`，该 job 的 `lfs: true` 纯属浪费；
-      - 配套守卫 `scripts/require-lfs-materialized.mjs`：**按需拉取**一旦失败，工作区留下的是约 130 字节的 pointer 文本——它 `existsSync` 为真、能被 `cp`/`tar` 读到，失败会以「tar 解压出错」之类难懂的下游症状出现。该守卫在源头判红，且**拒绝「过小文件」冒充**（空文件/截断文件同样判红）。
-    **为什么不只是加缓存**：首次运行仍要付 481 MB；缓存键也无法表达「只要这一个对象」。
-    **为什么不删 `.gitattributes` 里的 LFS 规则**：那会让后续 checkout 拿到 pointer 文本而非归档，是**破坏性**改动；本轮不碰。
-    **残留浪费（未处理，环境受限）**：让 LFS 改用 GitHub Actions 缓存或本地缓存需改 `.lfsconfig` / `lfs.storage` / `LFS_STORAGE` 并**实测验证**；本会话无法访问 github.com，无法验证匿名端点与私有仓鉴权，故不做无法验证的改动，仅如实登记。
-    **验证状态**：workflow 的 YAML 可解析性、结构完整性、门禁与「`lfs: true` 已清零」均已本地验证；**真实 runner 行为未验证**（用户边界禁止触发 workflow）。
+256. **不能把 `actions/checkout@v4` 的 LFS 下载推断成历史全量，也不能用对象清单估算 runner 流量（2026-10-07 复核官方实现）**：
+    **旧结论撤回**：`lfs: true` 并不等价于 `git lfs fetch --all`。checkout v4 的 `git-source-provider.ts` 调用 `lfsFetch(checkoutInfo.startPoint || ref)`；`git-command-manager.ts` 执行 `git lfs fetch origin <ref>`。`fetch-depth: 0` 扩展普通 Git 历史，不会把此命令改成拉取全部历史 LFS 对象。`git lfs ls-files --all` 可列出历史 pointer，但不能证明 CI 实际下载了对应对象或其流量。
+    **修法**：CI checkout 使用 `lfs: false`，快照 job 只按 ABI `git lfs pull --include="base/base-usr-<abi>.tar.xz,base/base-dsh.tar.xz"`，并以 pointer 文件哈希为缓存键；不消费底座归档的 release job 不拉 LFS。这样减少的是无用 ABI 与重复 job 的下载次数；具体节省量以 runner 网络日志核实，不能沿用旧文档按历史对象大小估算的数字。
+    **证据**：[checkout v4 git-command-manager.ts](https://github.com/actions/checkout/blob/v4/src/git-command-manager.ts#L352-L357)、[git-source-provider.ts](https://github.com/actions/checkout/blob/v4/src/git-source-provider.ts#L186-L193)。
+    **验证边界**：本地 workflow/YAML 与本地守卫测试不等于 GitHub runner 流量测量；真实 runner 下载量尚未以日志量化。
+
+257. **自动失败恢复必须隔离插件，不能从用户 patch 物理摘除原块（0.14.5 SafeMode D4）**：
+    **真因**：`PluginMounts.pull` 过去删除命中条目的整个 insert 子块，会丢掉用户配置和未知字段；恢复能力把“本次不加载”误做成“永久删除配置”。
+    **修法**：自动路径唯一命中后保留原块和所有字段，在顶层追加同 id/name 的 Cordis `disabled: true` override；歧义、无 id 或非 insert 命中一律不写。既有重启流程负责应用状态，用户可通过恢复 patch/编辑禁用位重新启用。
+    **判红证据**：`PluginMountsTest` 覆盖原文前缀/自定义字段保留、追加禁用、重复调用幂等、顶层覆盖与重复 id 拒绝；需要 APK fresh JVM suite 验证。
+258. **Safe Mode 不能用 publisher namespace 或包名代替本版本装配身份（0.14.5 D5）**：
+    **真因**：用户可以自行装配 `@deepseek-ai/*` 官方包，甚至创建与产品同名但不同 loader id 的条目。仅按前缀/名字保护，会把用户条目误判成 Hard；Kotlin、vendor core、generated engine snippets 与 emergency CLI 也曾出现策略漂移。
+    **修法**：构建期 `build-hard-manifest.mjs` 从最终注入 snapshot tar 抽取 schema 2 exact `{id,name}` identities，并单独记录来自打包 profile 的 `profileEntries` 子集；APK asset 的 fingerprint 绑定该 tar SHA-256，避免把 manifest 自身计入 tar 形成 hash 循环。online sidecar 由验证过的 stage `usr` 中 dsh-base/web-app patch 加当前 APK `profileEntries` 生成；完整归档出现 `home/` 时必须有可解析的 factory profile，并将其 exact identities 合并，home 整体缺席才允许 usr-only fallback。Stage HOME 仅作为经过 archive SHA 验证的 factory 输入，永不替换 live HOME；live HOME、live patch 与 prior sidecar profile identities 都不建立新归属。marker/.online-snapshot 必须授权 archive/base 双 fingerprint；SafeMode、UndoGate、vendor、CLI 都只按 exact pair 判断。缺失、损坏、未知/不兼容 marker、swap 中断或 fingerprint 不匹配时回执归属无法核实，不修改用户数据。
+    **判红证据**：`build-hard-manifest.test.mjs` 覆盖 exact identity、profile source subset 与缺 id 判红；`safe-mode-policy.yml` golden fixture 区分同名不同 id；Node transaction fixture 检查缺 manifest 时 patch 原文不变；S1 门禁 fixture 先构造带旧宽松谓词的 marker，再断言 `--check` 红、`--apply` 修到 exact pair 后转绿。
+259. **Soft mount digest 不能由单次探活或 Service 重入确认 Stable（0.14.5 Soft lifecycle）**：
+    **真因**：一次 HTTP 200、watchdog healthy 或 service epoch 都不等于插件组合跨冷启动可用；直接写 last-healthy 会把一次启动观察误当回归基线。
+    **修法**：Soft manifest 先记 Candidate；同一 patch digest 必须在两次 `EngineManager.startEngine` 实际 spawn（`lastStartAttemptAt` 只在成功 spawn 后赋值）上分别通过 authenticated `pluginInventory/list`、每个 Hard identity 在 inventory 中存在、当前 enabled 主 Loader 与 enabled preset fibers 为 `active`、`session/list` 与 `session/modelCatalog` 结构检查，且两次在 30 秒至 7 天窗口内，才写 Stable。合法 disabled Hard row 只要求可见，不要求 active。探活限制每次 spawn 一次、失败后至少 60 秒再试。`modelCatalog` 仅证明 API 和目录结构可读；不发真实模型请求，不能据此声称每个 provider 已完成执行验证。缺少 roster/能力证据时保持 Candidate。
+    **判红证据**：`PluginMountsTest` 固定同 spawn 不得 promote、两次不同 spawn 才 promote、digest/window 改变重置候选；`EngineProbeTest` 固定缺失 Hard identity、pending enabled preset、session 或 modelCatalog 缺失/异常时不通过，并接受合法 disabled Hard row。此前执行记录为 fresh JVM 1104 tests / 0 failures / 2 skips（2026-10-07 11:16+08:00）；本轮新增/改动尚未由该旧结果验证，需由 update agent 统一 fresh rerun。
+
+260. **交付前的"夹具随版"门禁会因 registry 文本变化而变红——它比对的是全文 SHA，不是语义（0.14.5）**：
+    **现象**：`node scripts/check-release-gates.mjs --run` 在 `check-patch-fixtures.mjs` 中止组装，报
+    「夹具捕获登记身份/补丁集与当前合同不符：必须从本代真实构建产物重新捕获」；但 `engine`、`sourceCommit`、
+    `overlaySha256`、34 个夹具目录与 18 个 provenance tarball 的哈希**全部对得上真实产物**。
+    **真因**：`fixtures/manifest.json` 的 `capture.registrySha256` 记录的是 `scripts/patches/registry.json`
+    的**整文件 SHA-256**。本轮把 S1/S2 两条补丁的 `summary` 与 `marker` 从"前缀白名单"口径改成"exact
+    {id,name} 权属"口径，registry 文本一变，摘要就与记录不符。而 `registry.json` 同时是**镜像面**文件
+    （`check-patch-mirror.mjs` 的 MIRROR_FILES 逐字节比对），两仓必须同步改文本 ⇒ 两侧摘要一起过期。
+    **为什么不是"重新捕获夹具"**：该报错文案会把人引向重跑一次捕获，但夹具本身是**上游包原样文件**
+    （`inputKind: published-tarball`，34 个目录没有一个与 S1/S2 的 vendor 补丁相关）。真正过期的只有这一枚
+    摘要。重跑捕获反而会在没有新上游产物时制造不可复核的夹具。
+    **修法**：先逐项复核其余捕获字段确实是新的（`sourceCommit` 对齐 `contract.baseline` 0.2.0-rc.2、
+    `overlaySha256` 等于当前 `scripts/snapshot-config/engine-overlay.json`、18 个 tarball 的 SHA-256
+    逐个等于 `.deploy-tmp/engine-overlay/<name>.tgz` 实算值），**确认夹具文件本身没动**之后，才把
+    `capture.registrySha256` 重写为当前 `registry.json` 的实算 SHA；两仓 manifest 逐字节同步。
+    **判红证据**：改前 `check-patch-fixtures.mjs` exit 1；改后两仓均 `PATCH-FIXTURES CHECK PASSED
+    （夹具代 0.2.0-rc.2）`，且 `check-patch-mirror.mjs` 仍 SKIP=0。**不要把这一步当成"改门禁放行"**——
+    摘要不是判据放宽，是记录刷新；一旦有夹具**文件**真变了，`meta.fileSha256` 会独立判红。
+
+261. **补丁镜像门禁把两份"整文件比字节"的补丁测试也镜像了——里面的相对路径必须布局无关（0.14.5）**：
+    **现象**：`check-release-gates.mjs --run` 报 `CHECK-PATCH-TEST-MANIFEST FAILED：出现未声明的补丁回归失败（1 项）`，点名
+    `scripts/patches/tests/safe-mode-policy.test.mjs`；协调仓跑同一文件 6/6 全绿，APK 仓跑却是 `tests 1 / pass 0 / fail 1`。
+    **真因**：该文件是**双仓逐字节镜像**（`check-patch-mirror.mjs` 按递归 tests/ 比对），但它用写死的三段相对路径同时指两仓：
+    `join(HERE, '../../../dsh-mobile-apk/vendor/...')` 与 `join(HERE, '../../../vendor/...')`。协调仓两处都在 ⇒ `length === 2`；
+    APK 仓只有后者在（它自己就是 APK 仓，上面没有第二个 `dsh-mobile-apk/`）⇒ `length === 1` ⇒ 加载期 `throw`。
+    **后果比"少一个断言"更糟**：模块顶层抛出会让**整个文件**被判失败，于是 APK 侧那一份 vendor 实现**一条都没跑**——
+    镜像门禁看得见文件在、看得见字节一致，唯独看不见它其实什么都没验证。
+    **修法**：改成从 `HERE` **向上逐层探测**（6 层内找 `vendor/...` 与 `dsh-mobile-apk/vendor/...`，去重），
+    找不到任何实现在场才判红；找到两份时额外比对**内容一致**（把"两仓必须同源"变成可判红断言，而不是假设）。
+    S1 陈旧 marker 用例里的同款写死路径也一并改为用探测到的 `vendorCores[0]`。
+    **判红证据**：修前 APK 侧 `fail 1`、协调仓 `pass 6`；修后**两仓均 `pass 6 / fail 0`**，且镜像仍逐字节一致。
+    **通用教训**：双仓镜像的测试里，凡是 `../../../` 这种**依赖自己在第几层**的路径都是定时炸弹——
+    写测试时先问"同一份文件放到另一个仓的同一相对位置，这条路径还指得对吗"。

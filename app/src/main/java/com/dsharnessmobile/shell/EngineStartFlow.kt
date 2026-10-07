@@ -21,7 +21,6 @@ internal class EngineStartFlow(private val activity: MainActivity) {
 
   private val flowOwnership = StartupFlowOwnership()
   private val ownershipRetry = StartupOwnershipRetryBudget()
-  private val updateRunning = java.util.concurrent.atomic.AtomicBoolean(false)
   /** 重启引擎 in-flight 守卫（防连点双杀双启）。 */
   private val engineRestarting = java.util.concurrent.atomic.AtomicBoolean(false)
   /** #118 建议7（2026-09）：启动失败自动重试（最多 2 次，5s/10s 间隔），
@@ -40,6 +39,7 @@ internal class EngineStartFlow(private val activity: MainActivity) {
   /** Throttles retries of an engine page that failed while the engine was still booting. */
   private var lastEnginePageReloadAt = 0L
   @Volatile private var monitorGeneration = 0L
+  @Volatile private var updateUiGeneration = 0L
   private val engineMonitorHandler = android.os.Handler(android.os.Looper.getMainLooper())
   private val engineMonitorRunnable = object : Runnable {
     override fun run() {
@@ -351,7 +351,7 @@ internal class EngineStartFlow(private val activity: MainActivity) {
     // 只花一次：本进程已花过预算就直接停手（与 UndoGate 的 30 分钟窗叠加）。
     if (clientPluginTreeRecoverySpent) return
     // 一次性入口：被抑制（重试窗内）或未放行 ⇒ 现在不执行回滚。
-    if (!UndoGate.onClientPluginTreeFailure(activity, clientPluginFailureReason)) return
+    if (!UndoGate.onClientPluginTreeFailure(activity, clientPluginFailureReason, activity.engineManager)) return
     if (clientPluginTreeRecoverySpent) return
     clientPluginTreeRecoverySpent = true
     LogCollector.log("dsh-shell", "client plugin tree recovery starting (generation=" + generation + ")")
@@ -362,7 +362,14 @@ internal class EngineStartFlow(private val activity: MainActivity) {
       val ids = LogCollector.clientFailedIdsOf(clientPluginFailureRawLine)
       // 纯判据（见 [clientPluginFailureRoute]）：唯一命中才外科拔除；点名不出但清单未变才允许
       // 整份回滚；两者都不成立就**不动作**（宁可不动，也不做一次会吞掉用户插件的写回）。
-      val candidate = PluginMounts.clientPullCandidate(patchText, ids, PluginMounts.hardNames(activity))
+      val hardManifest = PluginMounts.ensureHard(activity, PluginMounts.currentFingerprint(activity))
+      if (hardManifest == null) {
+        LogCollector.writeBootFail(activity, "client-plugin-tree-failed-ownership-unverified",
+          "本版本插件归属清单缺失或不匹配；未自动隔离/回滚，用户配置保持原样")
+        activity.runOnUiThread { activity.presentClientPluginFailure() }
+        return
+      }
+      val candidate = PluginMounts.clientPullCandidate(patchText, ids, hardManifest)
       val route = clientPluginFailureRoute(candidate, PluginMounts.mountUnchangedSinceHealthy(activity, patch))
       if (route == ClientPluginFailureRoute.NO_ACTION) {
         LogCollector.writeBootFail(
@@ -529,12 +536,14 @@ internal class EngineStartFlow(private val activity: MainActivity) {
   }
 
   fun startUpdateCheck() {
-    if (!updateRunning.compareAndSet(false, true)) return
+    if (!OnlineUpdateGate.begin()) return
+    val updateGeneration = ++updateUiGeneration
     activity.guideRenderer.chrome.updateButton.isEnabled = false
     activity.guideRenderer.chrome.updateButton.alpha = 0.55f
     activity.applyGuidePhase(GuidePhase.Updating, "检查更新…")
     UpdateManager(activity).checkAndApply { st ->
       activity.runOnUiThread {
+        if (updateGeneration != updateUiGeneration || !canRunEngineWork()) return@runOnUiThread
         // 相位由**类型**决定（0.14.1 批 2 / P0-2）：旧实现按字符串前缀猜，于是「本版没配发布源」
         // 被当失败渲染成满屏红字，而那串错误里写着 overrideManifestUrl（只存在于代码里的名字）。
         // 现在 NotConfigured 走 Info（中性事实 + 下一步），只有真正的失败才是红。
@@ -546,7 +555,7 @@ internal class EngineStartFlow(private val activity: MainActivity) {
           UpdateManager.UpdateOutcome.NotConfigured -> GuidePhase.Info
           UpdateManager.UpdateOutcome.Failed -> GuidePhase.Error
           UpdateManager.UpdateOutcome.Done -> GuidePhase.Recovering
-          UpdateManager.UpdateOutcome.Working -> GuidePhase.Updating
+          UpdateManager.UpdateOutcome.Working, UpdateManager.UpdateOutcome.Verifying -> GuidePhase.Updating
         }
         if (locked) {
           activity.guideRenderer.applyGuideHint(
@@ -559,8 +568,7 @@ internal class EngineStartFlow(private val activity: MainActivity) {
             if (phase == GuidePhase.Error) st.text.removePrefix("更新失败：") else null,
           )
         }
-        if (st.outcome != UpdateManager.UpdateOutcome.Working) {
-          updateRunning.set(false)
+        if (st.outcome != UpdateManager.UpdateOutcome.Working && st.outcome != UpdateManager.UpdateOutcome.Verifying) {
           activity.guideRenderer.chrome.updateButton.isEnabled = true
           activity.guideRenderer.chrome.updateButton.alpha = 1f
         }
@@ -602,7 +610,7 @@ internal class EngineStartFlow(private val activity: MainActivity) {
         // DEGRADED_HTTP（端口可连、HTTP 持续失败）下恒被清零，于是「半死引擎」在这条路径上
         // 永远达不到阈值，自动回撤静默不可达（与 planTick 的熔断锁存同族盲区）。
         // DEAD 路径不受影响：DEAD 下 consecutiveDegradedHttp 恒 0，两个计数相等。
-        if (!UndoGate.onProbeFailure(activity, WatchdogV2.effectiveFailureCount())) return@Thread
+        if (!UndoGate.onProbeFailure(activity, WatchdogV2.effectiveFailureCount(), engine = activity.engineManager)) return@Thread
         requireCurrentEngineFlow(generation)
         activity.runOnUiThread {
           if (!isCurrentEngineFlow(generation)) return@runOnUiThread
@@ -714,11 +722,19 @@ internal class EngineStartFlow(private val activity: MainActivity) {
           requireCurrentEngineFlow(generation)
           activity.engineManager.recoverInterruptedRefresh()
           requireCurrentEngineFlow(generation)
-          // 0.14.2-fx-2 缺口：恢复期**拒绝回滚**此前只有 logcat/诊断面，没有任何界面提示，
-          // 用户数据被保护了却不知情。这里落结构化码 + 一次性标记 + 诊断包；可见面由
-          // MainActivity 在引擎页面就绪后注入 DOM（引导页会被 showWeb 盖掉，故不切引导页相位）。
-          // 不阻断启动：恢复失败只意味着「这棵树还没收敛」，引擎仍可能正常起。
+          // 恢复期拒绝必须同时留下诊断证据与用户提示：写结构化码、一次性标记和诊断包；
+          // 本轮若仍未收敛，下面直接显示引导页 Error 并阻断探活/启动。恢复后进入引擎页时，
+          // MainActivity 也可消费保留的标记，在 DOM 中交付后续提示。
+          // 恢复失败时必须阻断探活与启动；事务现场未收敛前不能把当前 live 树当成健康运行时。
           reportRecoveryRejectionIfAny(activity, activity.engineManager.pendingRecoveryFailure) { isCurrentEngineFlow(generation) }
+          if (activity.engineManager.snapshotRecoveryBlocksRuntime()) {
+            activity.runOnUiThread {
+              if (!isCurrentEngineFlow(generation)) return@runOnUiThread
+              activity.applyGuidePhase(GuidePhase.Error, "运行时恢复未完成", "事务现场已保留；请打开控制台查看恢复失败原因。修复前不会探活或启动运行时。")
+              activity.showGuide()
+            }
+            throw java.util.concurrent.CancellationException("snapshot recovery has not converged")
+          }
         },
         // Health `running` intentionally includes arbitrary 401s for watchdog semantics; startup
         // early-exit needs ownership proof and must not treat an unrelated local listener as ours.
@@ -1095,6 +1111,7 @@ internal class EngineStartFlow(private val activity: MainActivity) {
 
   /** Cancel this Activity's callers, never the process-wide root maintenance worker. */
   fun destroy() {
+    updateUiGeneration++
     flowOwnership.invalidate(destroy = true)
     stopMonitoring()
     engineMonitorHandler.removeCallbacksAndMessages(null)
@@ -1102,16 +1119,19 @@ internal class EngineStartFlow(private val activity: MainActivity) {
 
   /** Run the runtime snapshot update; status mirrored to a file for adb verification. */
   fun runUpdate() {
+    if (!OnlineUpdateGate.begin()) return
+    val updateGeneration = ++updateUiGeneration
     val statusFile = File(activity.filesDir, "update-status.txt")
     val manager = UpdateManager(activity)
     manager.checkAndApply { st ->
       activity.runOnUiThread {
+        if (updateGeneration != updateUiGeneration || !canRunEngineWork()) return@runOnUiThread
         // 与 startUpdateCheck 同口径（0.14.1 批 2 / P0-2）：相位由**类型**决定，不猜字符串前缀。
         val phase = when (st.outcome) {
           UpdateManager.UpdateOutcome.NotConfigured -> GuidePhase.Info
           UpdateManager.UpdateOutcome.Failed -> GuidePhase.Error
           UpdateManager.UpdateOutcome.Done -> GuidePhase.Recovering
-          UpdateManager.UpdateOutcome.Working -> GuidePhase.Updating
+          UpdateManager.UpdateOutcome.Working, UpdateManager.UpdateOutcome.Verifying -> GuidePhase.Updating
         }
         activity.applyGuidePhase(phase, st.text)
         activity.showGuide()
@@ -1175,6 +1195,7 @@ internal class EngineStartFlow(private val activity: MainActivity) {
           }
           return@Thread
         }
+        UndoGate.clearRetryEpochForUserRestart(activity)
         if (!isCurrentEngineFlow(generation)) return@Thread
         EngineManager.lastStartAttemptAt = 0
         LogCollector.log("dsh-shell", "restart engine requested (tracked child only)")
@@ -1197,6 +1218,12 @@ internal class EngineStartFlow(private val activity: MainActivity) {
     caller.start()
     return true
   }
+}
+
+internal object OnlineUpdateGate {
+  private val running = java.util.concurrent.atomic.AtomicBoolean(false)
+  fun begin(): Boolean = running.compareAndSet(false, true)
+  fun end() { running.set(false) }
 }
 
 /**
@@ -1341,18 +1368,14 @@ private fun maybeSelfHealDamagedRuntimeTree(activity: MainActivity, current: () 
  * 为什么必须有人调它：`applyRecovery` 的 ROLLBACK_FAILED 只写 logcat 与
  * `pendingRecoveryFailure`，没有任何面向 UI 的通道 ⇒ 数据被保护了但用户完全不知情。
  *
- * 做三件事（与 :552 的 refreshSnapshot 失败**同族**的落盘面，但可见面不同）：
+ * 做三件事（与 refreshSnapshot 失败**同族**的落盘面，但可见面不同）：
  *   ① `LogCollector.writeBootFail(code)` —— 结构化码，排障者 grep 这个码即可归类；
  *   ② 一次性标记文件 —— 供引擎 WebUI 就绪后**注入 DOM 提示**（可见面，见 MainActivity）；
  *   ③ 诊断包镜像 —— 用户可取包反馈。
  *
- * **为什么不在这里切引导页 Error 相位**（与 :552 的关键差别，改动理由写清以免被当成漏做）：
- *   · 恢复期拒绝**不阻断启动**——实测场景（plugin-loss）里应用「一直能跑」，引擎照常起；
- *   · 启动流紧接着就会 `applyGuidePhase(Starting, "正在启动引擎…")`（引擎未起路径）或
- *     `showWeb()`（引擎已起路径），两者都会**立刻覆盖/隐藏**这里设的 Error 相位；
- *     结果是用户看到一闪而过的错误页然后恢复正常 —— 比不显示更糟（像是「刚才出错了？」）；
- *   · 因此可见面唯一可靠的落点是**页面 DOM 注入**（引擎起来、页面 onPageFinished 之后）。
- *   若引擎最终没起来，既有 boot-fail 错误页已经展示了失败，本条仍完整落在诊断面。
+ * **恢复拒绝会阻断探活与启动**：启动流在发现未收敛事务后保留现场、显示持久的引导页 Error，
+ * 并抛出 CancellationException 结束本轮；不能继续到 `applyGuidePhase(Starting, ...)` 或 `showWeb()`。
+ * 这样用户可直接看到恢复入口提示，诊断码、一次性标记和诊断包仍用于后续排查与恢复。
  */
 private fun reportRecoveryRejectionIfAny(activity: MainActivity, detail: String?, current: () -> Boolean) {
   if (!current()) return

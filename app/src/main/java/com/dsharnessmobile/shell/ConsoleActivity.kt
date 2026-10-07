@@ -148,6 +148,7 @@ class ConsoleActivity : ComponentActivity() {
         return
       }
       val engine = EngineManager(this@ConsoleActivity)
+      val hardManifest = PluginMounts.ensureHard(this@ConsoleActivity, PluginMounts.currentFingerprint(this@ConsoleActivity))
       val result = when (action) {
         SafeAction.ON -> SafeMode.enter(
           patch = SafeMode.patchFile(engine),
@@ -155,7 +156,9 @@ class ConsoleActivity : ComponentActivity() {
           autoDir = SafeMode.autoDir(engine),
           id = SafeMode.newId(),
           // 与引导页按钮同一权威来源（[SafeMode.isProductOwned]）：离线 CLI 与 UI 必须同口径。
-          hardNames = PluginMounts.hardNames(this@ConsoleActivity),
+          hardNames = hardManifest?.names.orEmpty(),
+          hardManifestAvailable = hardManifest != null,
+          hardEntries = hardManifest?.entries,
         )
         SafeAction.OFF -> SafeMode.exit(
           patch = SafeMode.patchFile(engine),

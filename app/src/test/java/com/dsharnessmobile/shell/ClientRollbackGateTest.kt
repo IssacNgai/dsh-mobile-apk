@@ -131,10 +131,16 @@ class ClientRollbackGateTest {
 
   @Test
   fun 一次性入口源码_不得起观察窗也不得等WATCH_MS() {
-    val code = memberBody(codeOnly(shellSource("UndoGate.kt")), "fun onClientPluginTreeFailure(context: Context, detail: String): Boolean")
+    val code = memberBody(codeOnly(shellSource("UndoGate.kt")), "fun onClientPluginTreeFailure(context: Context, detail: String, engine: EngineManager? = null): Boolean")
     assertTrue("必须用 decide 复用 SUPPRESS/EXECUTE 语义", code.contains("decide(TRIGGER_CONSEC_FAILURES"))
-    assertTrue("必须读上次回滚时刻（防循环窗口）", code.contains("lastUndoAt(context)"))
-    assertFalse("不得写 arm 文件（那会引入永不打开的观察窗）", code.contains("armFile("))
+    assertTrue("必须按安装 + 当前失败patch身份读取重试marker", code.contains("retrySuppression(markerFile(context), currentRetryIdentity(context, engine), now)"))
+    // 契约是「不得**新开**观察窗」，不是「不得碰 arm 文件」：清退一个陈旧起点是安全方向，
+    // 写入时间戳才会造出一个在这条路上永远走不到 EXECUTE 的窗口（历史缺陷形状即 armFile().writeText(now)）。
+    assertFalse(
+      "不得写 arm 文件（那会引入永不打开的观察窗）",
+      Regex("""armFile\s*\([^)]*\)\s*\.\s*(writeText|writeBytes|appendText|createNewFile)""").containsMatchIn(code),
+    )
+    assertTrue("观察窗起点只能来自读盘，不得在本入口重新计时", code.contains("armedAt("))
     assertFalse("不得等待 WATCH_MS", code.contains("WATCH_MS"))
     assertTrue("判定必须走纯函数两态映射", code.contains("clientPluginFailureDecision("))
   }
@@ -336,15 +342,16 @@ class ClientRollbackGateTest {
       val candidate = PluginMounts.clientPullCandidate(patch.readText(), listOf("dsh-bad-probe"), hard)!!
       assertTrue("唯一命中必须拔除成功", PluginMounts.pullByClientIds(ctx, patch, candidate))
       val after = patch.readText()
-      assertFalse("目标块必须消失", after.contains("dsh-bad-probe"))
+      assertTrue("目标插件原块必须保留供用户恢复", after.contains("dsh-bad-probe-plugin"))
+      assertTrue("目标插件必须由Cordis disabled override隔离", after.contains("- id: \"dsh-bad-probe\"\n  name: \"dsh-bad-probe-plugin\"\n  disabled: true"))
       assertTrue("其它条目一条不少", PluginMounts.entryNames(after).containsAll(
         listOf("@dsh-android/dsh-shell-termux", "dshmarketplace-plugin", "@dsh-android/dsh-android-bridge"),
       ))
       assertTrue("顶层说明注释不得被误删", after.contains("顶层说明注释"))
       assertTrue("disabled 条目不得受影响", after.contains("disabled: true"))
       assertEquals(
-        "条目数 4 -> 3",
-        PluginMounts.entryNames(fixture).size - 1,
+        "原条目保留，另增加一个顶层 disabled override",
+        PluginMounts.entryNames(fixture).size + 1,
         PluginMounts.entryNames(after).size,
       )
     } finally {
@@ -421,14 +428,16 @@ class ClientRollbackGateTest {
   fun execute_分支顺序与安全护栏一字不改() {
     val code = codeOnly(shellSource("UndoGate.kt"))
     val sourceAt = code.indexOf("?: clientFailure")
-    val hardAt = code.indexOf("failed.name !in hard")
+    val hardAt = code.indexOf("val hard = PluginMounts.ensureHard(context, installFingerprint(context))")
+    val exactOwnershipAt = code.indexOf("!hard.owns(failed.id, failed.name)")
     val pullAt = code.indexOf("PluginMounts.pull(context, patch, failed)")
     val mountAt = code.indexOf("PluginMounts.mountUnchangedSinceHealthy(context, patch)")
     val q = '"'
     val restoreAt = code.indexOf("listOf(" + q + "restore" + q + ", known)")
     assertTrue("失败条目来源必须在最前", sourceAt > 0)
-    assertTrue("硬清单护栏必须在拔除之前", hardAt > sourceAt)
-    assertTrue("外科拔除必须仍在整份回滚之前", pullAt > hardAt && pullAt < restoreAt)
+    assertTrue("权威Hard清单必须在拔除之前解析", hardAt > sourceAt)
+    assertTrue("失败entry必须按exact id/name归属后才允许拔除", exactOwnershipAt > hardAt)
+    assertTrue("外科拔除必须仍在整份回滚之前", pullAt > exactOwnershipAt && pullAt < restoreAt)
     assertTrue("清单未变护栏必须仍在场", mountAt > pullAt)
     assertTrue("整份回滚目标必须仍是已知良好 id", restoreAt > mountAt)
     assertTrue("跨版本护栏必须仍在场", code.contains("knownGoodUsable(knownGoodId(context), knownGoodFp(context), installFingerprint(context))"))

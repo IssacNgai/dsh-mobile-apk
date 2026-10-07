@@ -1,46 +1,49 @@
-    // dsh-mobile safe keeps shipped plugins (S1): 只摘第三方 insert 子条目，保留我方装配的插件
-    // 与全部顶层 disable 行（与壳侧 SafeMode.kt 同口径）。原实现整份覆写成最小文件，会摘掉
-    // 12 个 @dsh-android/* 引用与 7 条 disabled（含安全关键的 client-hmr）。
-    const dshMobileSafeShippedPrefixes = ["@deepseek-ai/", "@dsh-android/"];
-    const dshMobileSafeShippedNames = ["dsh-undo-savepoint", "dshmarketplace-plugin"];
-    const dshMobileSafeIsShipped = (name) => {
-      const v = String(name ?? "").trim().replace(/^['\"]+|['\"]+$/g, "");
-      if (v === "") return false;
-      if (dshMobileSafeShippedNames.includes(v)) return true;
-      return dshMobileSafeShippedPrefixes.some((p) => v.startsWith(p));
-    };
+    // dsh-mobile safe ownership identity v2: no namespace or live-patch fallback can prove ownership.
+    const filesRoot = dirname(dirname(DSH_HOME));
+    const hardManifest = JSON.parse(await fs.readFile(join(filesRoot, ".plugin-hard-manifest.json"), "utf8"));
+    const installedFingerprint = (await fs.readFile(join(filesRoot, ".snapshot-fingerprint"), "utf8")).trim();
+    if (hardManifest.schema !== 2 || hardManifest.complete !== true || hardManifest.fingerprint !== installedFingerprint ||
+      !Array.isArray(hardManifest.entries) || hardManifest.entries.length === 0 || hardManifest.entries.some((entry) =>
+        !entry || typeof entry.id !== "string" || entry.id.length === 0 || typeof entry.name !== "string" || entry.name.length === 0) ||
+      !Array.isArray(hardManifest.profileEntries) || hardManifest.profileEntries.length === 0 || hardManifest.profileEntries.some((entry) =>
+        !entry || typeof entry.id !== "string" || typeof entry.name !== "string" ||
+        !hardManifest.entries.some((hard) => hard.id === entry.id && hard.name === entry.name))) {
+      throw new Error("Safe Mode ownership manifest is missing, invalid, or for another snapshot; configuration was not changed");
+    }
+    const hardEntries = hardManifest.entries;
+    const owns = (id, name) => hardEntries.some((entry) => entry.id === id && entry.name === name);
     const dshMobileSafeFilterInserts = (text) => {
-      const lines = String(text).split("\n");
-      const out = [];
+      const lines = String(text).split("\n"), out = [];
       let i = 0;
       while (i < lines.length) {
-        if (!/^- insert:\s*$/.test(lines[i])) { out.push(lines[i]); i += 1; continue; }
+        if (!/^- insert:\s*$/.test(lines[i])) { out.push(lines[i++]); continue; }
         let end = i + 1;
-        while (end < lines.length && !/^-/.test(lines[end])) end += 1;
+        while (end < lines.length && !/^-\s/.test(lines[end]) && lines[end] !== "-") end++;
         const body = lines.slice(i + 1, end);
-        const firstItem = body.find((l) => /^(\s*)-\s+(id|name):/.test(l));
-        const itemIndent = firstItem ? firstItem.length - firstItem.replace(/^\s+/, "").length : null;
-        if (itemIndent === null) { out.push(lines[i]); out.push(...body); i = end; continue; }
-        // 按缩进切子条目块
-        const chunks = [];
-        let cur = null;
-        for (const line of body) {
-          const m = /^(\s*)-\s+/.exec(line);
-          if (m && m[1].length === itemIndent) { if (cur) chunks.push(cur); cur = [line]; }
-          else if (cur) cur.push(line);
-        }
-        if (cur) chunks.push(cur);
+        const rows = body.map((line, index) => {
+          const match = /^(\s*)-\s+(id|name):\s*(.*)$/.exec(line);
+          return match ? { index, indent: match[1].length, key: match[2], value: match[3].trim().replace(/^['\"]|['\"]$/g, "") } : null;
+        }).filter(Boolean);
+        const indent = rows.length ? Math.min(...rows.map((row) => row.indent)) : null;
+        if (indent === null) { out.push(lines[i], ...body); i = end; continue; }
+        const starts = rows.filter((row) => row.indent === indent).map((row) => row.index);
         const kept = [];
-        for (const chunk of chunks) {
-          const nm = /^\s*-?\s*name:\s*['\"]?([^'\"\s]+)/m.exec(chunk.join("\n"));
-          if (nm && !dshMobileSafeIsShipped(nm[1])) continue; // 第三方：整条摘掉
+        for (let n = 0; n < starts.length; n++) {
+          const start = starts[n], stop = starts[n + 1] ?? body.length;
+          const chunk = body.slice(start, stop), head = rows.find((row) => row.index === start);
+          const id = head.key === "id" ? head.value : null;
+          const name = head.key === "name" ? head.value : chunk.map((line) => {
+            const match = new RegExp("^\\s{" + (indent + 2) + "}name:\\s*(.*)$").exec(line);
+            return match ? match[1].trim().replace(/^['\"]|['\"]$/g, "") : null;
+          }).find(Boolean) ?? null;
+          if (name !== null && !owns(id, name)) continue;
           kept.push(...chunk);
         }
-        if (kept.length === 0) { i = end; continue; } // 空 insert 会让引擎 boot 抛
-        out.push(lines[i]); out.push(...kept); i = end;
+        if (kept.length) out.push(lines[i], ...kept);
+        i = end;
       }
       return out.join("\n");
     };
-    const dshMobileSafePatchText = await fs.readFile(patch, 'utf8');
+    const dshMobileSafePatchText = await fs.readFile(patch, "utf8");
     const minimal = dshMobileSafeFilterInserts(dshMobileSafePatchText);
-    await fs.writeFile(patch, minimal, 'utf8');
+    await fs.writeFile(patch, minimal, "utf8");

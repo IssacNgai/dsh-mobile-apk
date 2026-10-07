@@ -6,13 +6,15 @@ import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
+import java.util.UUID
 import org.json.JSONObject
 
 /**
- * Runtime snapshot online update (M2): fetch a manifest {url, sha256, size},
- * download the snapshot, verify, extract to an update-stage dir outside the
- * live tree, then atomically swap usr → usr-old / update-stage/usr → usr.
- * The engine restart is handled by the EngineService watchdog on the next poll.
+ * Runtime snapshot online update: fetch and verify a {url, sha256, size} archive,
+ * extract it to the transaction-owned stage, and atomically swap only usr. A full
+ * usr/ + home/ archive can provide verified Hard-composition evidence, but staged
+ * home is never applied to the user's live HOME. The previous usr remains journaled
+ * until candidate Hard health is confirmed; only then does the UI report completion.
  */
 class UpdateManager(private val context: Context) {
 
@@ -26,7 +28,7 @@ class UpdateManager(private val context: Context) {
    * 也不同（前者无需处理，后者要看日志/重试）。故把结论做成**类型**，界面按类型决定相位，
    * 不再靠前缀匹配。
    */
-  enum class UpdateOutcome { Working, Done, Failed, NotConfigured }
+  enum class UpdateOutcome { Working, Verifying, Done, Failed, NotConfigured }
 
   /** 一次状态回执：类型 + **用户可见**文案（不允许出现内部标识符）。 */
   data class UpdateStatus(val outcome: UpdateOutcome, val text: String)
@@ -49,6 +51,11 @@ class UpdateManager(private val context: Context) {
    */
   fun checkAndApply(onStatus: (UpdateStatus) -> Unit) {
     Thread {
+      val archive = File(context.filesDir, "update-${UUID.randomUUID()}.tar.xz")
+      val stage = SnapshotTransaction.stageRoot(context.filesDir)
+      var transactionStarted = false
+      var ownsTransactionStage = false
+      var probationStarted = false
       try {
         onStatus(UpdateStatus(UpdateOutcome.Working, "检查更新…"))
         // S-10：未配置可信发布源 = 未启用（不再对着模拟器别名超时，也不再给出「可用」的错觉）。
@@ -57,6 +64,11 @@ class UpdateManager(private val context: Context) {
           onStatus(notConfiguredStatus)
           return@Thread
         }
+        val manager = EngineManager(context)
+        if (!manager.beginOnlineUpdateTransaction()) {
+          throw IllegalStateException("已有运行时事务或未归属的恢复现场正在进行")
+        }
+        ownsTransactionStage = true
         val manifest = JSONObject(fetch(manifestUrl))
         val url = manifest.getString("url")
         // 完整性加固（2026-08-23，审核 A6/B5）：在线更新快照可被中间人篡改——
@@ -65,62 +77,88 @@ class UpdateManager(private val context: Context) {
         val declaredSize = manifest.optLong("size", 0)
 
         onStatus(UpdateStatus(UpdateOutcome.Working, "下载快照（" + (declaredSize / 1024 / 1024) + " MB）…"))
-        val tmp = File(context.filesDir, "update.tar.xz")
-        download(url, tmp, declaredSize)
+        download(url, archive, declaredSize)
 
         onStatus(UpdateStatus(UpdateOutcome.Working, "校验…"))
-        val actual = sha256(tmp)
+        val actual = sha256(archive)
         if (!actual.equals(expectedSha, ignoreCase = true)) {
-          tmp.delete()
           throw IllegalStateException("SHA256 不匹配: " + actual.take(12) + "…")
         }
 
         onStatus(UpdateStatus(UpdateOutcome.Working, "解压新快照…"))
-        // The archive holds a usr/ prefix; stage it OUTSIDE the live tree.
-        val stage = File(context.filesDir, "update-stage")
-        SnapshotFs.deletePath(stage)
-        SnapshotExtractor.extract(
-          tmp.inputStream(), manifest.optLong("size", 0), stage, { _, _ -> }, runtimeRoot = context.filesDir,
+        val priorFingerprint = File(context.filesDir, ".snapshot-fingerprint")
+          .takeIf { it.exists() }?.readText()?.trim().orEmpty()
+        if (!priorFingerprint.matches(Regex("[0-9a-fA-F]{64}"))) {
+          throw IllegalStateException("当前运行时缺少可验证的回退指纹，拒绝在线更新")
+        }
+        val baseFingerprint = PluginMounts.embeddedFingerprint(context)
+          ?: throw IllegalStateException("当前安装缺少可信的内嵌插件身份，拒绝在线更新")
+        val startedAt = System.currentTimeMillis()
+        SnapshotTransaction.writeMarker(
+          context.filesDir,
+          SnapshotTransaction.Marker(
+            SnapshotTransaction.Phase.STAGED,
+            expectedSha,
+            startedAt,
+            purpose = SnapshotTransaction.Purpose.ONLINE_UPDATE,
+            priorFingerprint = priorFingerprint,
+            baseFingerprint = baseFingerprint,
+          ),
         )
-        tmp.delete()
+        transactionStarted = true
+        SnapshotExtractor.extract(
+          archive.inputStream(), declaredSize, stage, { _, _ -> }, runtimeRoot = context.filesDir,
+        )
         val newUsr = File(stage, "usr")
-        if (!File(newUsr, "bin/node").exists()) throw IllegalStateException("新快照缺少 node")
+        if (!SnapshotFs.exists(File(newUsr, "bin/node"))) throw IllegalStateException("新快照缺少 node")
+        if (PluginMounts.prepareOnlineHardManifest(context, stage, expectedSha, baseFingerprint) == null) {
+          throw IllegalStateException("新快照缺少可验证的插件身份，拒绝在线更新")
+        }
+        if (!File(context.filesDir, "usr/bin/node").isFile) throw IllegalStateException("当前运行时缺少 node，拒绝在线替换")
 
         onStatus(UpdateStatus(UpdateOutcome.Working, "切换运行时…"))
         // Stop only an engine child held by this app process; never broad-match a listener by argv.
-        if (!EngineManager(context).stopOwnedEngine()) {
+        if (!manager.stopOwnedEngine()) {
           throw IllegalStateException("运行时更新已拒绝：3080 监听进程未归属到本壳，未停止外部进程")
         }
-        val usr = File(context.filesDir, "usr")
-        val old = File(context.filesDir, "usr-old")
-        SnapshotFs.deletePath(old)
-        if (usr.exists()) usr.renameTo(old)
-        if (!newUsr.renameTo(usr)) {
-          // 切换失败：立即回退旧代，不留半更新状态（PRD F3.2 第二层回退语义）。
-          if (old.exists() && !old.renameTo(usr)) {
-            Log.e("dsh-update", "swap failed and rollback failed; old runtime at usr-old: " + old.absolutePath)
-          }
-          throw IllegalStateException("切换失败（已回退旧代）")
-        }
-        SnapshotFs.deletePath(stage)
-        // 更新管理器第二版（PRD F3.2/F1.10）：保留上一版运行时（usr-old），
-        // 由 EngineManager 探活确认（连续 N 次健康）后清理；超窗未健康自动回退旧代。
-        // 原子切换联动 F3 最后已知良好状态语义：pending 标记是回退状态机的输入。
+        SnapshotTransaction.swap(
+          filesDir = context.filesDir,
+          stagedRoot = stage,
+          usrDir = File(context.filesDir, "usr"),
+          homeDir = File(context.filesDir, "home"),
+          preservedNames = SnapshotUserData.preservedNames.toSet(),
+          fingerprint = expectedSha,
+          startedAt = startedAt,
+          purpose = SnapshotTransaction.Purpose.ONLINE_UPDATE,
+          priorFingerprint = priorFingerprint,
+          baseFingerprint = baseFingerprint,
+        )
+        probationStarted = true
         File(context.filesDir, ".update-pending").writeText("1")
         File(context.filesDir, ".update-pending-at").writeText(System.currentTimeMillis().toString())
-
-        // The tracked child was stopped before the runtime swap; the service watchdog starts the new tree.
-        // Record the snapshot fingerprint: distinguishes an online update from the embedded assets
-        // fingerprint (otherwise the next boot misjudges "snapshot stale" and re-extracts the assets
-        // snapshot, reverting the online update to factory state).
-        if (expectedSha.isNotEmpty()) {
-          File(context.filesDir, ".snapshot-fingerprint").writeText(expectedSha)
-        }
-        onStatus(UpdateStatus(UpdateOutcome.Done, "更新完成，引擎已自动重启"))
+        onStatus(UpdateStatus(UpdateOutcome.Verifying, "运行时已切换，正在等待启动与健康验证…"))
+        val settlement = awaitOnlineSettlement(expectedSha, baseFingerprint, priorFingerprint)
+        probationStarted = SnapshotTransaction.readMarker(context.filesDir) != null ||
+          File(context.filesDir, ".update-pending").exists()
+        onStatus(settlement)
       } catch (t: Throwable) {
+        if (transactionStarted) {
+          val recovered = try { EngineManager(context).abortOnlineUpdate() } catch (rollback: Throwable) {
+            t.addSuppressed(rollback)
+            false
+          }
+          if (!recovered) Log.e("dsh-update", "online update rollback incomplete; transaction journal and recovery source retained")
+          probationStarted = !recovered
+        }
         // 失败文案也要能读懂：异常自带的内部措辞（HTTP 码、Java 类名）不上屏，只进日志。
         Log.w("dsh-update", "update failed: " + t.message)
         onStatus(UpdateStatus(UpdateOutcome.Failed, "更新失败：" + UpdateFailures.humanize(t)))
+      } finally {
+        // The archive is never a recovery source; the stage is retained only while its journal needs it.
+        SnapshotFs.deletePath(archive)
+        if (ownsTransactionStage && SnapshotTransaction.readMarker(context.filesDir) == null) SnapshotFs.deletePath(stage)
+        if (!probationStarted) EngineManager.onlineUpdateActive.set(false)
+        OnlineUpdateGate.end()
       }
     }.start()
   }
@@ -164,6 +202,61 @@ class UpdateManager(private val context: Context) {
     }
   }
 
+  private fun awaitOnlineSettlement(expectedFingerprint: String, baseFingerprint: String, priorFingerprint: String): UpdateStatus {
+    val deadline = System.currentTimeMillis() + EngineManager.UPDATE_ROLLBACK_MS + UPDATE_SETTLEMENT_GRACE_MS
+    while (System.currentTimeMillis() < deadline) {
+      val markerPresent = SnapshotTransaction.readMarker(context.filesDir) != null
+      val pendingPresent = File(context.filesDir, ".update-pending").exists()
+      val liveFingerprint = File(context.filesDir, ".snapshot-fingerprint")
+        .takeIf { it.isFile }?.let { runCatching { it.readText().trim() }.getOrNull() }.orEmpty()
+      val onlineIdentity = readOnlineIdentity(File(context.filesDir, ".online-snapshot"))
+      when (OnlineSettlement.classify(
+        markerPresent, pendingPresent, liveFingerprint, onlineIdentity.first, onlineIdentity.second,
+        expectedFingerprint, baseFingerprint, priorFingerprint,
+      )) {
+        OnlineSettlement.State.COMMITTED -> return UpdateStatus(UpdateOutcome.Done, "更新已通过启动与健康验证")
+        OnlineSettlement.State.ROLLED_BACK -> return UpdateStatus(UpdateOutcome.Failed, "新版本未通过健康验证，已自动回退到原版本；用户数据已保留")
+        OnlineSettlement.State.INCONSISTENT -> return UpdateStatus(UpdateOutcome.Failed, "更新状态无法确认；恢复现场已保留，请打开控制台检查日志")
+        OnlineSettlement.State.PENDING -> Unit
+      }
+      try { Thread.sleep(UPDATE_SETTLEMENT_POLL_MS) } catch (_: InterruptedException) {
+        Thread.currentThread().interrupt()
+        return UpdateStatus(UpdateOutcome.Failed, "健康验证等待已中断；恢复现场已保留，请重新启动应用完成恢复")
+      }
+    }
+    return UpdateStatus(UpdateOutcome.Failed, "启动与健康验证超时；恢复现场已保留，请重新启动应用并查看控制台日志")
+  }
+
+  private fun readOnlineIdentity(file: File): Pair<String, String> {
+    if (!file.isFile) return "" to ""
+    return try {
+      val values = file.readLines().mapNotNull { line ->
+        val split = line.indexOf('=')
+        if (split <= 0) null else line.substring(0, split) to line.substring(split + 1)
+      }
+      val map = values.toMap()
+      if (values.size != 2 || map.size != 2 || map.keys != setOf("base", "archive")) "" to ""
+      else map["base"].orEmpty() to map["archive"].orEmpty()
+    } catch (_: Throwable) { "" to "" }
+  }
+
+  internal object OnlineSettlement {
+    enum class State { PENDING, COMMITTED, ROLLED_BACK, INCONSISTENT }
+
+    fun classify(
+      markerPresent: Boolean, pendingPresent: Boolean, liveFingerprint: String,
+      onlineBase: String, onlineArchive: String, expectedFingerprint: String,
+      baseFingerprint: String, priorFingerprint: String,
+    ): State {
+      if (markerPresent || pendingPresent) return State.PENDING
+      if (liveFingerprint.equals(expectedFingerprint, true) &&
+        onlineBase.equals(baseFingerprint, true) && onlineArchive.equals(expectedFingerprint, true)) return State.COMMITTED
+      if (priorFingerprint.isNotBlank() && !priorFingerprint.equals(expectedFingerprint, true) &&
+        liveFingerprint.equals(priorFingerprint, true)) return State.ROLLED_BACK
+      return State.INCONSISTENT
+    }
+  }
+
   private fun fetch(url: String): String {
     val conn = URL(url).openConnection() as HttpURLConnection
     conn.connectTimeout = 10_000
@@ -201,6 +294,9 @@ class UpdateManager(private val context: Context) {
   }
 
   companion object {
+    private const val UPDATE_SETTLEMENT_POLL_MS = 1_000L
+    private const val UPDATE_SETTLEMENT_GRACE_MS = 45_000L
+
     /**
      * 发布面 manifest 地址（审查 §5.10 / S-10）。
      *

@@ -74,6 +74,12 @@ export function assembleApk(options, runner = spawnSync) {
   writeFileSync(fingerprint, sha, 'ascii')
   log(`snapshot.sha256 = ${sha}`)
 
+  // Generate exact product ownership only from the final injected archive. The
+  // separately packaged manifest binds itself to this tar hash, avoiding a hash cycle.
+  const hardManifest = join(assetDir, 'plugin-hard-manifest.json')
+  execute(process.execPath, [join(SCRIPT_DIR, 'build-hard-manifest.mjs'), '--snapshot', sourceSnapshot, '--out', hardManifest],
+    { cwd: SCRIPT_DIR }, runner)
+
   execute(process.execPath, [fingerprintGate, '--require'], { cwd: SCRIPT_DIR }, runner)
 
   const gradle = gradleCommand ?? (process.platform === 'win32' ? 'gradlew.bat' : './gradlew')

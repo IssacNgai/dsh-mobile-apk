@@ -105,7 +105,8 @@ for (const id of Object.keys(models)) {
 const snapshot = {
   schema: 1,
   source: `@earendil-works/pi-ai@${piVersion} dist/providers/data`,
-  engineRootHint: engineRoot,
+  // A stable snapshot-relative hint keeps catalog bytes independent of the CI job or host checkout path.
+  engineRootHint: PI_SUBPATH,
   generatedAt: new Date(SOURCE_DATE_EPOCH * 1000).toISOString(),
   modelCount: Object.keys(models).length,
   models,

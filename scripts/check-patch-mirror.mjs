@@ -188,10 +188,19 @@ if (peer) {
     // APK chains as well as the local release assembler.
     'scripts/build-apk-engine.mjs',
     'scripts/build-apk-engine.test.mjs',
+    'scripts/build-hard-manifest.mjs',
+    'scripts/build-hard-manifest.test.mjs',
+    'scripts/check-third-party.mjs',
+    'scripts/check-third-party.test.mjs',
+    'scripts/third-party-licenses.json',
+    'LICENSES/Shizuku-API-MIT.txt',
+    'THIRD_PARTY_NOTICES.md',
+    'scripts/build-apk.mjs',
     // Shared delivery gates and version normalization are invoked from the
     // mirrored local build entrypoint; keep their implementation and tests in sync.
     'scripts/check-apk-signatures.mjs',
     'scripts/check-apk-signatures.test.mjs',
+    'scripts/gen-model-catalog.mjs',
     'scripts/resolve-version-suffix.mjs',
     'scripts/resolve-version-suffix.test.mjs',
     // 门禁脚本**自身**也必须在镜像面（AGENTS.md 铁律 6 明文声明：「scripts/patches/** 与
@@ -370,7 +379,7 @@ if (peer) {
    * （假红），反而失去「挡住真漂移」的判别力。两类，逐条具名（排除面刻意极小）：
    *   - `*.tgz`：打包产物，子仓 .gitignore 已忽略；各自打包时按本侧源码生成，两侧本就不同源。
    *   - `lib/catalog-snapshot.json`：由 build-snapshot-013.mjs 按**本次构建的 ABI 引擎树**生成
-   *     （实测 engineRootHint：coord=…/x86_64/root、apk=…/arm64/root），是构建期数据，
+   *     （engineRootHint 使用快照内相对路径；数据仍来自各 ABI 的真实引擎树），是构建期数据，
    *     不属于铁律 5 的「src + package.json + lib 产物」镜像面。
    * 除外：src/、test/、package.json 等源码仍全量逐字节比对。
    */
