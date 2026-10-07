@@ -366,8 +366,17 @@ object PluginMounts {
   /**
    * 清理因人肉摘除条目而变空的 `- insert:` 包装行（YAML 会把它解析成 null 条目，引擎 boot 期会抛）。
    * 判据：`- insert:` 行之后、下一个同级或更浅的非空行之前，是否已无任何更深缩进行。
+   *
+   * 0.14.5（S-1）：本函数是这条收尾逻辑的**唯一实现**。此前 `SnapshotTransaction` 里有一份
+   * 逐字节等价副本（快照事务的「已摘除插件存量迁移」收尾也用同一判据），两处同源必然漂移——
+   * 其中一处修 bug 而另一处不修，就会出现「同一份清单经两条恢复路径得到两种结果」。
+   * 现在快照事务侧改为调用本函数（`PluginMounts.dropEmptyInsertWrappers(kept)`）。
+   * 可见性由 private 放宽到 internal 只为这一处跨文件调用，不进任何对外可见面。
+   *
+   * @param lines 摘除完成后的清单行（会被就地修改）。
+   * @returns 清理空壳后的同一列表（便于链式书写）。
    */
-  private fun dropEmptyInsertWrappers(lines: MutableList<String>): MutableList<String> {
+  internal fun dropEmptyInsertWrappers(lines: MutableList<String>): MutableList<String> {
     val indent = { line: String -> line.indexOfFirst { !it.isWhitespace() } }
     var index = 0
     while (index < lines.size) {

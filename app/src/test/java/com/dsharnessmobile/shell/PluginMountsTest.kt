@@ -1,5 +1,6 @@
 package com.dsharnessmobile.shell
 
+import java.io.File
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -241,5 +242,98 @@ class PluginMountsTest {
     assertEquals(setOf("@dsh-android/dsh-android-manage"), present)
     assertEquals(listOf("@dsh-android/dsh-android-bridge", "GLM-5.3"), missing)
     assertEquals("两口径必须互补", required.toSet(), present + missing.toSet())
+  }
+
+  // ── 0.14.5 S-1：空壳收尾的**唯一实现**（两条恢复写路径共用）────────────────────
+
+  /** 壳侧源码（工作目录随 gradle 调用方式而变，两种布局都试）。 */
+  private fun source(name: String): String {
+    val candidates = listOf(
+      File("src/main/java/com/dsharnessmobile/shell", name),
+      File("app/src/main/java/com/dsharnessmobile/shell", name),
+    )
+    val f = candidates.firstOrNull { it.isFile }
+      ?: throw AssertionError("找不到壳侧源码 " + name + "（工作目录 = " + File(".").absolutePath + "）")
+    return f.readText()
+  }
+
+  /** 去掉注释行（函数名出现在注释里不算命中——与仓内 grep 门禁同口径）。 */
+  private fun codeOnly(src: String): String = src.lineSequence()
+    .filterNot {
+      val t = it.trimStart()
+      t.startsWith("//") || t.startsWith("*") || t.startsWith("/*")
+    }
+    .joinToString("\n")
+
+  /**
+   * S-1 反证：`dropEmptyInsertWrappers` 只允许有**一份**实现，且快照事务侧必须调用它。
+   *
+   * 为什么这条断言必须落在**源码结构**上而不是行为上：两份实现在 0.14.5 之前**逐字节等价**，
+   * 任何行为用例都会同时被两份实现满足 —— 也就是说「重复实现」这个缺陷在行为面**不可观测**，
+   * 它只在将来某一份被单独修改时才变成可观测的语义分裂（同一份清单经两条恢复路径得到两种结果，
+   * 其中一条是安全敏感的快照事务写路径）。因此判据只能是「定义唯一 + 调用点在场」。
+   *
+   * 三条都要能变红：
+   * ① 把实现复制回 SnapshotTransaction.kt（private 副本）→ 定义计数变 2 → 第一条红；
+   * ② 删掉 PluginMounts 侧的 internal 实现 → 定义计数变 0 → 第一条红；
+   * ③ 把 `PluginMounts.dropEmptyInsertWrappers(kept)` 改回本地调用 → 第二条红。
+   */
+  @Test
+  fun 空壳清理必须是两条恢复路径共用的唯一实现() {
+    val mounts = codeOnly(source("PluginMounts.kt"))
+    val tx = codeOnly(source("SnapshotTransaction.kt"))
+
+    val definitions = listOf(
+      Regex("""fun\s+dropEmptyInsertWrappers\s*\(\s*lines""").findAll(mounts).count(),
+      Regex("""fun\s+dropEmptyInsertWrappers\s*\(\s*lines""").findAll(tx).count(),
+    ).sum()
+    assertEquals(
+      "dropEmptyInsertWrappers 必须全仓只有一份实现（重复实现的行为差在快照事务写路径上不可观测，" +
+        "只能用结构判据钉住）：PluginMounts=" + definitions,
+      1, definitions,
+    )
+    assertTrue(
+      "唯一实现必须留在 PluginMounts（快照事务侧不得再自行定义）",
+      Regex("""internal fun dropEmptyInsertWrappers""").containsMatchIn(mounts),
+    )
+    assertTrue(
+      "快照事务的已摘除插件迁移必须调用 PluginMounts 的唯一实现" +
+        "（撤掉这次合并 = 该调用消失，本断言即红）",
+      tx.contains("PluginMounts.dropEmptyInsertWrappers(kept)"),
+    )
+  }
+
+  /**
+   * 唯一实现的行为契约（两条路径共用同一份，故这一条同时钉住两侧收尾）：
+   * 空壳连同其**前后**相邻空行一起摘掉，不留连续空行；非空壳一字不动。
+   *
+   * 直接调 internal 实现而不是绕 removeEntry：`removeEntry` 的定位正则要求 `- ` 前缀，
+   * 表达不出列 0 的 `-`（合法 YAML 空 elem，可出现在 `- insert:` 前），
+   * 而设备实读的 patch 就是那种形态。
+   */
+  @Test
+  fun 空壳收尾必须吃掉前后空行且不碰非空壳() {
+    val shellThenBlank = mutableListOf(
+      "- id: keep-me",
+      "  disabled: true",
+      "",
+      "- insert:",
+      "",
+      "- id: tail",
+    )
+    val afterShell = PluginMounts.dropEmptyInsertWrappers(shellThenBlank)
+    assertEquals(
+      "空壳与其后紧邻空行必须摘掉，其前紧邻空行也不得留下（否则连续空行会累积）",
+      listOf("- id: keep-me", "  disabled: true", "- id: tail"),
+      afterShell,
+    )
+
+    val withChild = mutableListOf("", "- insert:", "    - id: child", "      name: 'p'")
+    val afterChild = PluginMounts.dropEmptyInsertWrappers(withChild)
+    assertEquals(
+      "组内还有子条目时包装行必须保留（误删 = 整组装配消失）",
+      listOf("", "- insert:", "    - id: child", "      name: 'p'"),
+      afterChild,
+    )
   }
 }

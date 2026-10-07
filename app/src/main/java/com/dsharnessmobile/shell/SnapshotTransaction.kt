@@ -588,43 +588,10 @@ internal object SnapshotTransaction {
    * 崩溃窗口只可能留下不带 journal 的 `.copying` 残渣（下次刷新清掉），恢复路径信任的
    * previous 一律是完整备份；宁可本次刷新失败（marker 不被清、下次重试），绝不半份覆盖。
    */
-  /**
-   * 0.14.2（D11）：清理因人肉摘除条目而变空的 `- insert:` 包装行。
-   *
-   * 判据：一个 `- insert:` 行之后、到下一个同级或更浅的非空行之前，若已无任何更深缩进行，
-   * 它就是个空壳（YAML 解析成 null 条目，引擎 boot 期拿到 nil 即抛），必须连同前后的空行一起摘掉。
-   *
-   * 本函数不参与「摘哪一条」的判定，只做摘除后的收尾——把「选择摘谁」与「清理空壳」拆开正是
-   * D11 的实质：旧实现把两者耦合在同一个缩进启发式里，误判即整组连坐。
-   *
-   * @param lines 摘除完成后的清单行（会被就地修改）。
-   * @returns 清理空壳后的同一列表（便于链式书写）。
-   */
-  private fun dropEmptyInsertWrappers(lines: MutableList<String>): MutableList<String> {
-    val indent = { line: String -> line.indexOfFirst { !it.isWhitespace() } }
-    var index = 0
-    while (index < lines.size) {
-      if (lines[index].trim() != "- insert:") { index += 1; continue }
-      val wrapperIndent = indent(lines[index])
-      var hasChild = false
-      var probe = index + 1
-      while (probe < lines.size) {
-        val candidate = lines[probe]
-        if (candidate.isBlank()) { probe += 1; continue }
-        if (indent(candidate) <= wrapperIndent) break
-        hasChild = true
-        break
-      }
-      if (hasChild) { index += 1; continue }
-      // 空壳：连同其后紧邻的空行一起摘掉，再回头吃掉它前面的空行，避免留下连续空行。
-      var end = index + 1
-      while (end < lines.size && lines[end].isBlank()) end += 1
-      lines.subList(index, end).clear()
-      while (index > 0 && lines[index - 1].isBlank()) lines.removeAt(index - 1)
-      if (index > 0) index -= 1
-    }
-    return lines
-  }
+  // 0.14.5（S-1）合并：摘除后的 `- insert:` 空壳收尾**唯一实现**在
+  // [PluginMounts.dropEmptyInsertWrappers]（本文件原有一份逐字节等价副本，两处同源必然漂移）。
+  // D11 的实质——「选择摘哪一条」与「清理空壳」解耦——在调用点体现：本文件在**全部摘除完成之后**
+  // 一次性判定空壳，见 [reconcileRemovedProfilePlugins]。
 
   /**
    * 已摘除插件的**存量迁移**（0.14.1 D-1 的设备侧收尾）。
@@ -690,7 +657,7 @@ internal object SnapshotTransaction {
                 // 放大到「整组」：同组里我们自己的硬清单插件一起消失（实测反证：2 子组里摘
                 // host-web-compat 会连带删掉 shell-termux，而日志只说摘了 1 处）。
                 // 现在无条件只消费 [index, end) 这一段；是否残留 `- insert:` 空壳由
-                // [dropEmptyInsertWrappers] 在**全部摘除完成之后**按「组内还有没有子条目」统一判定。
+                // [PluginMounts.dropEmptyInsertWrappers] 在**全部摘除完成之后**按「组内还有没有子条目」统一判定。
                 index = end
                 continue
               }
@@ -699,7 +666,7 @@ internal object SnapshotTransaction {
             index += 1
           }
           if (dropped > 0) {
-            val tidied = dropEmptyInsertWrappers(kept)
+            val tidied = PluginMounts.dropEmptyInsertWrappers(kept)
             val text = tidied.joinToString("\n") + (if (tidied.isNotEmpty()) "\n" else "") +
               "# 0.14.1：已摘除 " + removed.mountId + "（升级迁移自动清理；本行由 SnapshotTransaction 写入）\n"
             patch.writeText(text)
