@@ -208,6 +208,10 @@ if (peer) {
     // MIRROR_TOP，于是 apk 副本可以长期落后而本门禁**永远不会报**——本轮实测就是如此
     // （coord 306 行 vs apk 305 行，差 P0-c 的 manage 条目）。自指条目是本门禁唯一的自守面。
     'scripts/check-patch-mirror.mjs',
+    // The UI provider E2E helper accepts credential material; its secrecy guards
+    // and extracted-function regression must not drift in the APK mirror.
+    'scripts/e2e-provider-ui.ps1',
+    'scripts/tests/e2e-provider-ui-security.test.ps1',
     // ST-06 纳入镜像面：云端自包含构建链自身也是「单边演进 = 幽灵缺陷」面（此前只在 apk 仓存在、
     // 被镜像检查显式 SKIP）；注入集单一常量 + 契约/门禁脚本同批纳入（0.13.8-b 批 B1）。
     'scripts/build-apk.mjs',

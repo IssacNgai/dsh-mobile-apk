@@ -347,7 +347,7 @@ try {
   log('门禁：ELF 架构…')
   run('node', [gate('elf-check.mjs'), snapIn, ABI])
   log('门禁：运行时补丁资产（严格，快照缺席即失败）…')
-  run('node', [gate('check-runtime-assets.mjs'), ABI, '--require'])
+  run('node', [gate('check-runtime-assets.mjs'), ABI, '--require', '--snapshot', snapIn])
   // H-1（0.14.2-fx-2）：MCP client 运行期依赖闭包（该宿主不在我们装配的行面上，
   // check-engine-overlay 的正向闭包结构性看不见它——设备实测 boot 硬崩的正是这条）。
   log('门禁：MCP client 运行期依赖闭包（严格）…')

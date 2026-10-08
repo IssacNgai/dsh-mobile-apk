@@ -64,10 +64,8 @@ test('generated transaction snippet refuses missing or invalid ownership manifes
   const source = readFileSync(snippetPath, 'utf8')
   const helperStart = source.indexOf('async function safeModeOwnershipManifest(filesRoot)')
   const helperEnd = source.indexOf('function safeModeSha256(bytes)', helperStart)
-  const start = source.indexOf('    const filesRoot =')
-  const end = source.indexOf('    const minimal = safeModeFilterInserts', start)
-  assert.ok(helperStart >= 0 && helperEnd > helperStart && start >= 0 && end > start, 'expected transaction-aware manifest validation before filtering')
-  const body = source.slice(helperStart, helperEnd) + source.slice(start, end)
+  assert.ok(helperStart >= 0 && helperEnd > helperStart, 'expected transaction-aware ownership manifest helper')
+  const body = source.slice(helperStart, helperEnd) + `return (await safeModeOwnershipManifest('files')).entries`
   const evaluate = async (manifest) => {
     const fs = { async readFile() {
       if (manifest === null) throw new Error('missing manifest')
@@ -82,9 +80,7 @@ test('generated transaction snippet refuses missing or invalid ownership manifes
       if (path === '.snapshot-fingerprint') return 'f'.repeat(64)
       throw new Error('ENOENT')
     }
-    return new Function('fs', 'dirname', 'join', 'DSH_HOME', `return (async () => { ${body}; return hardManifest.entries; })()`)(
-      fs, () => 'files', fakeJoin, 'files/home/.dsh',
-    )
+    return new Function('fs', 'join', `return (async () => { ${body} })()`)(fs, fakeJoin)
   }
   const manifest = { schema: 2, complete: true, fingerprint: 'f'.repeat(64), entries: hardEntries, profileEntries: hardEntries }
   assert.deepEqual(await evaluate(manifest), hardEntries)
@@ -142,6 +138,65 @@ test('S1 patch gate rejects a stale marker and repairs its exact helper without 
   } finally {
     rmSync(temp, { recursive: true, force: true })
   }
+})
+
+test('S2 patch gate upgrades legacy transaction code without web-store resolver before allowing check', () => {
+  const temp = mkdtempSync(join(tmpdir(), 'safe-mode-s2-legacy-'))
+  try {
+    const current = readFileSync(vendorCores[0], 'utf8')
+    const legacy = current
+      .replace('dsh-mobile safe mode transaction (S2) with CAS recovery failover and web-store resolver (S4).', 'dsh-mobile safe mode transaction (S2) with CAS recovery failover (S3).')
+      .replace('safeModeRecoveryPath(autoDir, sha, create = false)', 'safeModeRecoveryPathLegacy(autoDir, sha, create = false)')
+      .replace('safeModeLoadBackup(cfg, primary, expectedSha)', 'safeModeLoadBackupLegacy(cfg, primary, expectedSha)')
+    const core = join(temp, 'dsh-undo-savepoint/lib/core.mjs')
+    const runner = join(HERE, '../apply-patches.mjs')
+    mkdirSync(dirname(core), { recursive: true })
+    writeFileSync(core, legacy)
+    const run = (mode) => spawnSync(process.execPath, [runner, temp, mode, '--only', 'undo-safe-transaction-S2'], { encoding: 'utf8' })
+    assert.equal(run('--check').status, 1, 'legacy S2 without the CAS contract must fail the gate')
+    assert.equal(run('--apply').status, 0)
+    const upgraded = readFileSync(core, 'utf8')
+    assert.match(upgraded, /factory-bundle filter \(S5\)/)
+    assert.match(upgraded, /async function safeModeLoadBackup\(cfg, primary, expectedSha\)/)
+    assert.equal(run('--check').status, 0)
+  } finally {
+    rmSync(temp, { recursive: true, force: true })
+  }
+})
+
+test('S2 gate upgrades old S4 cores that lack trusted factory-bundle isolation', () => {
+  const temp = mkdtempSync(join(tmpdir(), 'safe-mode-s4-bundle-'))
+  try {
+    const current = readFileSync(vendorCores[0], 'utf8')
+    const legacy = current
+      .replace('with CAS recovery failover, web-store resolver and factory-bundle filter (S5).', 'with CAS recovery failover and web-store resolver (S4).')
+      .replace('safeModeSelectFactoryBundles(cfg, pkg, pkgRaw, hardManifest.factoryBundles)', 'safeModeSelectFactoryBundlesLegacy(cfg, pkg, pkgRaw, hardManifest.factoryBundles)')
+      .replace('async function safeModeBundlePatchSha(packageRoot, declared)', 'async function safeModeBundlePatchShaLegacy(packageRoot, declared)')
+    const core = join(temp, 'dsh-undo-savepoint/lib/core.mjs')
+    const runner = join(HERE, '../apply-patches.mjs')
+    mkdirSync(dirname(core), { recursive: true })
+    writeFileSync(core, legacy)
+    const run = (mode) => spawnSync(process.execPath, [runner, temp, mode, '--only', 'undo-safe-transaction-S2'], { encoding: 'utf8' })
+    assert.equal(run('--check').status, 1, 'S4 core without the CAS-filter contract must fail the gate')
+    assert.equal(run('--apply').status, 0)
+    const upgraded = readFileSync(core, 'utf8')
+    assert.match(upgraded, /factory-bundle filter \(S5\)/)
+    assert.match(upgraded, /safeModeSelectFactoryBundles\(cfg, pkg, pkgRaw, hardManifest\.factoryBundles\)/)
+    assert.equal(run('--check').status, 0)
+  } finally {
+    rmSync(temp, { recursive: true, force: true })
+  }
+})
+
+test('CLI and generated vendor core share the byte-identical recovery object-name helper', () => {
+  const transaction = readFileSync(join(HERE, '../data/undo-safe-transaction-snippet.mjs'), 'utf8')
+  const cli = readFileSync(join(HERE, '../../dsh-undo-emergency.mjs'), 'utf8')
+  const helper = /function safeModeRecoveryObjectName\(sha\) \{\n[\s\S]*?\n\}/
+  const extract = (source) => helper.exec(source.replace(/\r\n/g, '\n'))?.[0]
+  const canonical = extract(transaction)
+  assert.ok(canonical, 'canonical recovery object-name helper is present in the generated transaction snippet')
+  assert.equal(extract(cli), canonical, 'single-file emergency CLI keeps the exact shared helper body')
+  for (const core of vendorCores) assert.equal(extract(readFileSync(core, 'utf8')), canonical)
 })
 
 test('transaction-aware selector follows online swap, committed, staged and rollback ownership', async () => {

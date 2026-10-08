@@ -81,18 +81,18 @@ const LOOP_P99_BUDGET_MS = 7200
 const LOOP_MIN_SAMPLES = 10
 /** C2：单个同步块上限（详档 §5.1：「探针报告的单次 compose dur ≤ 2000 ms」）。 */
 const SYNC_BLOCK_BUDGET_MS = 2000
-// C1：首个 HTTP 响应 − LISTEN 的硬上界。
-// 口径更正（2026-09-19，设备实测 12 个 boot）：原值 1000 ms **结构性不可达**——该差值由三部分构成，
-// 前两部分都是实现决定的：
-//   ① 壳侧 LISTEN 轮询量化：EngineStartFlow.ENGINE_BOOT_POLL_STEP_MS = 1000 ms（`Thread.sleep(1000)`），
-//      ⇒ 单是「观测到 LISTEN」这一步就能吃掉至多 1000 ms；
-//   ② 首个请求路径上的同步 compose 块：C2 预算 2000 ms；
-//   ③ 页面路径残余：设备实测 p90 ≈ 910 ms。
-// 设备 12 个 boot 的实测分布：min 1350 / p50 1881 / p90 2923 / max 2940 ms —— **19/19 个样本
-// （含跨代去重前的全部读数）全部 > 1000 ms**，故 1000 ms 不是「设备还不够快」，而是把量程设在了
-// 结构下限之下。新值 = ①1000 + ②2000 + ③1000(残余取整) = 4000 ms；设备 max 2940 留有约 1060 ms 余量。
-// **这不是放宽以掩盖**：C2（同步块 ≤2000 ms）仍是对**可控部分**的紧判据，C1 退化为端到端回归哨兵。
-const LISTEN_TO_HTTP_BUDGET_MS = 4000
+// C1：首次成功 HTTP 探测观测时刻 − TCP LISTEN 探测观测时刻的硬上界。
+// 历史重标（2026-09-19，设备实测 12 个 boot）：原值 1000 ms **结构性不可达**；既有4000ms阈值依据
+// 当时的端到端样本分布与旧成本估算，现保留为回归哨兵，不将其解释成服务端真实响应耗时上限。
+// 两个观测时刻来自不同的采样器：
+//   ① TCP LISTEN 由 watchEngineListen 每 500ms 尝试一次连接（单次超时 500ms）；
+//   ② HTTP 时刻由 EngineStartFlow 的启动轮询写入，轮询间隔 1000ms，单次 EngineProbe 默认连接/读取超时 800ms；
+//   ③ 两者之间还可能有真实服务就绪时间、线程调度延迟及页面路径成本。
+// 两个时刻都由壳侧轮询落盘，而非服务端精确首字节时刻：LISTEN 来自 500ms TCP 探测循环；
+// 首个 HTTP 来自 EngineProbe.check() 成功后的启动轮询（1s 间隔，单次请求有连接/读取超时）。
+// 因此差值包含两条探针的采样量化与调度延迟。C1 超限本身不能证明同步 compose 阻塞，需结合 C2 与
+// P1 phase 数据定位；C2 是独立的同步块预算。失败仍按原阈值判红，但不得把观测差描述成同步阻塞。
+const LISTEN_TO_HTTP_OBSERVATION_BUDGET_MS = 4000
 /**
  * C3：compose 调用数上限（与 P-AC-06 一致；已被设备实测满足，降级为回归哨兵）。
  *
@@ -109,7 +109,7 @@ const COMPOSE_CALLS_BUDGET = 2
 /**
  * 解析预算。C1 的**绝对**目标值（t_boot_start → 首个 HTTP 响应）按详档 §6 第 2 项尚未重标，
  * 因此默认只作观测告警；显式给 --first-response-budget 才升级为「失败即拒」。
- * 「首个响应 − LISTEN ≤ 4000 ms」（见常量处的构成推导）不受此影响，始终强制执行。
+ * 「首次成功 HTTP 探测观测 − TCP LISTEN 探测观测 ≤ 4000 ms」不受此影响，始终强制执行。
  */
 export function resolveBudgets(argv = []) {
   const argOf = (name) => {
@@ -118,7 +118,7 @@ export function resolveBudgets(argv = []) {
   }
   const absolute = argOf('first-response-budget')
   return {
-    listenToHttpMs: argOf('listen-to-http-budget') ?? LISTEN_TO_HTTP_BUDGET_MS,
+    listenToHttpObservationMs: argOf('listen-to-http-budget') ?? LISTEN_TO_HTTP_OBSERVATION_BUDGET_MS,
     syncBlockMs: argOf('sync-block-budget') ?? SYNC_BLOCK_BUDGET_MS,
     composeCalls: argOf('compose-calls-budget') ?? COMPOSE_CALLS_BUDGET,
     loopP99Ms: argOf('loop-p99-budget') ?? LOOP_P99_BUDGET_MS,
@@ -454,32 +454,32 @@ export function runChecks(input, budgets = resolveBudgets([])) {
     }
   }
 
-  // ── C1 首个 HTTP 响应（同时断言「首个响应 − LISTEN ≤ 1000 ms」）──
+  // ── C1 首次成功 HTTP 探测观测 − TCP LISTEN 探测观测（阈值保持 4000 ms）──
   {
     const listen = segments.listen
     const http = segments.firstHttp
     if (http === undefined) {
       add('C1', 'C1 首个 HTTP 响应时间（与 LISTEN 同时断言）', false,
-        't_first_http 未知（探针未装）——「首个响应 − LISTEN」无法判定；只判 LISTEN 会系统性假绿',
+        't_first_http 未知（探针未装）——首次成功 HTTP 探测观测与 TCP LISTEN 探测观测之差无法判定；只判 LISTEN 会系统性假绿',
         strict ? 'fail' : 'skip')
     } else {
-      // 硬判据：首个响应 − LISTEN ≤ 1000 ms。这是「LISTEN 快、首个响应慢」的直接防线。
+      // 硬判据：两次壳侧成功探测的观测时刻相差不超过预算。它包含采样/调度延迟，不能单独归因于同步阻塞。
       if (listen === undefined) {
-        add('C1', 'C1 首个响应 − LISTEN ≤ ' + budgets.listenToHttpMs + ' ms', false, 'LISTEN 时刻未知')
+        add('C1', 'C1 首次成功 HTTP 探测观测 − TCP LISTEN 探测观测 ≤ ' + budgets.listenToHttpObservationMs + ' ms', false, 'TCP LISTEN 观测时刻未知')
       } else {
         const delta = http - listen
-        add('C1', 'C1 首个响应 − LISTEN = ' + delta + ' ms ≤ ' + budgets.listenToHttpMs + ' ms',
-          delta <= budgets.listenToHttpMs,
-          'LISTEN=' + listen + ' 首个响应=' + http + ' → 差 ' + delta + 'ms（LISTEN 达标但首个响应被同步块挡住）')
+        add('C1', 'C1 首次成功 HTTP 探测观测 − TCP LISTEN 探测观测 = ' + delta + ' ms ≤ ' + budgets.listenToHttpObservationMs + ' ms',
+          delta <= budgets.listenToHttpObservationMs,
+          'TCP LISTEN 观测=' + listen + ' 首次成功 HTTP 探测观测=' + http + ' → 差 ' + delta + 'ms；差值包含两条探针的轮询采样与调度延迟，单凭 C1 不能归因于同步 compose；请结合 C2 与 P1 phase 数据')
       }
       // 绝对目标：未重标前只告警（详档 §6 第 2 项纪律），显式给 --first-response-budget 才判红。
       if (segments.bootStart !== undefined) {
         const absolute = http - segments.bootStart
         if (budgets.firstResponseMs === undefined) {
-          add('C1-abs', 'C1 冷启动 → 首个响应 = ' + absolute + ' ms（--first-response-budget 未给：观测告警，不判红）',
+          add('C1-abs', 'C1 冷启动 → 首次成功 HTTP 探测观测 = ' + absolute + ' ms（--first-response-budget 未给：观测告警，不判红）',
             true, undefined, 'warn')
         } else {
-          add('C1-abs', 'C1 冷启动 → 首个响应 = ' + absolute + ' ms ≤ ' + budgets.firstResponseMs + ' ms',
+          add('C1-abs', 'C1 冷启动 → 首次成功 HTTP 探测观测 = ' + absolute + ' ms ≤ ' + budgets.firstResponseMs + ' ms',
             absolute <= budgets.firstResponseMs, '超出预算 ' + budgets.firstResponseMs + 'ms')
         }
       }
@@ -605,8 +605,16 @@ function selfTest() {
   // ② 反向对照（详档 §5.1 C1 明文要求）：LISTEN 快、首个响应慢 → 必须判红
   {
     const r = run(segLine({ boot: 100000, listen: 101000, listenMs: 1000, http: 105500, httpMs: 5500 }), probeText({ single: true }))
-    check('反向对照：LISTEN 快(1000ms) + 首个响应慢(4500ms 滞后) → C1 判红',
+    check('反向对照：首次成功 HTTP 探测观测晚于 TCP LISTEN 观测 4500ms → C1 判红',
       okOf(r, 'C1') === false, 'C1 ok=' + okOf(r, 'C1'))
+    const c1 = resultOf(r, 'C1')
+    check('反向对照：C1 超限仍维持 4000ms 阈值且明确是观测差',
+      c1?.label.includes('≤ 4000 ms') === true && c1?.label.includes('探测观测') === true,
+      String(c1?.label ?? ''))
+    check('反向对照：C2 同步块预算通过时，C1 详情不把超限归因于同步 compose',
+      okOf(r, 'C2') === true && String(c1?.detail ?? '').includes('轮询采样与调度延迟')
+        && !String(c1?.detail ?? '').includes('被同步块挡住'),
+      'C2=' + okOf(r, 'C2') + ' C1 detail=' + String(c1?.detail ?? ''))
   }
 
   // ③ 反向对照：三字段在场但 t_compose_total = -1 → C6 必须判红（42/42 假绿的教训）
@@ -949,7 +957,7 @@ else {
     console.log(tag + r.label + (r.ok || r.detail === undefined ? '' : ' -> ' + r.detail))
   }
   if (budgets.firstResponseMs === undefined) {
-    console.log('WARN  C1 绝对目标（t_boot_start → 首个响应）未重标：只作观测告警。'
+    console.log('WARN  C1 绝对目标（t_boot_start → 首次成功 HTTP 探测观测）未重标：只作观测告警。'
       + '重标方法见 docs/0.14.1-preview-BOOT-SPEED-AND-LAZY-PLUGINS.md §6 第 2 项（目标设备 n>=5 基线）')
   }
   if (hard > 0) {

@@ -238,6 +238,41 @@ export function isTaskSubmitted(receipt) {
   return receipt === 'clicked' || receipt === 'enter'
 }
 
+/** Permission-gate replies mean the model task did not reach any device tool. */
+export function detectBlocker(text) {
+  if (/MISSING_CREDENTIAL|no API key for provider/i.test(text)) {
+    return '引擎未配置模型凭据（MISSING_CREDENTIAL / no API key）——模型无法运行，'
+      + '请在应用「模型」页配置 provider 后重跑本套件（这不是设备缺陷）'
+  }
+  if (/(?:会话档位.{0,80}workspace-write|workspace-write.{0,100}(?:设备控制|屏幕控制|danger-full-access)|(?:设备控制|屏幕控制).{0,100}danger-full-access|danger-full-access.{0,100}(?:权限|会话))/i.test(text)) {
+    return '设备控制被会话权限档位阻止（workspace-write 需要 danger-full-access）；本任务未验证设备行为'
+  }
+  return ''
+}
+
+/** Parse package ActivityRecord identities with their display placement. */
+export function packageActivityRecords(pkg, dump) {
+  const out = []
+  let current = -1
+  const header = /^\s*Display #([0-9]+)/
+  const member = new RegExp('(^|[\\s:])' + pkg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '/')
+  for (const line of dump.split('\n')) {
+    const h = header.exec(line)
+    if (h !== null) { current = Number(h[1]); continue }
+    if (current < 0 || !line.includes('ActivityRecord{') || !member.test(line)) continue
+    const record = /ActivityRecord\{([^\s}]+)/.exec(line)
+    if (record !== null) out.push({ displayId: current, id: record[1] })
+  }
+  return out
+}
+
+/** A pre-existing target ActivityRecord is not proof that this task launched the app. */
+export function hasNewTargetActivity(pkg, targetDisplayId, beforeDump, afterDump) {
+  const before = packageActivityRecords(pkg, beforeDump)
+  const oldTargetIds = new Set(before.filter((r) => r.displayId === targetDisplayId).map((r) => r.id))
+  return packageActivityRecords(pkg, afterDump).some((r) => r.displayId === targetDisplayId && !oldTargetIds.has(r.id))
+}
+
 async function runModelTask(promptText) {
   const script = `(async () => {
     const box = document.querySelector('[contenteditable="true"][role="textbox"]')
@@ -280,24 +315,12 @@ async function runModelTask(promptText) {
     const now = await pageConversationText()
     const [generating] = await bridge([`!!document.querySelector('[data-composer-card] button[aria-label="停止生成"]')`])
     active = generating === true
-    if (/MISSING_CREDENTIAL|no API key for provider/i.test(now)) break
+    if (detectBlocker(now) !== '') break
     if (!active && Date.now() > minWaitUntil && now !== '' && now === prev) break
     prev = now
   }
-  return { sent, blocker: active ? '任务仍在生成，目标尚未完成；不得开始下一任务' : detectBlocker(await pageConversationText()) }
-}
-
-/**
- * 识别**环境阻塞**（不是缺陷）：模型起不来时，套件必须说清「为什么任务没跑」而不是判「设备没问题」。
- * 首跑实测：本机引擎未配置模型凭据，会话直接报
- * `llm-deepseek: no API key for provider route "deepseek-official"` / `MISSING_CREDENTIAL`。
- */
-function detectBlocker(text) {
-  if (/MISSING_CREDENTIAL|no API key for provider/i.test(text)) {
-    return '引擎未配置模型凭据（MISSING_CREDENTIAL / no API key）——模型无法运行，'
-      + '请在应用「模型」页配置 provider 后重跑本套件（这不是设备缺陷）'
-  }
-  return ''
+  const finalText = await pageConversationText()
+  return { sent, blocker: detectBlocker(finalText) || (active ? '任务仍在生成，目标尚未完成；不得开始下一任务' : '') }
 }
 
 /** 抓页面会话区的可见文本（作为「模型自己编排」的过程留证；判据仍只看设备事实）。 */
@@ -322,8 +345,8 @@ export function displaysRunning(pkg, dump) {
   return [...out].sort((a, b) => a - b)
 }
 
-/** SF token ↔ 别名配对（与产品同一形态：`Virtual Display <token>` 后一行 `name="DSH <alias>"`）。 */
-export function sfTokenForAlias(sfDump, alias) {
+/** SF token ↔ 别名配对（只返回目标alias的成对记录，便于不泄露整份SF dump地留证）。 */
+export function sfMappingForAlias(sfDump, alias) {
   let pending = null
   for (const raw of sfDump.split('\n')) {
     const t = /^Virtual Display[ \t]+(\d+)[ \t]*$/.exec(raw.trim())
@@ -331,10 +354,14 @@ export function sfTokenForAlias(sfDump, alias) {
     if (pending === null) continue
     const n = /^[ \t]*name="([^"]*)"[ \t]*$/.exec(raw)
     if (n === null) continue
-    if (n[1] === 'DSH ' + alias) return pending
+    if (n[1] === 'DSH ' + alias) return { token: pending, name: n[1] }
     pending = null
   }
   return null
+}
+
+export function sfTokenForAlias(sfDump, alias) {
+  return sfMappingForAlias(sfDump, alias)?.token ?? null
 }
 
 /** 真实屏（display 0）当前的前台包名；读不到返回空串。 */
@@ -446,20 +473,26 @@ async function main() {
   }
 
   // ── P2 落点（C1）：模型自己拉起，设备侧回读落点 ──
-  const before = displaysRunning(PKG, run(`dumpsys activity activities | grep -E '^ *Display #|ActivityRecord'`))
+  const beforeDump = run(`dumpsys activity activities | grep -E '^ *Display #|ActivityRecord'`)
+  const before = displaysRunning(PKG, beforeDump)
+  const beforeActivities = packageActivityRecords(PKG, beforeDump)
   const task = await runModelTask(
     `帮我用手机把游戏 ${PKG} 在虚拟屏 ${vd.alias} 上打开。`
     + '完成后只回复一行 DONE，不要解释。',
   )
   writeFileSync(join(EVID, 'p2-conversation.txt'), await pageConversationText())
-  const after = displaysRunning(PKG, run(`dumpsys activity activities | grep -E '^ *Display #|ActivityRecord'`))
+  const afterDump = run(`dumpsys activity activities | grep -E '^ *Display #|ActivityRecord'`)
+  const after = displaysRunning(PKG, afterDump)
   shot(join(EVID, 'p2-real-screen.png'))
   if (task.sent === undefined || task.blocker !== '') {
     record('P2', '拉起落点=虚拟屏', 'INCONCLUSIVE',
       (task.blocker !== '' ? task.blocker : '未能发起任务：' + String(task.reason))
       + `（设备事实：${PKG} 在 displayId=${after.join(',') || '无'}）`)
-  } else if (after.includes(vd.displayId)) {
+  } else if (after.includes(vd.displayId) && hasNewTargetActivity(PKG, vd.displayId, beforeDump, afterDump)) {
     record('P2', '拉起落点=虚拟屏', 'PASS', `${PKG} 在 displayId=${after.join(',')}（目标 ${vd.displayId}；此前 ${before.join(',') || '不在任何屏'}）`)
+  } else if (after.includes(vd.displayId)) {
+    record('P2', '拉起落点=虚拟屏', 'INCONCLUSIVE',
+      `目标屏已有 ActivityRecord，任务后没有可确认的新实例（目标 ${vd.displayId}；前后实例数 ${beforeActivities.filter((r) => r.displayId === vd.displayId).length}/${packageActivityRecords(PKG, afterDump).filter((r) => r.displayId === vd.displayId).length}）`)
   } else if (after.length === 0) {
     record('P2', '拉起落点=虚拟屏', 'INCONCLUSIVE', `回读里找不到 ${PKG} 的 ActivityRecord（应用可能已退出）——不构成落点证明`)
   } else {
@@ -468,7 +501,12 @@ async function main() {
 
   // ── P3 虚拟屏输入 + 双屏像素对照（真实屏必须不变） ──
   const sfDump = run('dumpsys SurfaceFlinger | grep -E "^(Virtual Display|    name=)"')
-  const token = sfTokenForAlias(sfDump, vd.alias)
+  const sfMapping = sfMappingForAlias(sfDump, vd.alias)
+  const token = sfMapping?.token ?? null
+  writeFileSync(join(EVID, 'sf-token-mapping.json'), JSON.stringify({
+    alias: vd.alias, displayId: vd.displayId,
+    sfName: sfMapping?.name ?? null, token, matched: sfMapping !== null,
+  }, null, 2) + '\n')
   let vdBefore = 0
   let vdBeforeSha = ''
   let realBefore = 0

@@ -11,6 +11,8 @@
 //
 // 用法：node scripts/verify-vdisplay-float.mjs --ws <main-webview-cdp-ws> [--serial 127.0.0.1:16416]
 
+import { booleanReadbackMatches } from './vdisplay-float-contract.mjs'
+
 const argv = process.argv.slice(2)
 const argOf = (name, def) => { const i = argv.indexOf('--' + name); return i >= 0 ? (argv[i + 1] ?? def) : def }
 const WS = argOf('ws', '')
@@ -56,12 +58,11 @@ try {
   const originalEnabled = readBool(original)
   const flipped = !originalEnabled
   const set1 = await callBridge('window.androidBridge.setVdisplayFloatEnabled(' + String(flipped) + ')')
-  if (set1 !== true && set1?.ok !== true) fail('设置浮窗开关失败：' + JSON.stringify(set1))
   await sleep(400)
   const read1 = await callBridge('window.androidBridge.getVdisplayFloatEnabled()')
   const read1Enabled = readBool(read1)
-  if (read1Enabled !== flipped) fail('浮窗开关未收敛：set=' + flipped + ' get=' + JSON.stringify(read1))
-  ok('浮窗开关真源往返', originalEnabled + ' -> ' + flipped)
+  if (!booleanReadbackMatches(flipped, read1Enabled)) fail('浮窗开关未收敛：set=' + flipped + ' returned=' + JSON.stringify(set1) + ' readback=' + JSON.stringify(read1))
+  ok('浮窗开关真源往返', originalEnabled + ' -> ' + flipped + ' (returned=' + JSON.stringify(set1) + ')')
   // 还原
   await callBridge('window.androidBridge.setVdisplayFloatEnabled(' + String(originalEnabled) + ')')
   await sleep(300)

@@ -607,9 +607,18 @@ object VdisplayController {
    */
   fun input(context: Context, verb: String, args: JSONObject, target: String? = null): JSONObject {
     val appContext = context.applicationContext
-    val record = selectedRecord() ?: recordOf(target)
+    // An explicit target is authoritative; never redirect its input to the selected display.
+    val record = (if (target != null) recordOf(target) else selectedRecord())
       ?: return status(appContext).put("ok", false).put("code", "screen-not-ready")
         .put("guidance", "虚拟屏幕尚未创建，无法向其注入输入；可先 android_vdisplay_create。")
+    val scope = ScreenScopePrefs.current(appContext)
+    val denial = scope.inputDenial(record.alias)
+    if (denial != null) {
+      return JSONObject()
+        .put("ok", false).put("code", denial).put("reason", denial)
+        .put("scope", scope.wire).put("screenId", record.alias).put("displayId", record.displayId)
+        .put("guidance", "当前屏幕范围为 ${scope.wire}，拒绝向 ${record.alias} 注入输入。")
+    }
     val id = record.displayId
     val argv = ArrayList<String>(12)
     argv += arrayOf("/system/bin/input", "-d", id.toString())

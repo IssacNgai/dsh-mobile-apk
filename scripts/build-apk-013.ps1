@@ -438,7 +438,7 @@ foreach ($abi in @('arm64', 'x86_64')) {
     # FX-208.1：按当前 ABI 传参；--require = 快照/资产缺席即失败，不得 SKIP exit 0（旧实现把构建机状态
     # 变成门禁结果）。ST-06：本调用原先落在 foreach 之外（$abi 未定义恒走 x86_64 默认值）——已移进循环。
     Write-Host "== 运行时补丁资产门禁（$abi，严格）=="
-    node (Join-Path $Root "scripts\check-runtime-assets.mjs") $abi --require 2>&1
+    node (Join-Path $Root "scripts\check-runtime-assets.mjs") $abi --require --snapshot $snapIn 2>&1
     if ($LASTEXITCODE -ne 0) { Deny-Abi $abi "运行时补丁资产过期或缺失（从快照重新生成 assets/patched）"; continue }
 
     # MCP client 运行期依赖闭包（0.14.2-fx-2 H-1）：该宿主**不在我们装配的行面上**（用户自己在

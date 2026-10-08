@@ -1,10 +1,10 @@
 // 补丁回归清单门禁：scripts/patches/tests/*.test.mjs 必须全部真的跑起来，且**不允许悄悄坏掉**。
 //
 // 立项理由（0.14.5，上游对齐审计 C-1 实锤）：
-//   scripts/patches/tests/ 下有 26 个补丁回归测试文件，但此前**只有 6 个**有自动化入口
+//   scripts/patches/tests/ 下有补丁回归测试文件，但此前**只有 6 个**有自动化入口
 //   （coord pr-gate 跑 3 个、build-snapshot 跑 2 个、check-runtime-assets 跑 2 个，去重后 6 个）。
-//   其余从未被执行过 —— 后果实测：一旦真跑，其中 1 个**当场判红**
-//   （ptc-android-native-A1 读 fixture 里不存在的 src/*.ts），而**没人知道**。
+//   其余从未被执行过 —— 后果实测：一旦真跑，多个测试缺陷当场暴露；A1 测试曾把发布包 fixture
+//   当源码 checkout 使用，且文件级豁免掩盖了它。该缺陷现已改为覆盖真实发布 lib fixture。
 //   这正是「存在不等于能用」：文件在、语法对（check-release-gates 只做 node --check），行为没有防线。
 //
 // 设计取舍（为什么不直接「全绿才过」）：
@@ -28,14 +28,6 @@ const TESTS_DIR = join(HERE, 'patches', 'tests')
 // 已知失败清单。每条必须有 reason 与 since —— 不许无理由豁免，也不许把新失败塞进来当没看见。
 const KNOWN_FAIL = [
   {
-    // 注意：node:test 对**文件级**失败报的是绝对路径（D:\\...\\scripts\\patches\\tests\\x.test.mjs），
-    // 不是仓库相对路径。此处按尾部锚定，避免因路径形态差异导致豁免失效（本门禁首次运行即踩到）。
-    match: /ptc-android-native-A1\.test\.mjs$/,
-    platforms: ['win32'],
-    reason: 'Windows 专有：该用例建 symlink 触发 EPERM（创建符号链接需特权）。Linux/CI 上通过。',
-    since: '2026-10-07',
-  },
-  {
     match: /^emergency CLI keeps recovery marker across interrupted writes and round-trips fixture$/,
     platforms: ['win32'],
     reason: 'Windows 专有：同上 symlink EPERM。Linux/CI 上通过。',
@@ -45,20 +37,6 @@ const KNOWN_FAIL = [
     match: /^emergency CLI accepts autoDir symlink aliases and rejects backup paths outside autoDir$/,
     platforms: ['win32'],
     reason: 'Windows 专有：同上 symlink EPERM。Linux/CI 上通过。',
-    since: '2026-10-07',
-  },
-]
-
-// ptc-android-native-A1 在**所有平台**都真坏（fixture 只有 lib/，用例读 src/*.ts），
-// 但它被合并进同一个文件，故上面那条 Windows 豁免会顺带把它放掉。为不掩盖它，单列一条全平台条目：
-// 该用例在 Windows 上才会因 symlink 先炸；在 Linux 上它会以 ENOENT(src/index.ts) 失败。
-// ⇒ 结论：这条**必须修**，修法是补 src fixture 或把 src 模式断言改为显式 skip（不许静默）。
-const KNOWN_BROKEN_ALL_PLATFORMS = [
-  {
-    match: /ptc-android-native-A1\.test\.mjs$/,
-    reason: 'FIXTURE 缺 src/：用例读 fixtures/dsh-ptc-runtime-node-0.2.0-rc.2/src/{index,environment,process}.ts，'
-      + '而该 fixture 的 manifest 声明只有 lib/index.js、lib/process.js、package.json。需补 src fixture，'
-      + '或把 src 模式断言改成**显式** skip（禁静默 skip：那正是本门禁要消灭的假绿）。',
     since: '2026-10-07',
   },
 ]
@@ -90,7 +68,6 @@ function parseTap(out) {
 
 function isAllowed(name, platform) {
   return KNOWN_FAIL.some((k) => k.match.test(name) && k.platforms.includes(platform))
-    || KNOWN_BROKEN_ALL_PLATFORMS.some((k) => k.match.test(name))
 }
 
 function selfTest() {
@@ -106,11 +83,13 @@ function selfTest() {
   ok(parseTap('ok 1 - x\n# tests 1\n# pass 1\n').fails.length === 0, '全绿时无失败')
   // 反证：白名单只放行声明过的条目，新的失败名不得被放行
   ok(isAllowed('some brand new breakage', process.platform) === false, '未声明的新失败**不被**放行（门禁不会被绕过）')
-  ok(isAllowed(files.find((f) => /ptc-android-native-A1/.test(f)), process.platform) === true, '已声明的 ptc 条目被放行')
-  ok(KNOWN_FAIL.every((k) => k.reason && k.since) && KNOWN_BROKEN_ALL_PLATFORMS.every((k) => k.reason && k.since),
+  ok(isAllowed(files.find((f) => /ptc-android-native-A1/.test(f)), process.platform) === false, 'ptc 回归文件没有豁免')
+  ok(KNOWN_FAIL.every((k) => k.reason && k.since),
     '白名单每条都带 reason 与 since（不许无理由豁免）')
   // 反证：平台条件必须生效
-  ok(isAllowed(files.find((f) => /ptc-android-native-A1/.test(f)), 'linux') === true, 'ptc 在所有平台都已知（其真因是 fixture 缺 src）')
+  const symlinkCase = 'emergency CLI keeps recovery marker across interrupted writes and round-trips fixture'
+  ok(isAllowed(symlinkCase, 'win32') === true, 'symlink 失败仅豁免受影响的 Windows 用例')
+  ok(isAllowed(symlinkCase, 'linux') === false, 'Linux 上 symlink 用例失败仍判红')
   console.log('')
   console.log('CHECK-PATCH-TEST-MANIFEST ' + (failed === 0 ? 'PASSED' : 'FAILED') + '（' + checks + ' 项检查，' + failed + ' 项失败）')
   process.exitCode = failed === 0 ? 0 : 1

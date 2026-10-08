@@ -31,6 +31,13 @@ class ScreenScopeTest {
   }
 
   @Test
+  fun vdInputScopeGateDeniesVirtualInputInRealOnly() {
+    assertEquals("screen-out-of-scope", ScreenScope.REAL_ONLY.inputDenial("virtual-1"))
+    assertEquals(null, ScreenScope.VIRTUAL_ONLY.inputDenial("virtual-1"))
+    assertEquals(null, ScreenScope.ALL.inputDenial("virtual-1"))
+  }
+
+  @Test
   fun onlyRealHasAStableAndroidDisplayId() {
     assertEquals(true, ScreenTargets.known(ScreenTargets.REAL))
     assertEquals(true, ScreenTargets.known(ScreenTargets.VIRTUAL))

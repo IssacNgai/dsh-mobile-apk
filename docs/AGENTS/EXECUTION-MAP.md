@@ -50,7 +50,7 @@ flowchart TD
 - shared ownership prelude已结算后先恢复事务再probe/strictSHA/fresh；不新鲜暂存解压→用户配置stage过滤→factory交换→提交指纹，pending不提前读事务。
 - 交换内还要合并用户面：`SnapshotTransaction.kt:626`（`mergeProfiles`）、`SnapshotTransaction.kt:546`（`reconcileRemovedProfilePlugins`，已摘除插件的存量迁移）；残渣按年龄回收 `SnapshotTransaction.kt:196`（`reclaimResidue`）；
   **0.14.2-fx-2 缺陷 I（apk #271）在交换前新增了两道闸门**：`SnapshotTransaction.kt:313`（`requireDeletableResidue` 可写性预检，点名非应用属主残留）与 `SnapshotTransaction.kt:242`（`clearFailedResidue` 无年龄门槛地清上一轮 `*.failed-*`）；`SnapshotFs.kt:177`（`move`）自保——目标非空先 `SnapshotFs.kt:83`（`deletePathStrict`）删净、删不净即抛（`snapshot-delete-residue` / `snapshot-move-blocked`）；
-- **0.14.2-fx-2 缺陷 D（安全模式）**：启动失败页主按钮变「安全模式启动」→ `GuidePageRenderer.kt` 的 `enterSafeMode()`；状态机与剪贴板 prompt 在 `SafeMode.kt`（唯一写面：`auto/safe-mode.json` + `safe-mode-backup-*.yml`）；控制台命令解析在 `SafeConsole.kt`（纯函数，命中即不落 bash，接线 `ConsoleActivity.kt`）。
+- **0.14.2-fx-2 缺陷 D（安全模式）**：启动失败页主按钮变「安全模式启动」→ `GuidePageRenderer.kt` 的 `enterSafeMode()`；Kotlin `SafeMode.kt`、离线 `scripts/dsh-undo-emergency.mjs`、vendor `dsh-undo-savepoint/lib/core.mjs` 共用 `safe-mode.json` / 主备份命名契约与内容寻址副本。默认 web 新状态用平铺 `undo-snapshots/auto` 与 Kotlin 共享；Safe Mode 单独识别唯一既有 scoped marker 并绑定其原目录，平铺与 scoped 同时有 marker（损坏也算）则 fail closed。显式 custom autoDir 与非 web profile 不参与解析，普通 snapshot 布局不变。副本在所选 auto 的 sibling `safe-mode-recovery/`。vendor 实现由 `scripts/patches/data/undo-safe-transaction-snippet.mjs` 生成，S2 门禁要求 CAS + resolver 契约。Marker 绑定 profile；Kotlin exit 兼容恢复 vendor 写入的 home/package 备份。Safe Mode ON 同时筛选 rc2 `package.json` 的 profile bundles：只保留权威 HardManifest 给出的 exact `{name,version,patchSha256}` 工厂元组，摘要按 `DSHBNDL1`、声明顺序和路径/内容长度帧计算；缺少活跃 bundle 身份即拒绝修改。完整 package bytes 进入 primary 与 SHA 寻址恢复副本，OFF 原字节还原。退出先将全部必需 live bytes 读入并校验，任一来源主副本均失效就不写 live 文件；成功时写回已校验的同一组内存字节。S2 patch gate 的 S5 判据同时要求 bundle selector/hash 实现，避免旧 S4 core 被误判为已更新。控制台命令解析在 `SafeConsole.kt`（纯函数，命中即不落 bash，接线 `ConsoleActivity.kt`）。
 - 引擎经snapshotRefreshing/STARTING/runtime完整性/端口归属闸门与runtime patches再spawn，当前锚点见§6 K02/K03。
 
 ### 阶段 1：每次冷启动（秒级到三十秒）
@@ -223,6 +223,7 @@ sequenceDiagram
 - [K07] 3. 已确证（V-R5）：`create()` 的幂等判定在锁外（`:322`），锁内（`:343` 起）不复查 `records`，中间还夹着最长 15s 的 `ensureBound`（`:324`）。控制队列线程（模型 `vdCreate`）与主线程桥面（面板 `vdisplayCreate`）并行时两侧都通过检查 → 各建一块，`MAX_VIRTUAL_DISPLAYS=1` 的全链假设被打破。
 - [K07] 4. 已确证（V-R7）：`attachViewerSurface` 用 `runCatching { record.display.setSurface(surface) }` 吞掉失败（`:495`），但 `record.viewerId/viewerSurface` 已被占用（`:492-493`）且 `status()` 因 `state=active` 回 `ok:true` → 宿主 `attached=true`，黑屏且重开修不好；同处 `viewerBounds`（`:116`、`:520-523`）无上限、`VdisplayHost.destroy()` 也不注销，Activity 每次重建留一条永不回收的 JSON，并被 2s 轮询的 `status()` 整个序列化。
 - [K07] 5. 已确证（S-8）：`VdisplayHost.onMain`（`:207-213`）没有 catch —（a）`block` 在主线程抛异常时（`releaseViewerSurface → status → kickBind/Shizuku 往返`）经 `main.post` 成为主线程未捕获异常 = 进程闪退；（b）2s `latch.await` 超时只回 `main-thread-timeout`，不报是哪个 block。`BrowserHost.kt` 是同一份实现的第二份（S-8 要求两份同改）。
+- [K07] 6. 已确证（Scope P4，执行点 fail-open）：`DeviceControlService.handle` 与 `ControlCarrier` 都把 `vdInput` 交给 `VdisplayOps`，但既有 bridge/a11y 内容 op 集合不覆盖 `vdInput`；`VdisplayController.input` 原先直接调用 Shizuku `input -d`，未读取 `ScreenScopePrefs`。因此 `real-only` 可真实注入虚拟屏。两侧执行前都必须按目标范围拒绝，错误码固定 `screen-out-of-scope`；显式 target 必须优先于 selected，避免错屏注入。
 - [K08] 1. 【已确认，S-8 / R1】`workspaces` 与 `currentWorkspace` 跨线程。控制队列线程在 `workspaceFor` 里写 map（:187-192，由 :506 `switchTo(workspaceFor(session))` 每次 op 触发），主线程在 `applyVisibility`（:821）与看门狗（:871）里遍历同一张 `LinkedHashMap`；`currentWorkspace`（:184）无 `@Volatile`，而 `onMain`（:1661-1673）只有 `finally` 没有 `catch`。复现：模型连开新会话页面 + 用户侧栏展开（300ms 一拍 `setStageBounds` → `applyVisibility`）。一次 CME 即 uncaught on main Looper = 进程闪退，且 `workspaces` 可能停在半写状态。
 - [K08] 同族【已确认，R2 / H-1】：`workspaces` 无上限、无 LRU/TTL，全仓无 `onTrimMemory`（grep 零命中），`MAX_TABS=8` 只是每工作台上限，也没有「会话被删除 → `dropWorkspace`」的可信信号。每个新 session 开页即多一个 WebView，驻留到 Activity 销毁。
 - [K08] 2. 【已确认，S-7 / R3 / R6 / F-6】浏览器 op 在控制队列线程上忙等：`awaitNavigation`（:1101-1107）用 `Thread.sleep(40)` 自旋，冷启动预算 10s（:1087）；而内置错误页的 `onPageStarted` 被守卫 `return`（:670）不推进代次 → DNS 立即失败时必然等满预算再 `return ok:true`（:1088）。影响：一次 `browser_open` 最坏占住整条设备控制队列 10s（a11y / vd / `sh*` 全排队），回执仍是成功（`reason` 只有 `status()` 带出）。
@@ -455,6 +456,7 @@ sequenceDiagram
 | K06 | 构建门禁块 | check-bounded-io / check-control-ops / gen-screen-scope-fixture 三条门禁约束本块形态 | scripts/check-bounded-io.mjs:54 |
 | K06 | 引擎启动流 EngineStartFlow | 引擎就绪时补投待发来件，闭合冷启动竞态 | app/src/main/java/com/dsharnessmobile/shell/EngineStartFlow.kt:550 |
 | K07 | ShizukuTransport | 建屏前必须 ensureBound，输入/拉起/SF token 反查全走 runController 的固定 argv | app/src/main/java/com/dsharnessmobile/shell/VdisplayController.kt:324 |
+| K07 | K06 ScreenScope | `vdInput` 在 bridge 服务面校验目标范围，`VdisplayController.input` 在固定 argv 执行前再次校验；显式 target 直接解析，不得被 selected 覆盖 | plugins/dsh-android-bridge/src/index.ts:1045, app/src/main/java/com/dsharnessmobile/shell/VdisplayController.kt:608 |
 | K07 | K05 | realScreenScopeError 用 displayIdForAlias 把 virtual-N 解析成动态 displayId 并钉给 a11y 取树/截屏 | app/src/main/java/com/dsharnessmobile/shell/DeviceControlService.kt:718 |
 | K05 | K07 | 屏幕范围门的 SF token 空间用 activeAliases 求交，屏一销毁其 token 立刻失效 | app/src/main/java/com/dsharnessmobile/shell/ShellOps.kt:524 |
 | K07 | K08 浏览器宿主 | 同一套「可信舞台几何 → 原生 SurfaceView」与无 catch 的 onMain 是两份同款实现 | app/src/main/java/com/dsharnessmobile/shell/VdisplayHost.kt:207 |
@@ -1494,10 +1496,10 @@ flowchart TD
 - **入口/触发**：
   - 引擎侧装载：`scripts/profile-web.cordis.patch.yml` 的 insert 行拉起三个子仓（`shell-termux` 引擎插件、`host-web-compat` 宿主插件、`ui-responsive` 客户端插件）。
   - 每个 index 响应：`host-web-compat` 用 `ctx.webServer.tapIndex` 在 `</head>` 前注入四段脚本（polyfill + 看门狗 + 主题桥 + 目录选择/打开路径桥）。
-  - 页面事件：客户端插件 `apply()` 装载后，全部由 click/keydown/MutationObserver/ResizeObserver/定时器驱动；壳侧回呼 `window.__dshBack`、`window.__dshOpenPath`、`window.__dshBridge.onDirectoryPicked`。
+  - 页面事件：客户端插件 `apply()` 装载后，全部由 click/keydown/touchstart-move-end-cancel/MutationObserver/ResizeObserver/定时器驱动；壳侧回呼 `window.__dshBack`、`window.__dshOpenPath`、`window.__dshBridge.onDirectoryPicked`。
 - **运行顺序**：
   1. 引擎启动、WebUI 被打开：`host-web-compat.apply()` 先做 `assertInjectionsParse`（`dsh-host-web-compat/lib/index.js:770`），失败即抛 → 插件树装载失败、引擎起不来；通过则注册两次 `tapIndex`（`:783` 主体注入、`:791` 静态失败占位）与三条端点 `/api/android/dir-pick/poll`、`/dir-pick/result`、`/open-path`（`:803-878`）。页面先跑注入脚本（主题桥同步取 `getSystemDark`、picker poll 每 500ms、看门狗 40s 判据 + `readyWatch` 500ms 报就绪），再跑上游 boot 与客户端插件。
-  2. 客户端插件装载：`index.ts:125` 的 `apply()` 按固定顺序注入样式表（mobile-form → mobile-settings → composer-row → composer-insets → composer-menu → attachment-picker-menu → trajectory-details → dev-section），再挂各 marker/守卫（`form-marker` `:135`、`composer-popup-guard` `:163`、`trajectory-panels-observer` `:182`、`enter-guard` `:198`、`keyboard-boundary` `:209`、`theme-bridge` `:218`）、注册槽位（`settings.section` ×2、`settings.general.item`、`shell.overlay` ×2、`sidebar.right.pane.tab` ×2）。`conversation.session.header.utilities` 的「在文件中打开」注册已在 0.14.2 P5 按用户反馈退役（`dsh-client-ui-responsive/src/client/index.ts:352-356`）；open-with tab 类型仍保留，另注册 AI 浏览器 tab。随后启动 browser auto-place 轮询（1s）与来件草稿轮询（4s）。
+  2. 客户端插件装载：`index.ts:125` 的 `apply()` 按固定顺序注入样式表（mobile-form → mobile-settings → composer-row → composer-insets → composer-menu → attachment-picker-menu → trajectory-details → dev-section），再挂各 marker/守卫（`form-marker` `:135`、`composer-popup-guard` `:163`、`trajectory-panels-observer` `:182`、`enter-guard` `:198`、`keyboard-boundary` `:209`、`theme-bridge` `:218`）、注册槽位（`settings.section` ×2、`settings.general.item`、`shell.overlay` ×2、`sidebar.right.pane.tab` ×2）。`conversation.session.header.utilities` 的「在文件中打开」注册已在 0.14.2 P5 按用户反馈退役（`dsh-client-ui-responsive/src/client/index.ts:352-356`）；open-with tab 类型仍保留，另注册 AI 浏览器 tab。0.14.5 #335 增加 `mobile/sidebar-gestures.ts`：只在 `html[data-dsh-mobile-form]` 手机形态下，对触屏内容区起手判向（左右各 32 CSS px 留给系统手势），左、右开关分别读写 `localStorage` 的 `dsh.android.sidebarSwipe.left/right`；右滑打开左栏，左滑在左栏已开/主面板选中时回会话；左滑打开右栏，右滑在右栏已开时关闭当前栏。动作仅按水平 64px 阈值提交，横向意图出现时由显式 `passive:false` 的 `touchmove` 监听器及时阻止浏览器横向接管；垂直位移不调用 `preventDefault`，输入控件/标签/按钮/链接、已选中文本、水平滚动容器及非 settings 模态不认领，settings 弹层仍可用手势返回。定向回归为 `dsh-client-ui-responsive/tests/sidebar-gestures.spec.ts` 与 `general-settings.spec.tsx`。随后启动 browser auto-place 轮询（1s）与来件草稿轮询（4s）。
   3. 交给谁：标记与桥交给壳侧（K04：`dshBackBridge.setAvailable`、`__dshExportResult`、`__dshThemeBridge`、`browserHost*`），控件交给上游 frame 渲染；此后每次返回键/点击/可见性变化回到本块的入口函数。
   - `shell-termux` 与页面无关：引擎启动时以 `ctx.shell` provider 身份装载，模型每次 bash 调用走 `resolve()`（盖 Termux env）→ `run()/start()`；`probe()` 的工具链表被 `plugins/dsh-android-linux-env` 与 `android_toolchain_status` 复用。
 - **嵌套与线程**：调用链最多 3 层，全部书写于页面主线程（JS 单线程），跨语言处才换线程：
@@ -1543,6 +1545,7 @@ flowchart TD
   - `dsh-host-web-compat/lib/index.js:770` — 装载期 `assertInjectionsParse` 四段脚本逐段 `new Function` 断言（防线②）。
   - `dsh-host-web-compat/lib/index.js:783` 与 `:791` — 两次 `tapIndex`：前者带 `x-dsh-pick-token` 幂等哨兵，后者是独立哨兵的静态失败占位。
   - `dsh-client-ui-responsive/src/client/mobile/form-marker.ts:88` — `html[data-dsh-mobile-form]` 唯一发布点。
+  - `dsh-client-ui-responsive/src/client/mobile/sidebar-gestures.ts` — `touchstart/move/end/cancel` 内容区仲裁唯一入口；左、右设置键分别为 `dsh.android.sidebarSwipe.left` 与 `.right`，缺省启用、`0` 关闭；32 CSS px 外边条不拦截，64px 横移判动作；多指 start/move 会取消，touchend 仅在无剩余触点时结算；仅受 `data-dsh-mobile-form` 门控。
   - `dsh-client-ui-responsive/src/client/mobile/back-stack.ts:334` — `window.__dshBack` 入口（壳侧返回键唯一可达点）；`:551` 是上行 `setAvailable` 的唯一出口。
   - `dsh-client-ui-responsive/src/client/mobile/native-browser-presentation.ts:61` — `browserHostBounds` 跨桥下推（原生覆盖层几何/可见性的唯一来源）。
   - `dsh-client-ui-responsive/src/client/enter-guard.ts:63` — 形态门用 `window.innerWidth` 直读（与标记不同源）。
@@ -1638,7 +1641,7 @@ flowchart TD
   - `scripts/build-apk-013.ps1:388`（gradle assembleDebug，出包唯一一步）
   - `scripts/build-apk-engine.mjs:33` / `:86`（共用 assemble 与签名验证入口）；调用测试锁住本地、云端、发布三路汇合：`scripts/build-apk-engine.test.mjs:121`
   - `scripts/patches/data/registry-scan-c4.mjs:11`（同步 flush 的 Loader 临时索引与 manifest 复用；详细设备计时/预算见 RUNTIME-PATCHES §7.6，自动补给的异步 checkpoint 见 model-capability README）
-  - `scripts/patches/data/undo-safe-transaction-snippet.mjs:1`（Safe Mode 事务代码模板；由 `apply-patches.mjs:438` 注入 vendor 快照代码）
+  - `scripts/patches/data/undo-safe-transaction-snippet.mjs:1`（Safe Mode 事务代码模板；由 `apply-patches.mjs:519` 注入 vendor 快照代码）
   - `scripts/build-apk-013.ps1:427`（被拒非空即 exit 1 的收口）
   - `scripts/build-snapshot-013.mjs:31`（Windows 宿主重入 WSL 的判据）
   - `scripts/build-snapshot-013.mjs:297`（引擎树补丁 --apply --scope engine）

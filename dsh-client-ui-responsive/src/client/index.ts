@@ -65,6 +65,7 @@ import { BackStackSignal } from './mobile/back-stack.ts'
 import { MAIN_PANEL_BACK_CSS } from './mobile/main-panel-back.css.ts'
 import { MainPanelBackMount } from './mobile/main-panel-back.ts'
 import { PanelNavDrawer } from './mobile/panel-nav-drawer.ts'
+import { MobileSidebarGestures } from './mobile/sidebar-gestures.ts'
 import { SessionMarker, type SessionsFace } from './mobile/session-marker.ts'
 import {
   BROWSER_TAB_ID, BROWSER_TAB_KIND, LEGACY_BROWSER_TAB_ID, LEGACY_BROWSER_TAB_KIND,
@@ -521,6 +522,47 @@ export function apply(ctx: ClientContext): void {
       backStack.detach()
     }
   }, 'ui-responsive: back-stack signal (page layers → shell back gate)')
+
+  // APK #335: narrow-screen content swipes reuse the layout and right-sidebar
+  // controllers. The two preferences are independent and are read at gesture
+  // start, so settings changes take effect without remounting this listener.
+  ctx.effect(() => {
+    const right = ctx.get('sidebarRight') as { isExpanded(): boolean; toggleExpanded(): void } | undefined
+    const frame = (): HTMLElement | null => document.querySelector('[data-dsh-frame]')
+    const gestures = new MobileSidebarGestures({
+      mobileForm: () => document.documentElement.hasAttribute('data-dsh-mobile-form'),
+      leftOpen: () => {
+        const root = frame()
+        return root !== null && !root.hasAttribute('data-sidebar-collapsed')
+      },
+      rightOpen: () => right?.isExpanded() ?? false,
+      mainPanelSelected: () => ctx.layout.panelInfo.getSnapshot().activePanelId !== null,
+      openLeft: () => { ctx.layout.toggleSidebar() },
+      returnToConversation: () => {
+        // Settings is the one dialog nested in the drawer; dismiss its own
+        // back-stack layer before collapsing the drawer and selecting session.
+        const settings = document.querySelector<HTMLElement>('[data-dsh-settings-dialog]')
+        if (settings !== null) {
+          const consumed = window.__dshBack?.() ?? false
+          if (!consumed) {
+            const mask = settings.parentElement?.querySelector(':scope > [aria-hidden="true"]')
+              ?? settings.querySelector(':scope > [aria-hidden="true"]')
+            if (mask !== null && mask !== undefined) {
+              mask.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }))
+              mask.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+            }
+          }
+        }
+        const root = frame()
+        if (root !== null && !root.hasAttribute('data-sidebar-collapsed')) ctx.layout.toggleSidebar()
+        ctx.layout.selectPanel(null)
+      },
+      openRight: () => { if (right !== undefined && !right.isExpanded()) right.toggleExpanded() },
+      closeRight: () => { if (right?.isExpanded()) right.toggleExpanded() },
+    })
+    gestures.attach()
+    return () => { gestures.detach() }
+  }, 'ui-responsive: narrow-screen sidebar content swipes')
 
   // FX1-C (2026-09-27, user): the sidebar 插件 row switches the centre column to
   // upstream plugin-manager main panel, which is neither a dialog nor a sidebar layer -

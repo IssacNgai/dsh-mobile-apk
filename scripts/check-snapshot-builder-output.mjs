@@ -35,6 +35,9 @@ const BUILDER = join(ROOT, 'scripts', 'build-snapshot-013.mjs')
 const SLIM = join(ROOT, 'scripts', 'snapshot-config', 'slim.json')
 const APK_CHAIN = join(ROOT, 'scripts', 'build-apk-013.ps1')
 const MIRROR_CHAIN = join(ROOT, 'dsh-mobile-apk', 'scripts', 'build-apk-013.ps1')
+const PORTABLE_CHAIN = join(ROOT, 'scripts', 'build-apk.mjs')
+const RUNTIME_ASSET_GATE_LOCAL = 'node (Join-Path $Root "scripts\\check-runtime-assets.mjs") $abi --require --snapshot $snapIn'
+const RUNTIME_ASSET_GATE_PORTABLE = "run('node', [gate('check-runtime-assets.mjs'), ABI, '--require', '--snapshot', snapIn])"
 
 const failures = []
 const check = (label, ok, detail) => {
@@ -159,6 +162,17 @@ function runChecks() {
     check('打包链读取 .deploy-tmp\\snapshot-013\\<abi>\\snapshot.tar.xz（与构建器同源）',
       chain.includes('.deploy-tmp\\snapshot-013\\') && chain.includes('snapshot.tar.xz'),
       '打包链路径变更：两者不同源会产生「写 A 读 B」的静默假绿')
+    check('运行时资产门禁显式读取注入后的最终快照（PowerShell）',
+      chain.includes(RUNTIME_ASSET_GATE_LOCAL),
+      '必须把当前 ABI 的 $snapIn 传给 --snapshot；默认值会错误读取旧 stage tar')
+  }
+  if (!existsSync(PORTABLE_CHAIN)) {
+    check('可移植打包链在场: scripts/build-apk.mjs', false)
+  } else {
+    const portable = readFileSync(PORTABLE_CHAIN, 'utf8')
+    check('运行时资产门禁显式读取注入后的最终快照（portable）',
+      portable.includes(RUNTIME_ASSET_GATE_PORTABLE),
+      '必须把当前 ABI 的 snapIn 传给 --snapshot；默认值会错误读取旧 stage tar')
   }
   // 镜像侧同版（铁律 6：单边演进 = 云端跑到旧构建器）
   if (existsSync(MIRROR_CHAIN)) {
@@ -186,6 +200,16 @@ function selfTest() {
   // ① 正向：当前构建器必须通过全部构造在场判据
   const missingNow = REQUIRED.filter((r) => !text.split('\n').some((l) => l.includes(r.needle) && !/^\s*(\/\/|\*)/.test(l)))
   probe('正向对照：当前构建器的产出面构造全部在场（缺=' + missingNow.length + '）', missingNow.length === 0)
+
+  const localChain = readFileSync(APK_CHAIN, 'utf8')
+  const portableChain = readFileSync(PORTABLE_CHAIN, 'utf8')
+  probe('正向对照：两条打包链都将最终快照传给运行时资产门禁',
+    localChain.includes(RUNTIME_ASSET_GATE_LOCAL) && portableChain.includes(RUNTIME_ASSET_GATE_PORTABLE))
+  probe('反向对照：省略 PowerShell --snapshot 会被门禁自测识别',
+    !localChain.replace(' --snapshot $snapIn', '').includes(RUNTIME_ASSET_GATE_LOCAL))
+  probe('反向对照：省略 portable --snapshot 会被门禁自测识别',
+    !portableChain.replace(RUNTIME_ASSET_GATE_PORTABLE,
+      RUNTIME_ASSET_GATE_PORTABLE.replace(", '--snapshot', snapIn", '')).includes(RUNTIME_ASSET_GATE_PORTABLE))
 
   // ② 反向：模拟本次事故——尾部删除（把归档段整段砍掉）后判据必须判红
   const cut = text.replace(/\n\/\/ ── 8\. 归档[\s\S]*$/, '\n')

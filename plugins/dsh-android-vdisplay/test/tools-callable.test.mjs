@@ -152,6 +152,34 @@ test('android_vdisplay_input rejection and control failure both satisfy the stri
   assertMatchesToolSchema(brokenInput, failed)
 })
 
+test('android_vdisplay_input preserves the stable scope denial code from bridge service', async () => {
+  const deniedFace = {
+    async controlExec(op) {
+      if (op === 'vdInfo') return { ok: true, data: { screens: [{ alias: 'virtual-1', kind: 'virtual', displayId: 42 }] } }
+      return { ok: false, code: 'screen-out-of-scope', error: 'screen-out-of-scope: user scope is real-only' }
+    },
+  }
+  const input = loadTools(deniedFace).find((t) => t.name === 'android_vdisplay_input')
+  const value = await input.execute({ verb: 'tap', x: 1, y: 2, screenId: 'virtual-1' }, { agent: { session: 't' } })
+  assert.equal(value.ok, false)
+  assert.equal(value.code, 'screen-out-of-scope')
+  assertMatchesToolSchema(input, value)
+})
+
+test('native vdInput execution checks scope before Shizuku and honors the explicit display target', async () => {
+  const source = (await import('node:fs')).readFileSync(fileURLToPath(KOTLIN_SOURCE), 'utf8')
+  const start = source.indexOf('fun input(context: Context, verb: String, args: JSONObject, target: String? = null)')
+  const end = source.indexOf('\n  /**', start + 1)
+  assert.ok(start >= 0 && end > start, 'VdisplayController.input source block must exist')
+  const body = source.slice(start, end)
+  assert.match(body, /if \(target != null\) recordOf\(target\) else selectedRecord\(\)/,
+    'explicit target must not be replaced by selectedRecord')
+  assert.ok(body.indexOf('scope.inputDenial(record.alias)') < body.indexOf('ShizukuTransport.runController'),
+    'scope refusal must happen before any Shizuku input dispatch')
+  assert.match(body, /\.put\("code", denial\)\.put\("reason", denial\)/,
+    'native refusal must carry the stable machine-readable denial code')
+})
+
 test('android_vdisplay_destroy 同样必须走通（同一缺陷类）', async () => {
   const { face, calls } = strictFace()
   const tools = loadTools(face)

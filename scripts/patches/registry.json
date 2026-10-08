@@ -95,12 +95,12 @@
     {
       "id": "undo-safe-transaction-S2",
       "target": "dsh-undo-savepoint/lib/core.mjs",
-      "summary": "Safe Mode 先验证备份并原子写兼容状态，再逐项原子改动；中断后保留可重试恢复路径",
+      "summary": "Safe Mode 为 patch、home 与包状态写入主备份及独立 SHA-256 内容寻址恢复副本；任一路双副本失效即拒绝全部 live 写入。新 web 状态绑定 profile；兼容唯一既有 scoped marker，双位置冲突 fail closed",
       "provenance": "2026-10-05 Hard/Soft/Data 重构审计：多个 Safe Mode 入口曾在改配置后才写状态，崩溃会丢失退出依据",
       "requires": [
         "undo-safe-align-S1"
       ],
-      "marker": "dsh-mobile safe mode transaction (S2)"
+      "marker": "dsh-mobile safe mode transaction (S2) with CAS recovery failover, web-store resolver and factory-bundle filter (S5)"
     },
     {
       "id": "undo-api-auth-U1",

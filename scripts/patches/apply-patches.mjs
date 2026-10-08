@@ -48,6 +48,28 @@ function saveImpl(target, vendorRoot) {
   writeFileSync(join(vendorRoot, target), IMPL_state[target])
 }
 
+function safeModeTransactionStart(source) {
+  const selector = source.indexOf('async function safeModeOwnershipManifest(filesRoot)')
+  if (selector < 0) return -1
+  let start = source.lastIndexOf('\n', selector - 1) + 1
+  while (start > 0) {
+    const previousEnd = start - 1
+    const previousStart = source.lastIndexOf('\n', previousEnd - 1) + 1
+    const previousLine = source.slice(previousStart, previousEnd).replace(/\r$/, '')
+    if (!previousLine.startsWith('// dsh-mobile safe mode transaction (S2)')) break
+    start = previousStart
+  }
+  return start
+}
+
+function safeModeTransactionIsLf(source) {
+  const start = safeModeTransactionStart(source)
+  const end = source.indexOf('// ── 跨机一致性预检', start)
+  return start >= 0 && end > start && !source.slice(start, end).includes('\r') &&
+    !source.includes("import { join, dirname, basename, resolve, relative, sep, isAbsolute } from 'node:path';\r\n") &&
+    !source.includes("    safeModeDefaultWebStore: profileName === 'web' && overrides.autoDir === undefined && !hasConfiguredAutoDir(),\r\n")
+}
+
 /* ── H-2（0.14.2-fx-2）：G3 的归属判据真源 ────────────────────────────────────────
  * 旧判据按**包名前缀**（`@deepseek-ai/`、`@dsh-android/`）判「这条失败算不算我们自己的产品回归」，
  * 于是用户自己挂的官方包（实测：`@deepseek-ai/dsh-mcp-client`，用户在 profile 里配的 mcp-lark）
@@ -458,7 +480,27 @@ const IMPLS = {
   'undo-safe-transaction-S2': {
     file: 'dsh-undo-savepoint/lib/core.mjs',
     check: (s) => s.includes('dsh-mobile safe mode transaction (S2)') &&
+      safeModeTransactionIsLf(s) &&
+      s.includes('dsh-mobile safe mode transaction (S2) with CAS recovery failover, web-store resolver and factory-bundle filter (S5)') &&
+      s.includes('async function safeModeResolveWebStore(cfg)') &&
+      s.indexOf('function safeModeRecoveryObjectName(sha)') < s.indexOf('async function safeModeRecoveryPath(autoDir, sha, create = false)') &&
+      s.indexOf('async function safeModeRecoveryPath(autoDir, sha, create = false)') < s.indexOf('async function safeModeResolveWebStore(cfg)') &&
+      s.includes('safeModeDefaultWebStore: profileName === \'web\'') &&
+      s.includes('function hasConfiguredAutoDir()') &&
+      s.includes('homeExisted: homePatchExists') &&
+      s.includes('Both current and legacy Safe Mode markers exist') &&
+      s.includes('Safe-mode state is not a regular file') &&
+      s.includes('Safe-mode state belongs to profile') &&
+      s.includes('safeModeLoadBackup(cfg, primary, expectedSha)') &&
+      s.includes('safeModeEnsureRecovery(cfg, bytes, sha, atomicWrite)') &&
+      s.includes('async function safeModeRecoveryPath(autoDir, sha, create = false)') &&
+      s.includes('function safeModeRecoveryObjectName(sha)') &&
+      s.includes('Missing primary files remain valid recovery candidates') &&
+      s.includes('constants as fsConstants') &&
+      s.includes('relative, sep, isAbsolute } from \'node:path\'') &&
       s.includes('dsh-mobile safe ownership identity v2') &&
+      s.includes('safeModeSelectFactoryBundles(cfg, pkg, pkgRaw, hardManifest.factoryBundles)') &&
+      s.includes('async function safeModeBundlePatchSha(packageRoot, declared)') &&
       s.includes('safeModeFilterInserts(patchBytes.toString(\'utf8\'), hardManifest.entries)') &&
       s.includes('value.schema === 2') && s.includes('value.profileEntries') &&
       s.includes('safeModeOwnershipManifest(filesRoot)') &&
@@ -466,7 +508,27 @@ const IMPLS = {
       s.includes("const purpose = marker.purpose || 'FACTORY'"),
     apply: (s) => {
       if (s.includes('dsh-mobile safe mode transaction (S2)') &&
+        safeModeTransactionIsLf(s) &&
+        s.includes('dsh-mobile safe mode transaction (S2) with CAS recovery failover, web-store resolver and factory-bundle filter (S5)') &&
+        s.includes('async function safeModeResolveWebStore(cfg)') &&
+        s.indexOf('function safeModeRecoveryObjectName(sha)') < s.indexOf('async function safeModeRecoveryPath(autoDir, sha, create = false)') &&
+        s.indexOf('async function safeModeRecoveryPath(autoDir, sha, create = false)') < s.indexOf('async function safeModeResolveWebStore(cfg)') &&
+        s.includes('safeModeDefaultWebStore: profileName === \'web\'') &&
+        s.includes('function hasConfiguredAutoDir()') &&
+        s.includes('homeExisted: homePatchExists') &&
+        s.includes('Both current and legacy Safe Mode markers exist') &&
+        s.includes('Safe-mode state is not a regular file') &&
+        s.includes('Safe-mode state belongs to profile') &&
+        s.includes('safeModeLoadBackup(cfg, primary, expectedSha)') &&
+        s.includes('safeModeEnsureRecovery(cfg, bytes, sha, atomicWrite)') &&
+        s.includes('async function safeModeRecoveryPath(autoDir, sha, create = false)') &&
+        s.includes('function safeModeRecoveryObjectName(sha)') &&
+        s.includes('Missing primary files remain valid recovery candidates') &&
+        s.includes('constants as fsConstants') &&
+        s.includes('relative, sep, isAbsolute } from \'node:path\'') &&
         s.includes('dsh-mobile safe ownership identity v2') &&
+        s.includes('safeModeSelectFactoryBundles(cfg, pkg, pkgRaw, hardManifest.factoryBundles)') &&
+        s.includes('async function safeModeBundlePatchSha(packageRoot, declared)') &&
         s.includes('safeModeFilterInserts(patchBytes.toString(\'utf8\'), hardManifest.entries)') &&
         s.includes('value.schema === 2') && s.includes('value.profileEntries') &&
         s.includes('safeModeOwnershipManifest(filesRoot)') &&
@@ -475,13 +537,36 @@ const IMPLS = {
       const safeStart = s.indexOf('async function safeModeSet(cfg, on')
       const selectorStart = s.indexOf('async function safeModeOwnershipManifest(filesRoot)')
       const helperStart = s.indexOf('function safeModeSha256(bytes) {')
-      const start = selectorStart >= 0 ? selectorStart : helperStart >= 0 ? helperStart : safeStart
+      const start = selectorStart >= 0 ? safeModeTransactionStart(s) : helperStart >= 0 ? helperStart : safeStart
       const end = s.indexOf('// ── 跨机一致性预检', start)
       if (start < 0 || end < 0 || safeStart < 0) {
         throw new Error('undo-safe-transaction 锚点缺失：safeModeSet / preflight 边界已变')
       }
       const transaction = readFileSync(join(HERE, 'data', 'undo-safe-transaction-snippet.mjs'), 'utf8')
-      const next = s.slice(0, start) + transaction + '\n' + s.slice(end)
+      let next = s.slice(0, start) + transaction + '\n' + s.slice(end)
+      const defaultDirHelper = `function hasConfiguredAutoDir() {
+  try {
+    const value = JSON.parse(readFileSync(SETTINGS_FILE, 'utf8').replace(/^\\uFEFF/, ''));
+    return Object.prototype.hasOwnProperty.call(value, 'autoDir');
+  } catch { return false; }
+}
+`
+      const autoHelperStart = next.indexOf('function hasConfiguredAutoDir() {')
+      if (autoHelperStart >= 0) {
+        const autoHelperEnd = next.indexOf('\n}', autoHelperStart)
+        if (autoHelperEnd > autoHelperStart) next = next.slice(0, autoHelperStart) + defaultDirHelper.trimEnd() + next.slice(autoHelperEnd + 2)
+      } else {
+        next = next.replace(/function buildConfig\(overrides = \{\}\) \{/, defaultDirHelper + 'function buildConfig(overrides = {}) {')
+      }
+      const safeModeDefaultLine = `    safeModeDefaultWebStore: profileName === 'web' && overrides.autoDir === undefined && !hasConfiguredAutoDir(),\n`
+      if (!next.includes('safeModeDefaultWebStore: profileName === \'web\'')) next = next.replace(/(    profileName,\r?\n)/, `$1${safeModeDefaultLine}`)
+      else next = next.replace(/    safeModeDefaultWebStore: profileName === 'web' && overrides.autoDir === undefined && !hasConfiguredAutoDir\(\),\r?\n/, safeModeDefaultLine)
+      next = next.replace("import { promises as fs, existsSync, readFileSync } from 'node:fs';",
+        "import { promises as fs, existsSync, readFileSync, constants as fsConstants } from 'node:fs';")
+      next = next.replace(/import \{ join, dirname, basename, resolve, isAbsolute \} from 'node:path';\r?\n/,
+        "import { join, dirname, basename, resolve, relative, sep, isAbsolute } from 'node:path';\n")
+      next = next.replace(/import \{ join, dirname, basename, resolve, relative, sep, isAbsolute \} from 'node:path';\r?\n/,
+        "import { join, dirname, basename, resolve, relative, sep, isAbsolute } from 'node:path';\n")
       if (!next.includes('dsh-mobile safe mode transaction (S2)')) {
         throw new Error('undo-safe-transaction 复核失败——不写回')
       }
@@ -903,15 +988,37 @@ const IMPLS = {
   // 历史：0.13.3 曾以「上游 0.1.2-rc.1 已原生覆盖 rename 回退」为由退役 fs-local-index.js，
   // 但该结论对当前的 createIfAbsent 站点不成立（0.1.5-rc.1 实测：全文仅此一处 link 调用，
   // 且无任何 EACCES/EPERM/ENOTSUP 回退）——本补丁即补回该覆盖。
-  // 不变量：EACCES/EPERM/ENOTSUP 时改用 O_EXCL 占位 + rename 等价实现 no-replace
+  // 不变量：Android private dir 的 EACCES 与 shared-storage/FUSE 的 ENOSYS，以及 EPERM/ENOTSUP，
+  // 改用 O_EXCL 占位 + rename 等价实现 no-replace
   // （直接照抄 else 分支的裸 rename 会静默覆盖已存在目标，丢掉 link 的独占语义）。
   'fs-local-link-F8': {
     file: 'usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-fs-local/lib/index.js',
     scope: 'engine',
-    check: (s) => s.includes('dsh-mobile exclusive create (F8)')
-      && s.includes('dsh-mobile link->rename fallback (F8)')
-      && s.includes('dshMobilePublishExclusive('),
+    check: (s) => {
+      const markerAt = s.indexOf('dsh-mobile link->rename fallback (F8)');
+      const conditionAt = markerAt < 0 ? -1 : s.indexOf('if (!(error instanceof Error', markerAt);
+      const conditionLine = conditionAt < 0 ? '' : s.slice(conditionAt, s.indexOf('\n', conditionAt));
+      return s.includes('dsh-mobile exclusive create (F8)')
+        && markerAt >= 0
+        && s.includes('dshMobilePublishExclusive(')
+        && conditionLine.includes('error.code === \"EACCES\" || error.code === \"EPERM\" || error.code === \"ENOTSUP\" || error.code === \"ENOSYS\"');
+    },
     apply: (s) => {
+      // Android private dirs reject hard links with EACCES; shared-storage/FUSE may return ENOSYS.
+      // Upgrade only the predicate in the F8 site's catch line; unrelated ENOSYS text is irrelevant.
+      const markerAt = s.indexOf('dsh-mobile link->rename fallback (F8)');
+      if (markerAt >= 0) {
+        const conditionAt = s.indexOf('if (!(error instanceof Error', markerAt);
+        const conditionEnd = conditionAt < 0 ? -1 : s.indexOf('\n', conditionAt);
+        if (conditionAt < 0 || conditionEnd < 0) throw new Error('F8 upgrade predicate missing');
+        const conditionLine = s.slice(conditionAt, conditionEnd);
+        const oldPredicate = 'error.code === \"EACCES\" || error.code === \"EPERM\" || error.code === \"ENOTSUP\"';
+        const newPredicate = oldPredicate + ' || error.code === \"ENOSYS\"';
+        if (!conditionLine.includes(newPredicate)) {
+          if (!conditionLine.includes(oldPredicate)) throw new Error('F8 upgrade predicate missing');
+          s = s.slice(0, conditionAt) + conditionLine.replace(oldPredicate, newPredicate) + s.slice(conditionEnd);
+        }
+      }
       if (s.includes('dsh-mobile exclusive create (F8)')
         && s.includes('dsh-mobile link->rename fallback (F8)')
         && s.includes('dshMobilePublishExclusive(')) return s
@@ -928,8 +1035,8 @@ const IMPLS = {
         '\t\tif (createIfAbsent !== void 0) try {',
         '\t\t\tawait linkFile(tempPath, absolutePath);',
         '\t\t} catch (error) {',
-        '\t\t\t/* dsh-mobile link->rename fallback (F8): Android app-private dirs reject link(2) (EACCES). */',
-        '\t\t\tif (!(error instanceof Error && "code" in error && (error.code === "EACCES" || error.code === "EPERM" || error.code === "ENOTSUP"))) {',
+        '\t\t\t/* dsh-mobile link->rename fallback (F8): Android private EACCES and shared-storage/FUSE ENOSYS. */',
+        '\t\t\tif (!(error instanceof Error && "code" in error && (error.code === "EACCES" || error.code === "EPERM" || error.code === "ENOTSUP" || error.code === "ENOSYS"))) {',
         '\t\t\t\tawait throwGuardedCreateFailure(error, absolutePath, createIfAbsent.displayPath, inspectPublicationTarget);',
         '\t\t\t} else {',
         '\t\t\t\tawait dshMobilePublishExclusive(tempPath, absolutePath, createIfAbsent.displayPath, inspectPublicationTarget, internals);',
@@ -947,8 +1054,8 @@ const IMPLS = {
       const HELPER = [
         '',
         '/**',
-        ' * dsh-mobile exclusive create (F8): Android app-private directories reject link(2) with EACCES,',
-        ' * so the createIfAbsent publication cannot use the hard-link no-replace primitive at all.',
+        ' * dsh-mobile exclusive create (F8): Android private directories reject link(2) with EACCES,',
+        ' * and shared-storage/FUSE may reject it with ENOSYS; createIfAbsent cannot rely on hard links.',
         ' * Re-implement it with an O_EXCL placeholder plus a rename, which keeps the semantics the hard',
         ' * link provided: the loser of a concurrent create gets EEXIST and reports the same',
         ' * "cannot overwrite existing" refusal, and a failed rename releases the placeholder so a',

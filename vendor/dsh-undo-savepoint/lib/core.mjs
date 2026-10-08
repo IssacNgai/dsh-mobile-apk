@@ -20,9 +20,9 @@
  * @module dsh-undo-savepoint/core
  */
 import { createRequire } from 'node:module';
-import { promises as fs, existsSync, readFileSync } from 'node:fs';
+import { promises as fs, existsSync, readFileSync, constants as fsConstants } from 'node:fs';
 import { execFile } from 'node:child_process';
-import { join, dirname, basename, resolve, isAbsolute } from 'node:path';
+import { join, dirname, basename, resolve, relative, sep, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomBytes, createCipheriv, createDecipheriv, scryptSync } from 'node:crypto';
 // node:zlib 的 zstd API（zstdCompressSync/zstdDecompressSync/ZSTD_c_checksumFlag）是
@@ -309,7 +309,6 @@ function loadSettingsFile() {
     return { ...DEFAULT_SETTINGS, ...j };
   } catch { return { ...DEFAULT_SETTINGS }; }
 }
-
 /** 解析当前 DSH profile（v0.3.3，issue #3）。`dsh web` 是 `--profile web` 的别名。 */
 function detectProfileName(argv = process.argv ?? []) {
   for (let i = 0; i < argv.length; i++) {
@@ -336,6 +335,12 @@ function resolveStoreRoots(profileName) {
  * 共用一个纯数据 cfg 构造器，保证双端路径/设置语义一致。
  * @param {object} [overrides] 可覆盖 homeDir/profileDir/sensitiveMode/bootAlert/profileName 等
  */
+function hasConfiguredAutoDir() {
+  try {
+    const value = JSON.parse(readFileSync(SETTINGS_FILE, 'utf8').replace(/^\uFEFF/, ''));
+    return Object.prototype.hasOwnProperty.call(value, 'autoDir');
+  } catch { return false; }
+}
 function buildConfig(overrides = {}) {
   const profileName = overrides.profileName ?? detectProfileName();
   const homeDir = overrides.homeDir ?? DSH_HOME;
@@ -345,6 +350,7 @@ function buildConfig(overrides = {}) {
   return {
     ...fileSettings,
     profileName,
+    safeModeDefaultWebStore: profileName === 'web' && overrides.autoDir === undefined && !hasConfiguredAutoDir(),
     homeDir,
     profileDir,
     manualDir: overrides.manualDir ?? fileSettings.manualDir ?? roots.manualDir,
@@ -1018,9 +1024,7 @@ export function safeModeFilterInserts(text, hardEntries = []) {
   }
   return out.join('\n');
 }
-// dsh-mobile safe mode transaction (S2): backups and state precede atomic per-file replacement.
-// dsh-mobile safe mode transaction (S2): backups and state precede atomic per-file replacement.
-// dsh-mobile safe mode transaction (S2): backups and state precede atomic per-file replacement.
+// dsh-mobile safe mode transaction (S2) with CAS recovery failover, web-store resolver and factory-bundle filter (S5).
 async function safeModeOwnershipManifest(filesRoot) {
   const readJson = async (path) => { try { return JSON.parse(await fs.readFile(path, 'utf8')) } catch { return null } };
   const valid = (value) => value && value.schema === 2 && value.complete === true &&
@@ -1028,7 +1032,10 @@ async function safeModeOwnershipManifest(filesRoot) {
     value.entries.every((entry) => entry && typeof entry.id === 'string' && entry.id.length > 0 && typeof entry.name === 'string' && entry.name.length > 0) &&
     Array.isArray(value.profileEntries) && value.profileEntries.length > 0 &&
     value.profileEntries.every((entry) => entry && typeof entry.id === 'string' && typeof entry.name === 'string' &&
-      value.entries.some((hard) => hard.id === entry.id && hard.name === entry.name));
+      value.entries.some((hard) => hard.id === entry.id && hard.name === entry.name)) &&
+    (value.factoryBundles === undefined || value.factoryBundles === null ||
+      (Array.isArray(value.factoryBundles) && value.factoryBundles.every((bundle) => bundle && typeof bundle.name === 'string' && bundle.name.length > 0 &&
+        typeof bundle.version === 'string' && bundle.version.length > 0 && /^[0-9a-f]{64}$/.test(bundle.patchSha256 ?? ''))));
   const cache = await readJson(join(filesRoot, '.plugin-hard-manifest.json'));
   const installed = (await fs.readFile(join(filesRoot, '.snapshot-fingerprint'), 'utf8')).trim().toLowerCase();
   if (!/^[0-9a-f]{64}$/.test(installed) || !valid(cache)) throw new Error('ownership cache/fingerprint unavailable');
@@ -1110,12 +1117,14 @@ async function safeModeBackupPath(cfg, value, id, prefix, suffix = '.yml') {
     const candidate = resolve(value);
     const expectedName = `${prefix}${id}${suffix}`;
     if (basename(candidate) !== expectedName || await fs.realpath(dirname(candidate)) !== root) return null;
+    // Missing primary files remain valid recovery candidates when the snapshot id and root bind the path.
     // autoDir and stored paths may use a symlink alias; only allow that on the
     // parent path. The backup file itself must remain a regular, non-symlink file.
-    const info = await fs.lstat(candidate);
-    if (!info.isFile() || info.isSymbolicLink()) return null;
     const canonical = join(root, expectedName);
-    if (await fs.realpath(candidate) !== canonical) return null;
+    try {
+      const info = await fs.lstat(candidate);
+      if (!info.isFile() || info.isSymbolicLink() || await fs.realpath(candidate) !== canonical) return null;
+    } catch (error) { if (error?.code !== 'ENOENT') return null; }
     return canonical;
   } catch { return null; }
 }
@@ -1126,9 +1135,152 @@ async function safeModeVerifyBackup(path, expectedSha) {
     return typeof expectedSha !== 'string' || expectedSha === '' || safeModeSha256(bytes) === expectedSha;
   } catch { return false; }
 }
+async function safeModeReadRegular(path) {
+  if (!path) return null;
+  let handle;
+  try {
+    handle = await fs.open(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    const info = await handle.stat();
+    if (!info.isFile()) return null;
+    return await handle.readFile();
+  } catch { return null; } finally { await handle?.close().catch(() => {}); }
+}
+function safeModeRecoveryObjectName(sha) {
+  return typeof sha === 'string' && /^[0-9a-f]{64}$/.test(sha) ? `safe-mode-${sha}.yml` : null;
+}
+async function safeModeRecoveryPath(autoDir, sha, create = false) {
+  const objectName = safeModeRecoveryObjectName(sha);
+  if (!objectName) return null;
+  try {
+    const dir = join(dirname(autoDir), 'safe-mode-recovery');
+    if (create) await fs.mkdir(dir, { recursive: true });
+    const root = await fs.realpath(dirname(autoDir));
+    const recovery = join(root, 'safe-mode-recovery');
+    if (await fs.realpath(recovery) !== recovery || (await fs.lstat(recovery)).isSymbolicLink()) return null;
+    return join(recovery, objectName);
+  } catch { return null; }
+}
+async function safeModeResolveWebStore(cfg) {
+  if (cfg.profileName !== 'web' || cfg.safeModeDefaultWebStore !== true) return { cfg };
+  const root = dirname(cfg.autoDir);
+  if (basename(cfg.autoDir) !== 'auto') return { cfg };
+  const flatAuto = cfg.autoDir;
+  const scopedAuto = join(root, 'web', 'auto');
+  const markers = ['safe-mode.json', 'safe-mode-state.json'];
+  const hasMarker = async (dir) => {
+    for (const name of markers) {
+      try { await fs.lstat(join(dir, name)); return true; } catch { /* no marker entry */ }
+    }
+    return false;
+  };
+  const flat = await hasMarker(flatAuto);
+  const scoped = await hasMarker(scopedAuto);
+  if (flat && scoped) return { error: `Safe Mode state conflict: both ${flatAuto} and ${scopedAuto} contain marker files; refusing to read or modify either store.` };
+  const autoDir = scoped ? scopedAuto : flatAuto;
+  return { cfg: { ...cfg, autoDir, manualDir: join(dirname(autoDir), 'manual') } };
+}
+async function safeModeEnsureRecovery(cfg, bytes, sha, atomicWrite) {
+  const target = await safeModeRecoveryPath(cfg.autoDir, sha, true);
+  if (!target) throw new Error('invalid recovery digest');
+  const existing = await safeModeReadRegular(target);
+  if (!existing || safeModeSha256(existing) !== sha) await atomicWrite(target, bytes);
+  const verified = await safeModeReadRegular(target);
+  if (!verified || !verified.equals(bytes)) throw new Error('recovery copy verification failed');
+}
+async function safeModeLoadBackup(cfg, primary, expectedSha) {
+  if (!primary) return null;
+  const primaryBytes = await safeModeReadRegular(primary);
+  if (primaryBytes && (typeof expectedSha !== 'string' || expectedSha === '' || safeModeSha256(primaryBytes) === expectedSha)) return primaryBytes;
+  // Digest-less legacy state can only authorize its primary backup.
+  if (typeof expectedSha !== 'string' || expectedSha === '') return null;
+  const copy = await safeModeReadRegular(await safeModeRecoveryPath(cfg.autoDir, expectedSha));
+  return copy && safeModeSha256(copy) === expectedSha ? copy : null;
+}
+async function safeModeBundlePatchSha(packageRoot, declared) {
+  const patches = typeof declared === 'string' ? [declared] : declared;
+  if (!Array.isArray(patches) || patches.length === 0) throw new Error('bundle patch declaration missing');
+  const root = await fs.realpath(packageRoot);
+  const hash = createHash('sha256').update(Buffer.from('DSHBNDL1', 'ascii'));
+  for (const rel of patches) {
+    if (typeof rel !== 'string' || !rel || isAbsolute(rel) || rel.includes('\\') || rel.includes('\0') || rel.split('/').includes('..')) throw new Error('unsafe bundle patch path');
+    const target = resolve(root, rel);
+    const relFromRoot = relative(root, target);
+    if (!relFromRoot || relFromRoot === '..' || relFromRoot.startsWith(`..${sep}`)) throw new Error('bundle patch escapes package');
+    let cursor = root;
+    for (const segment of relFromRoot.split(sep)) {
+      cursor = join(cursor, segment);
+      const info = await fs.lstat(cursor);
+      if (info.isSymbolicLink() || (cursor === target ? !info.isFile() : !info.isDirectory())) throw new Error('bundle patch path is not regular');
+    }
+    const pathBytes = Buffer.from(rel, 'utf8');
+    const patchBytes = await fs.readFile(target);
+    const pathLength = Buffer.alloc(4); pathLength.writeUInt32BE(pathBytes.length);
+    const contentLength = Buffer.alloc(8); contentLength.writeBigUInt64BE(BigInt(patchBytes.length));
+    hash.update(pathLength).update(pathBytes).update(contentLength).update(patchBytes);
+  }
+  return hash.digest('hex');
+}
+async function safeModeSelectFactoryBundles(cfg, pkg, packageText, identities) {
+  const nested = pkg.dsh?.profile && Object.hasOwn(pkg.dsh.profile, 'bundles');
+  const dotted = Object.hasOwn(pkg, 'dsh.profile.bundles');
+  const source = nested ? pkg.dsh.profile.bundles : dotted ? pkg['dsh.profile.bundles'] : undefined;
+  if (source === undefined) return { bytes: null, removed: [] };
+  if (!Array.isArray(source)) throw new Error('profile bundles must be an array');
+  if (source.length === 0) return { bytes: null, removed: [] };
+  if (!Array.isArray(identities)) throw new Error('factory bundle identities unavailable for active profile bundles');
+  const trusted = new Map(identities.map((entry) => [entry.name, entry]));
+  const kept = [], removed = [];
+  for (const name of source) {
+    if (typeof name !== 'string') { removed.push(String(name)); continue; }
+    const expected = trusted.get(name);
+    const candidate = expected ? await bundleCheck(cfg, name) : { ok: false };
+    let matches = false;
+    if (candidate.ok) {
+      const packageRoot = await fs.realpath(candidate.dir);
+      const packageMeta = await fs.lstat(join(packageRoot, 'package.json'));
+      if (!packageMeta.isFile() || packageMeta.isSymbolicLink()) throw new Error('bundle package manifest is not a regular file');
+      const packageInfo = JSON.parse(await fs.readFile(join(packageRoot, 'package.json'), 'utf8'));
+      if (packageInfo.name === name && packageInfo.version === expected.version) {
+        matches = await safeModeBundlePatchSha(packageRoot, packageInfo.dsh?.bundle?.patch) === expected.patchSha256;
+      }
+    }
+    if (matches) kept.push(name); else removed.push(name);
+  }
+  if (kept.length === source.length && kept.every((name, index) => name === source[index])) return { bytes: null, removed };
+  if (nested) pkg.dsh.profile.bundles = kept; else pkg['dsh.profile.bundles'] = kept;
+  return { bytes: Buffer.from(JSON.stringify(pkg, null, 2) + '\n', 'utf8'), removed };
+}
 async function safeModeSet(cfg, on, { atomicWrite = safeModeAtomicWrite } = {}) {
+  const selected = await safeModeResolveWebStore(cfg);
+  if (selected.error) return { ok: false, error: selected.error };
+  cfg = selected.cfg;
+  const stateFilePath = join(cfg.autoDir, 'safe-mode.json');
+  const legacyStatePath = join(cfg.autoDir, 'safe-mode-state.json');
+  try {
+    await fs.lstat(legacyStatePath);
+    const legacyInfo = await fs.lstat(legacyStatePath);
+    if (!legacyInfo.isFile() || legacyInfo.isSymbolicLink()) return { ok: false, error: 'Legacy Safe Mode marker is not a regular file; refusing to follow it.' };
+    try { await fs.lstat(stateFilePath); return { ok: false, error: 'Both current and legacy Safe Mode markers exist; refusing to guess the recovery authority.' }; }
+    catch (error) { if (error?.code !== 'ENOENT') throw error; }
+    const legacyBytes = await fs.readFile(legacyStatePath);
+    try { JSON.parse(legacyBytes.toString('utf8')); } catch { return { ok: false, error: 'Legacy Safe Mode marker is corrupt; refusing to treat it as inactive.' }; }
+    await atomicWrite(stateFilePath, legacyBytes);
+    await fs.rm(legacyStatePath);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') return { ok: false, error: `Legacy Safe Mode marker migration failed; recovery source was retained: ${String(error?.message ?? error)}` };
+  }
+  try {
+    await fs.lstat(stateFilePath);
+    const stateInfo = await fs.lstat(stateFilePath);
+    if (!stateInfo.isFile() || stateInfo.isSymbolicLink()) return { ok: false, error: 'Safe-mode state is not a regular file; refusing to follow or overwrite it.' };
+    const raw = await fs.readFile(stateFilePath, 'utf8');
+    try { JSON.parse(raw); } catch { return { ok: false, error: 'Safe-mode state is corrupt; refusing to treat it as inactive or overwrite its recovery sources.' }; }
+  } catch (error) {
+    if (error?.code !== 'ENOENT') return { ok: false, error: `Safe-mode state is unreadable; refusing to continue: ${String(error?.message ?? error)}` };
+  }
   if (hasOpenTurn()) return busyError();
   const st = await safeModeStatus(cfg);
+  if (st.active && st.profile && st.profile !== cfg.profileName) return { ok: false, error: `Safe-mode state belongs to profile ${st.profile}; refusing to use it as ${cfg.profileName}.` };
   const patch = filePath(cfg, { root: 'profile', rel: 'cordis.patch.yml' });
   const homePatch = filePath(cfg, { root: 'home', rel: 'cordis.patch.yml' });
   const pkgPath = filePath(cfg, { root: 'profile', rel: 'package.json' });
@@ -1152,6 +1304,10 @@ async function safeModeSet(cfg, on, { atomicWrite = safeModeAtomicWrite } = {}) 
       if (raw === null) return { ok: false, error: 'Safe-mode state is unreadable; refusing to overwrite recovery state.' };
       try { JSON.parse(raw); } catch { return { ok: false, error: 'Safe-mode state is corrupt; refusing to overwrite recovery state.' }; }
     }
+    const filesRoot = dirname(dirname(cfg.homeDir ?? DSH_HOME));
+    let hardManifest;
+    try { hardManifest = await safeModeOwnershipManifest(filesRoot); }
+    catch (error) { return { ok: false, error: `Trusted factory manifest unavailable; refusing Safe Mode: ${String(error?.message ?? error)}` }; }
     const snap = await createSnapshot(cfg, 'manual', 'safe-mode-before');
     const backup = join(cfg.autoDir, `safe-mode-backup-${snap.id}.yml`);
     const homeBackup = join(cfg.autoDir, `safe-mode-home-backup-${snap.id}.yml`);
@@ -1171,23 +1327,20 @@ async function safeModeSet(cfg, on, { atomicWrite = safeModeAtomicWrite } = {}) 
       const pkgRaw = pkgBytes.toString('utf8');
       try {
         const pkg = JSON.parse(pkgRaw);
-        const { pruned, kept } = await computeSafeBundles(cfg, pkg);
-        prunedBundles = pruned;
-        const orig = pkg.dsh?.profile?.bundles ?? [];
-        if (kept.join('\u0000') !== orig.join('\u0000')) {
-          pkg.dsh = pkg.dsh ?? {};
-          pkg.dsh.profile = pkg.dsh.profile ?? {};
-          pkg.dsh.profile.bundles = kept;
-          pkgSafeBytes = Buffer.from(JSON.stringify(pkg, null, 2) + '\n', 'utf8');
-        }
+        const selected = await safeModeSelectFactoryBundles(cfg, pkg, pkgRaw, hardManifest.factoryBundles);
+        prunedBundles = selected.removed.map((name) => ({ name, reason: 'not a verified factory bundle' }));
+        pkgSafeBytes = selected.bytes;
       } catch (error) {
-        return { ok: false, error: t('safe.err.corruptPkg', { msg: String(error?.message ?? error) }) };
+        return { ok: false, error: `Safe Mode bundle ownership is incomplete; no live files changed: ${String(error?.message ?? error)}` };
       }
     }
     try {
       await atomicWrite(backup, patchBytes);
       if (homeBytes) await atomicWrite(homeBackup, homeBytes);
       if (pkgBytes) await atomicWrite(pkgBackup, pkgBytes);
+      await safeModeEnsureRecovery(cfg, patchBytes, safeModeSha256(patchBytes), atomicWrite);
+      if (homeBytes) await safeModeEnsureRecovery(cfg, homeBytes, safeModeSha256(homeBytes), atomicWrite);
+      if (pkgBytes) await safeModeEnsureRecovery(cfg, pkgBytes, safeModeSha256(pkgBytes), atomicWrite);
       if (!(await safeModeVerifyBackup(backup, safeModeSha256(patchBytes))) ||
         (homeBytes && !(await safeModeVerifyBackup(homeBackup, safeModeSha256(homeBytes)))) ||
         (pkgBytes && !(await safeModeVerifyBackup(pkgBackup, safeModeSha256(pkgBytes))))) {
@@ -1197,13 +1350,12 @@ async function safeModeSet(cfg, on, { atomicWrite = safeModeAtomicWrite } = {}) 
       return { ok: false, error: t('safe.err.backupWrite', { backup }) + ` (${String(error?.message ?? error)})` };
     }
     // dsh-mobile safe mode transaction (S2): require final-snapshot ownership identities.
-    const filesRoot = dirname(dirname(DSH_HOME));
-    const hardManifest = await safeModeOwnershipManifest(filesRoot);
     const minimal = safeModeFilterInserts(patchBytes.toString('utf8'), hardManifest.entries);
     const state = {
-      active: true, enteredAt: new Date().toISOString(), backup, snapshotId: snap.id,
+      active: true, profile: cfg.profileName, enteredAt: new Date().toISOString(), backup, snapshotId: snap.id,
       backupSha256: safeModeSha256(patchBytes),
       homeBackup: homePatchExists ? homeBackup : undefined,
+      homeExisted: homePatchExists,
       homeBackupSha256: homeBytes ? safeModeSha256(homeBytes) : undefined,
       homeFingerprint: await homeFingerprint(cfg),
     };
@@ -1241,22 +1393,25 @@ async function safeModeSet(cfg, on, { atomicWrite = safeModeAtomicWrite } = {}) 
       ? { ok: true, active: false, message: t('safe.stale') }
       : { ok: true, active: false, message: t('safe.notActive') };
   }
+  if (st.profile && st.profile !== cfg.profileName) return { ok: false, error: `Safe-mode state belongs to profile ${st.profile}; refusing to restore it as ${cfg.profileName}.` };
   const backup = await safeModeBackupPath(cfg, st.backup, st.snapshotId, 'safe-mode-backup-');
   const homeBackup = st.homeBackup
     ? await safeModeBackupPath(cfg, st.homeBackup, st.snapshotId, 'safe-mode-home-backup-') : null;
   const pkgBackup = st.pkgBackup
     ? await safeModeBackupPath(cfg, st.pkgBackup, st.snapshotId, 'safe-mode-pkg-', '.json') : null;
-  if (!st.active || !await safeModeVerifyBackup(backup, st.backupSha256)) {
+  const patchBytes = await safeModeLoadBackup(cfg, backup, st.backupSha256);
+  const homeBytes = homeBackup ? await safeModeLoadBackup(cfg, homeBackup, st.homeBackupSha256) : null;
+  const pkgBytes = pkgBackup ? await safeModeLoadBackup(cfg, pkgBackup, st.pkgBackupSha256) : null;
+  if (!st.active || !patchBytes) {
     return { ok: false, error: 'Safe-mode backup missing. Restore a snapshot from before the crash first (undo_list / undo_restore).' };
   }
-  if ((st.homeBackup && !await safeModeVerifyBackup(homeBackup, st.homeBackupSha256)) ||
-    (st.pkgBackup && !await safeModeVerifyBackup(pkgBackup, st.pkgBackupSha256))) {
+  if ((st.homeBackup && !homeBytes) || (st.pkgBackup && !pkgBytes)) {
     return { ok: false, error: 'Safe-mode home backup missing. Restore a snapshot from before the crash first (undo_list / undo_restore).' };
   }
   try {
-    await atomicWrite(patch, await fs.readFile(backup));
-    if (homeBackup) await atomicWrite(homePatch, await fs.readFile(homeBackup));
-    if (pkgBackup) await atomicWrite(pkgPath, await fs.readFile(pkgBackup));
+    await atomicWrite(patch, patchBytes);
+    if (homeBackup) await atomicWrite(homePatch, homeBytes);
+    if (pkgBackup) await atomicWrite(pkgPath, pkgBytes);
     await fs.rm(join(cfg.autoDir, 'safe-mode.json'), { force: true });
   } catch (error) {
     return { ok: false, error: `Safe-mode restore incomplete; state and backups were retained for retry: ${String(error?.message ?? error)}` };

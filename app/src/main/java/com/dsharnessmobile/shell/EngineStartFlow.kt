@@ -358,7 +358,6 @@ internal class EngineStartFlow(private val activity: MainActivity) {
     try {
       val engine = activity.engineManager
       val patch = PluginMounts.patchFile(engine)
-      val patchText = try { patch.readText() } catch (_: Throwable) { "" }
       val ids = LogCollector.clientFailedIdsOf(clientPluginFailureRawLine)
       // 纯判据（见 [clientPluginFailureRoute]）：唯一命中才外科拔除；点名不出但清单未变才允许
       // 整份回滚；两者都不成立就**不动作**（宁可不动，也不做一次会吞掉用户插件的写回）。
@@ -369,16 +368,15 @@ internal class EngineStartFlow(private val activity: MainActivity) {
         activity.runOnUiThread { activity.presentClientPluginFailure() }
         return
       }
-      val candidate = PluginMounts.clientPullCandidate(patchText, ids, hardManifest)
+      val candidate = PluginMounts.clientPullCandidate(activity, patch, ids, hardManifest)
       val route = clientPluginFailureRoute(candidate, PluginMounts.mountUnchangedSinceHealthy(activity, patch))
       if (route == ClientPluginFailureRoute.NO_ACTION) {
         LogCollector.writeBootFail(
           activity, "client-plugin-tree-failed-no-action",
           // 措辞必须**如实指向真因**（Lead 设备取证 DEVICE-FINDING-1）：这一支的触发条件是
-          // 「clientPullCandidate 返回 null 且清单自健康起已变」。而真机上后者恰恰不成立——
-          // 真实原因是页面点名的 entry 名（对注入集成员而言 = 包名）在装配清单条目里找不到对应项。
-          // 旧措辞写成「且挂载清单已变化」，差一点把真因掩盖过去（Lead 正是靠它反查到匹配面错位）。
-          "点名不出唯一可拔条目（页面点名的 entry 名在装配清单里没有对应条目，或命中多条无法唯一归属），" +
+          // 「clientPullCandidate 返回 null 且有效 composition 自健康起已变」。
+          // Profile cordis 与已解析 bundle insert layers 都参与点名；身份不唯一、factory来源不明或命中Hard时拒绝修改。
+          "点名不出唯一可拔 Soft 条目（profile/bundle composition 中无对应 insert、命中多条、factory 身份不明或命中 Hard），" +
             "不自动回滚（避免连坐用户其它插件），停在可读错误页",
         )
         activity.runOnUiThread { activity.presentClientPluginFailure() }

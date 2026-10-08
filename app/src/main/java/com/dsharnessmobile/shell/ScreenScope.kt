@@ -21,6 +21,10 @@ enum class ScreenScope(val wire: String) {
     ALL -> screenId == ScreenTargets.REAL || ScreenTargets.isVirtual(screenId)
   }
 
+  /** Stable execution-point denial for virtual-display input. */
+  fun inputDenial(screenId: String): String? =
+    if (allows(screenId)) null else "screen-out-of-scope"
+
   companion object {
     fun fromWire(value: String?): ScreenScope = entries.firstOrNull { it.wire == value } ?: VIRTUAL_ONLY
   }

@@ -136,6 +136,36 @@ class ShellOpsScreenCommandFixtureTest {
   }
 
   @Test
+  fun realOnlyShellGateAllowsOnlyPhysicalScreenTargetsAndPreservesNonScreenCommands() {
+    val denied = listOf(
+      "input -d 47 tap 10 20",
+      "screencap --display=47 -p /sdcard/a.png",
+      "sh -c \"screencap -d 0 -p; input -d 47 tap 10 20\"",
+      "toybox sh -c \"input --display 999 tap 1 2\"",
+      "screencap --display-id 999 -p /sdcard/a.png",
+      "uiautomator dump /sdcard/tree.xml --display 2",
+      "echo ok; input -d 0 tap 1 2; screencap -d 7 -p /sdcard/a.png",
+      "sh -c \"input -d 999 tap 1 2",
+    )
+    for (command in denied) {
+      assertFalse("real-only 必须拒绝虚拟/未知目标：$command", ShellOps.realOnlyScreenCommandAllowed(command))
+    }
+    val allowed = listOf(
+      "input tap 10 20",
+      "input -d 0 tap 10 20",
+      "input tap 10 20 --display=0",
+      "screencap -p -d 0 /sdcard/a.png",
+      "dumpsys window",
+      "am start -d https://example.test -n com.example/.Main",
+      "getprop ro.product.model",
+      "curl -d value https://example.test",
+    )
+    for (command in allowed) {
+      assertTrue("real-only 必须保留物理屏/非屏幕命令：$command", ShellOps.realOnlyScreenCommandAllowed(command))
+    }
+  }
+
+  @Test
   fun displayOptionWhitespaceClassIsAsciiOnlyLikeTheEngineSide() {
     // N-5：两侧都用显式 ASCII 空白类。全角空格不是 shell 分隔符（整串是 argv[0]，不会被执行），
     // 若把它当分隔符，判定看到的命令与 shell 执行的就不是同一条。

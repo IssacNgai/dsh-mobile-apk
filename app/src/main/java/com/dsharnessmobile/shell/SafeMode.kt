@@ -2,8 +2,11 @@ package com.dsharnessmobile.shell
 
 import android.content.Context
 import java.io.File
+import java.io.ByteArrayOutputStream
+import java.io.DataOutputStream
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.nio.file.LinkOption
 import java.security.MessageDigest
 
 /**
@@ -28,7 +31,8 @@ import java.security.MessageDigest
  * 状态却不存在 ⇒ 之后 `off` 认为「未开启」而拒绝还原，用户的插件**永久消失**。
  * 本实现把状态文件写在**改 patch 之前**（先落「pending 但备份已就位」的事实，再动 patch），
  * 于是任何时刻崩溃，`off` 都能拿备份整份还原。
- * 备份不成功就**绝不进入**；退出前校验全部备份在位才动任何文件；还原一律整份 copyFile。
+ * 备份准备或校验失败时不写 live 配置；状态 marker 成功落盘后，live 写入失败可能留下部分更新，
+ * 但 marker 与全部恢复来源会保留，`off` 可重试整份恢复。退出前先校验所有来源，再动任何 live 文件。
  */
 internal object SafeMode {
 
@@ -36,31 +40,15 @@ internal object SafeMode {
   const val STATE_FILE = "safe-mode.json"
 
   /**
-  * Legacy source-contract placeholders. Production ownership never uses these values; it comes from
-  * the fingerprint-bound `HardManifest` passed to the transaction.
-   */
-  internal val SHIPPED_NAMES = emptyList<String>()
-  internal val SHIPPED_PREFIXES = emptyList<String>()
-
-  /** Package names alone never prove that an entry belongs to this product. */
-  internal fun isShippedPackage(name: String): Boolean {
-    val v = name.trim().trim('\'', '"')
-    if (v.isEmpty()) return false
-    return false
-  }
-
-  /**
    * Ownership is established only by the exact `{id,name}` manifest packaged for this snapshot.
    *
-   * 0.14.5（D-1(c)，与 G3 同源缺陷第二次出现）：原先只用 `SHIPPED_PREFIXES` 的 `@deepseek-ai/`
-   * 前缀判归属。**包名前缀只说明谁发布的，不说明谁装配的**——用户完全可以自己挂一个官方包
-   * （实测 `@deepseek-ai/dsh-mcp-client`）。按前缀判会把**用户的合法扩展**当成产品自有条目**保留**，
-   * 于是 Safe Mode 的「不加载 Soft」目标对它失效。
+   * 0.14.5（D-1(c)）：包名前缀只说明谁发布的，不说明谁装配的——用户完全可以自己挂一个官方包。
+   * ownership 只能来自当前 fingerprint 绑定的 Hard manifest 中 exact `{id,name}` 条目。
    *
    * Missing or invalid manifests are rejected before mutation. Names and publisher namespaces
    * are not ownership evidence.
    */
-  internal fun isProductOwned(name: String, hardNames: Set<String>, hardEntries: Set<PluginMounts.HardEntry>? = null, id: String? = null): Boolean {
+  internal fun isProductOwned(name: String, hardEntries: Set<PluginMounts.HardEntry>, id: String?): Boolean {
     val v = name.trim().trim('\'', '"')
     if (v.isEmpty()) return false
     if (hardEntries == null || id.isNullOrEmpty()) return false
@@ -83,7 +71,7 @@ internal object SafeMode {
    * @param patchText 装配清单全文。
    * @returns 过滤后全文；无改动时与输入**逐字节相同**（调用方据此跳过写盘）。
    */
-  internal fun filterThirdPartyInserts(patchText: String, hardNames: Set<String> = emptySet(), hardEntries: Set<PluginMounts.HardEntry>? = null): String {
+  internal fun filterThirdPartyInserts(patchText: String, hardEntries: Set<PluginMounts.HardEntry> = emptySet()): String {
     val lines = patchText.split("\n").toMutableList()
     val out = ArrayList<String>(lines.size)
     var i = 0
@@ -102,7 +90,7 @@ internal object SafeMode {
       for (item in insertChildChunks(body, itemIndent)) {
         val name = itemName(item.lines)
         val id = itemId(item.lines)
-        if (name != null && !isProductOwned(name, hardNames, hardEntries, id)) continue // 第三方条目：整条摘掉
+        if (name != null && !isProductOwned(name, hardEntries, id)) continue // 第三方条目：整条摘掉
         kept.addAll(item.lines)
       }
       if (kept.none { ITEM.containsMatchIn(it) }) {
@@ -140,30 +128,62 @@ internal object SafeMode {
     }
   }
 
-  private fun backupFor(autoDir: File, path: String, snapshotId: String, prefix: String): File? {
+  private fun backupFor(autoDir: File, path: String, snapshotId: String, prefix: String, suffix: String = ".yml"): File? {
     if (path.isBlank()) return null
     return runCatching {
       val root = autoDir.canonicalFile.toPath()
       val candidate = File(path).canonicalFile.toPath()
-      if (candidate.parent != root || candidate.fileName.toString() != "$prefix$snapshotId.yml") null
+      if (candidate.parent != root || candidate.fileName.toString() != "$prefix$snapshotId$suffix") null
       else candidate.toFile()
     }.getOrNull()
   }
 
-  private fun verifyBackup(file: File, expectedSha: String?): Boolean = runCatching {
-    if (!file.isFile || !file.canRead()) return false
-    expectedSha.isNullOrBlank() || sha256(file.readBytes()).equals(expectedSha, ignoreCase = true)
-  }.getOrDefault(false)
+  /** Recovery copies live beside (not inside) the routinely pruned auto-snapshot directory. */
+  private fun recoveryDir(autoDir: File): File = File(autoDir.absoluteFile.parentFile, "safe-mode-recovery")
+
+  private fun recoveryCopy(autoDir: File, sha: String): File? {
+    if (!sha.matches(Regex("[0-9a-f]{64}"))) return null
+    val dir = recoveryDir(autoDir)
+    return runCatching {
+      val expectedRoot = File(autoDir.absoluteFile.parentFile.canonicalFile, "safe-mode-recovery").toPath()
+      val root = dir.canonicalFile.toPath()
+      val uncanonicalCandidate = File(dir, "safe-mode-$sha.yml")
+      if (root != expectedRoot || Files.isSymbolicLink(uncanonicalCandidate.toPath())) return null
+      val candidate = uncanonicalCandidate.canonicalFile.toPath()
+      if (candidate.parent == expectedRoot) candidate.toFile() else null
+    }.getOrNull()
+  }
+
+  private fun ensureRecoveryCopy(autoDir: File, bytes: ByteArray, sha: String, atomicWrite: (File, ByteArray) -> Unit): File {
+    val copy = recoveryCopy(autoDir, sha) ?: error("invalid recovery digest")
+    val alreadyValid = runCatching { copy.isFile && sha256(copy.readBytes()) == sha }.getOrDefault(false)
+    if (!alreadyValid) atomicWrite(copy, bytes)
+    check(copy.isFile && copy.readBytes().contentEquals(bytes)) { "recovery copy verification failed" }
+    return copy
+  }
+
+  /** Read once, verify the exact bytes that will later be written; never verify then reopen. */
+  private fun loadBackup(primary: File, autoDir: File, expectedSha: String?): ByteArray? {
+    val primaryBytes = runCatching { if (primary.isFile && primary.canRead()) primary.readBytes() else null }.getOrNull()
+    if (primaryBytes != null && (expectedSha.isNullOrBlank() || sha256(primaryBytes).equals(expectedSha, ignoreCase = true))) {
+      return primaryBytes
+    }
+    // Old markers have no digest. They retain the legacy primary-only contract and cannot safely
+    // authorize an arbitrary recovery object.
+    if (expectedSha.isNullOrBlank()) return null
+    val copy = recoveryCopy(autoDir, expectedSha) ?: return null
+    val copyBytes = runCatching { if (copy.isFile && copy.canRead()) copy.readBytes() else null }.getOrNull() ?: return null
+    return copyBytes.takeIf { sha256(it) == expectedSha }
+  }
 
   /**
    * 进入安全模式：备份成功后**先写状态文件**，再改 patch（修既有崩溃窗口）。
    *
    * 顺序是本方法唯一的承重设计，不得调换：
-   *   ① 建 autoDir；② 整份备份 patch（不存在则备份 `[]`）与 home patch（存在才备份）；
-   *   ③ **校验备份真的可读且逐字节等于原文件**；④ 写状态文件（此刻起 off 一定能把东西还原回去）；
-   *   ⑤ 最后才写过滤后的 patch。
+   *   ① 建 autoDir 与独立恢复目录；② 整份备份 patch（不存在则备份 `[]`）与 home patch（存在才备份）；
+   *   ③ 主备份与内容寻址恢复副本都逐字节核验；④ 写绑定 SHA-256 的状态文件；⑤ 最后才写过滤后的 live 文件。
    * 旧实现在 ③ 与 ⑤ 之间崩溃 → patch 已被最小化而状态不存在 → `off` 判「未开启」→ 用户插件永久消失。
-   * 本方法任何一步失败都**不写状态文件、不改 patch**，并如实回执。
+   * 状态落盘前失败不改 live patch；状态落盘后 live 写失败时保留 marker 与所有恢复来源，供 off 重试。
    *
    * @param patch live 装配清单（`profiles/web/cordis.patch.yml`）。
    * @param homePatch home 级清单（设备上通常不存在——该分支为空操作，但必须保留：
@@ -171,24 +191,36 @@ internal object SafeMode {
    * @param autoDir 快照/急救共用目录（`<home>/.dsh/undo-snapshots/auto`，平铺）。
    * @param id 本次入档 id（生产传时间戳；测试传固定值以便逐字节比对）。
    */
+  @Synchronized
   internal fun enter(
     patch: File,
     homePatch: File,
     autoDir: File,
     id: String,
     atomicWrite: (File, ByteArray) -> Unit = ::replaceAtomically,
-    // 权威装配清单（[PluginMounts.hardNames]）。缺席时拒绝开启，避免把无法识别归属的 Hard 当 Soft。
-    hardNames: Set<String> = emptySet(),
+    // 权威装配清单（[PluginMounts.HardManifest.entries]）。缺席时拒绝开启，避免误摘 Hard。
     hardManifestAvailable: Boolean = true,
     hardEntries: Set<PluginMounts.HardEntry>? = null,
+    factoryBundles: Set<PluginMounts.FactoryBundle>? = null,
   ): Result {
+    val store = resolveSafeModeAutoDir(patch, homePatch, autoDir)
+    if (store.second != null) return Result(false, store.second!!)
+    val selectedAutoDir = store.first
+    migrateLegacyState(selectedAutoDir, atomicWrite)?.let { return Result(false, it) }
     if (!hardManifestAvailable || hardEntries.isNullOrEmpty()) {
       return Result(false, "安全模式未生效：本版本插件归属清单缺失，无法安全区分产品插件与用户插件；原配置未改动。请先修复/重建插件清单后重试。")
     }
-    val stateFile = File(autoDir, STATE_FILE)
+    if (!id.matches(Regex("[A-Za-z0-9._-]{1,80}"))) return Result(false, "安全模式档案 id 不合法，已拒绝进入。")
+    val stateFile = File(selectedAutoDir, STATE_FILE)
+    if (Files.exists(stateFile.toPath(), LinkOption.NOFOLLOW_LINKS) && !Files.isRegularFile(stateFile.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+      return Result(false, "安全模式状态不是普通文件，已拒绝读取或覆盖。")
+    }
     if (stateFile.isFile) {
       try {
         val existing = org.json.JSONObject(stateFile.readText())
+        if (existing.has("profile") && existing.optString("profile") != "web") {
+          return Result(false, "安全模式状态绑定到 profile ${existing.optString("profile")}，拒绝按 web 状态处理。")
+        }
         if (existing.optBoolean("active", false)) {
           return Result(true, "安全模式已开启；保留现有恢复档，未重复改写。", existing.optString("snapshotId", ""))
         }
@@ -196,10 +228,26 @@ internal object SafeMode {
         return Result(false, "安全模式状态文件损坏（" + t.javaClass.simpleName + "），已拒绝覆盖；请先恢复状态文件。")
       }
     }
-    if (!autoDir.exists() && !autoDir.mkdirs()) return Result(false, "无法创建安全模式目录：" + autoDir.absolutePath)
-    val backup = File(autoDir, "safe-mode-backup-$id.yml")
-    val homeBackup = File(autoDir, "safe-mode-home-backup-$id.yml")
+    if (!selectedAutoDir.exists() && !selectedAutoDir.mkdirs()) return Result(false, "无法创建安全模式目录：" + selectedAutoDir.absolutePath)
+    val backup = File(selectedAutoDir, "safe-mode-backup-$id.yml")
+    val homeBackup = File(selectedAutoDir, "safe-mode-home-backup-$id.yml")
+    val packageFile = File(patch.parentFile, "package.json")
+    val packageExists = Files.exists(packageFile.toPath(), LinkOption.NOFOLLOW_LINKS)
+    if (packageExists && !Files.isRegularFile(packageFile.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+      return Result(false, "profile package.json 不是普通文件，已拒绝安全模式；live 文件未修改。")
+    }
+    val packageBytes = if (packageExists) runCatching { packageFile.readBytes() }.getOrElse {
+      return Result(false, "无法读取 profile package.json，已拒绝安全模式；live 文件未修改。")
+    } else null
+    val packageSelection = try {
+      if (packageBytes != null) selectFactoryBundles(packageBytes, packageFile, factoryBundles) else null
+    } catch (t: Throwable) {
+      return Result(false, "安全模式未生效：工厂 bundle 身份无法验证（${t.message ?: t.javaClass.simpleName}）；live 文件未修改。")
+    }
+    val recoveryDir = recoveryDir(selectedAutoDir)
+    if (!recoveryDir.exists() && !recoveryDir.mkdirs()) return Result(false, "无法创建安全模式独立恢复目录：" + recoveryDir.absolutePath)
     val homeExisted = homePatch.isFile
+    var homeSha = ""
     return try {
       val original = if (patch.isFile) patch.readBytes() else "[]\n".toByteArray()
       atomicWrite(backup, original)
@@ -207,33 +255,49 @@ internal object SafeMode {
       if (!backup.isFile || !backup.readBytes().contentEquals(original)) {
         return Result(false, "安全模式备份校验失败（备份与原文不一致），已放弃进入——未改动任何文件")
       }
+      val originalSha = sha256(original)
+      ensureRecoveryCopy(selectedAutoDir, original, originalSha, atomicWrite)
       if (homeExisted) {
         val homeBytes = homePatch.readBytes()
         atomicWrite(homeBackup, homeBytes)
         if (!homeBackup.readBytes().contentEquals(homeBytes)) {
           return Result(false, "安全模式 home 级备份校验失败，已放弃进入——未改动任何文件")
         }
+        homeSha = sha256(homeBytes)
+        ensureRecoveryCopy(selectedAutoDir, homeBytes, homeSha, atomicWrite)
+      }
+      if (packageBytes != null) {
+        val packageBackup = File(selectedAutoDir, "safe-mode-pkg-$id.json")
+        atomicWrite(packageBackup, packageBytes)
+        if (!packageBackup.isFile || !packageBackup.readBytes().contentEquals(packageBytes)) {
+          return Result(false, "安全模式 package.json 备份校验失败，已拒绝进入；live 文件未修改。")
+        }
+        ensureRecoveryCopy(selectedAutoDir, packageBytes, sha256(packageBytes), atomicWrite)
       }
       // ④ 先落状态：此后无论何时崩溃，off 都能凭备份整份还原。
       atomicWrite(stateFile, (
         org.json.JSONObject()
           .put("active", true)
+          .put("profile", "web")
           .put("enteredAt", java.time.Instant.now().toString())
           .put("by", "shell-guide-button")
           .put("backup", backup.absolutePath)
-          .put("backupSha256", sha256(original))
+          .put("backupSha256", originalSha)
           .put("homeBackup", homeBackup.absolutePath)
-          .put("homeBackupSha256", if (homeExisted) sha256(homePatch.readBytes()) else "")
+          .put("homeBackupSha256", homeSha)
           .put("homeExisted", homeExisted)
+          .put("pkgBackup", if (packageBytes != null) File(selectedAutoDir, "safe-mode-pkg-$id.json").absolutePath else "")
+          .put("pkgBackupSha256", if (packageBytes != null) sha256(packageBytes) else "")
           .put("snapshotId", id)
           .toString(2)
       ).toByteArray(Charsets.UTF_8))
       // ⑤ 最后改 patch。
-      val filtered = filterThirdPartyInserts(String(original, Charsets.UTF_8), hardNames, hardEntries)
+      val filtered = filterThirdPartyInserts(String(original, Charsets.UTF_8), hardEntries.orEmpty())
       patch.parentFile?.mkdirs()
       atomicWrite(patch, filtered.toByteArray(Charsets.UTF_8))
       if (homeExisted) atomicWrite(homePatch, "# dsh safe mode (home level)\n[]\n".toByteArray(Charsets.UTF_8))
-      val removed = removedPluginNames(String(original, Charsets.UTF_8), hardNames, hardEntries)
+      if (packageSelection?.bytes != null) atomicWrite(packageFile, packageSelection.bytes)
+      val removed = removedPluginNames(String(original, Charsets.UTF_8), hardEntries.orEmpty())
       Result(
         true,
         if (removed.isEmpty())
@@ -248,41 +312,60 @@ internal object SafeMode {
   }
 
   /**
-   * 退出安全模式：**先校验全部备份在位**，再整份 copyFile 还原（唯一防线）。
+   * 退出安全模式：先把所有 live patch 的完整还原字节载入内存并校验，再开始任何 live 写入。
    *
-   * 任一备份缺失/不可读 ⇒ 拒绝退出且**不动任何文件**（宁可停在安全模式，也不做一次
-   * 「patch 已写、备份没了」的半还原——那正是用户插件永久消失的形态）。
+   * 主备份损坏时允许使用 sibling recovery 副本；两份都无效 ⇒ 拒绝退出且不动任何 live 文件。
    */
+  @Synchronized
   internal fun exit(
     patch: File,
     homePatch: File,
     autoDir: File,
     atomicWrite: (File, ByteArray) -> Unit = ::replaceAtomically,
   ): Result {
-    val stateFile = File(autoDir, STATE_FILE)
+    val store = resolveSafeModeAutoDir(patch, homePatch, autoDir)
+    if (store.second != null) return Result(false, store.second!!)
+    val selectedAutoDir = store.first
+    migrateLegacyState(selectedAutoDir, atomicWrite)?.let { return Result(false, it) }
+    val stateFile = File(selectedAutoDir, STATE_FILE)
+    if (Files.exists(stateFile.toPath(), LinkOption.NOFOLLOW_LINKS) && !Files.isRegularFile(stateFile.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+      return Result(false, "安全模式状态不是普通文件，已拒绝读取或覆盖。")
+    }
     if (!stateFile.isFile) return Result(false, "安全模式未开启（没有状态文件），无需退出")
     val st = try { org.json.JSONObject(stateFile.readText()) } catch (t: Throwable) {
-      return Result(false, "安全模式状态文件损坏（" + t.javaClass.simpleName + "），已拒绝退出以免误改文件；备份仍在 " + autoDir.absolutePath)
+      return Result(false, "安全模式状态文件损坏（" + t.javaClass.simpleName + "），已拒绝退出以免误改文件；备份仍在 " + selectedAutoDir.absolutePath)
     }
     if (!st.optBoolean("active", false)) return Result(false, "安全模式状态未标记为开启，已拒绝退出")
+    if (st.has("profile") && st.optString("profile") != "web") return Result(false, "安全模式状态绑定到 profile ${st.optString("profile")}，拒绝从 web profile 写回。")
     val backupPath = st.optString("backup", "")
     if (backupPath.isEmpty()) return Result(false, "状态文件缺少 backup 字段，已拒绝退出")
     val snapshotId = st.optString("snapshotId", "")
-    val backup = backupFor(autoDir, backupPath, snapshotId, "safe-mode-backup-")
+    val backup = backupFor(selectedAutoDir, backupPath, snapshotId, "safe-mode-backup-")
       ?: return Result(false, "安全模式备份路径不符合状态文件约定，已拒绝退出")
-    val homeExisted = st.optBoolean("homeExisted", false)
-    val homeBackup = if (homeExisted) backupFor(autoDir, st.optString("homeBackup", ""), snapshotId, "safe-mode-home-backup-")
+    val homeExisted = if (st.has("homeExisted")) st.optBoolean("homeExisted", false) else st.optString("homeBackup", "").isNotBlank()
+    val homeBackup = if (homeExisted) backupFor(selectedAutoDir, st.optString("homeBackup", ""), snapshotId, "safe-mode-home-backup-")
       ?: return Result(false, "安全模式 home 级备份路径不符合状态文件约定，已拒绝退出") else null
-    if (!verifyBackup(backup, st.optString("backupSha256", ""))) {
+    val backupSha = st.optString("backupSha256", "")
+    val patchBytes = loadBackup(backup, selectedAutoDir, backupSha)
+    if (patchBytes == null) {
       return Result(false, "安全模式备份缺失（" + backup.absolutePath + "），已拒绝退出：现在退出会让 patch 停在安全模式内容且无从还原。备份找回后再试。")
     }
-    if (homeBackup != null && !verifyBackup(homeBackup, st.optString("homeBackupSha256", ""))) {
+    val homeBackupSha = st.optString("homeBackupSha256", "")
+    val homeBytes = if (homeBackup != null) loadBackup(homeBackup, selectedAutoDir, homeBackupSha) else null
+    if (homeBackup != null && homeBytes == null) {
       return Result(false, "安全模式 home 级备份缺失（" + homeBackup.absolutePath + "），已拒绝退出（不动任何文件）")
     }
+    val pkgBackupPath = st.optString("pkgBackup", "")
+    val pkgBackup = if (pkgBackupPath.isNotBlank()) backupFor(selectedAutoDir, pkgBackupPath, snapshotId, "safe-mode-pkg-", ".json")
+      ?: return Result(false, "安全模式 package.json 备份路径不符合状态文件约定，已拒绝退出") else null
+    val pkgBytes = if (pkgBackup != null) loadBackup(pkgBackup, selectedAutoDir, st.optString("pkgBackupSha256", "")) else null
+    if (pkgBackup != null && pkgBytes == null) return Result(false, "安全模式 package.json 主备份与恢复副本均无效，拒绝退出（live 文件未修改）")
+    val packageFile = if (pkgBackup != null) File(patch.parentFile, "package.json") else null
     return try {
       // 整份还原 —— 不用「合并/只删我们加的」，因为任何增量还原都可能留下半态。
-      atomicWrite(patch, backup.readBytes())
-      if (homeBackup != null) atomicWrite(homePatch, homeBackup.readBytes())
+      atomicWrite(patch, patchBytes)
+      if (homeBackup != null) atomicWrite(homePatch, homeBytes!!)
+      if (packageFile != null) atomicWrite(packageFile, pkgBytes!!)
       if (stateFile.exists() && !stateFile.delete()) error("无法清除安全模式状态文件")
       Result(true, "已退出安全模式：装配清单已整份还原到进入前的状态，重启应用生效。")
     } catch (t: Throwable) {
@@ -291,8 +374,17 @@ internal object SafeMode {
   }
 
   /** 当前状态。未开启与「状态文件损坏」是两件事，回执必须分开（否则用户以为没开）。 */
-  internal fun status(autoDir: File): Result {
-    val stateFile = File(autoDir, STATE_FILE)
+  internal fun status(autoDir: File, patch: File? = null, homePatch: File? = null): Result {
+    val selectedAutoDir = if (patch != null && homePatch != null) {
+      val store = resolveSafeModeAutoDir(patch, homePatch, autoDir)
+      if (store.second != null) return Result(false, store.second!!)
+      store.first
+    } else autoDir
+    migrateLegacyState(selectedAutoDir, ::replaceAtomically)?.let { return Result(false, it) }
+    val stateFile = File(selectedAutoDir, STATE_FILE)
+    if (Files.exists(stateFile.toPath(), LinkOption.NOFOLLOW_LINKS) && !Files.isRegularFile(stateFile.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+      return Result(false, "安全模式状态不是普通文件，已拒绝读取。")
+    }
     if (!stateFile.isFile) return Result(true, "安全模式：未开启")
     return try {
       val st = org.json.JSONObject(stateFile.readText())
@@ -301,6 +393,143 @@ internal object SafeMode {
       Result(true, "安全模式：开启中（进入于 " + at + "，档 " + id + "）")
     } catch (t: Throwable) {
       Result(true, "安全模式：状态文件存在但无法解析（" + t.javaClass.simpleName + "）——请查看 " + stateFile.absolutePath)
+    }
+  }
+
+  private data class BundleSelection(val bytes: ByteArray?, val removed: List<String>)
+
+  /** Bundle composition is an independent loader path: only exact version + patch-byte factory tuples survive. */
+  private fun selectFactoryBundles(
+    packageBytes: ByteArray,
+    packageFile: File,
+    factoryBundles: Set<PluginMounts.FactoryBundle>?,
+  ): BundleSelection {
+    val pkg = org.json.JSONObject(String(packageBytes, Charsets.UTF_8))
+    val dotted = pkg.optJSONArray("dsh.profile.bundles")
+    val nested = pkg.optJSONObject("dsh")?.optJSONObject("profile")?.optJSONArray("bundles")
+    // rc2 app-boot reads packageInfo.dsh.profile.bundles; when both forms are present the nested
+    // runtime field is authoritative, matching the CLI/vendor implementations.
+    val bundles = nested ?: dotted ?: return BundleSelection(null, emptyList())
+    if (bundles.length() == 0) return BundleSelection(null, emptyList())
+    if (factoryBundles == null) error("当前权威 HardManifest 缺少 factoryBundles")
+    val trusted = factoryBundles.associateBy { it.name }
+    val kept = org.json.JSONArray()
+    val removed = ArrayList<String>()
+    for (index in 0 until bundles.length()) {
+      val name = bundles.opt(index) as? String
+      val expected = name?.let(trusted::get)
+      val matches = name != null && expected != null && bundleMatchesFactory(packageFile, name, expected)
+      if (matches) kept.put(name) else removed += (name ?: bundles.opt(index).toString())
+    }
+    if (removed.isEmpty()) return BundleSelection(null, emptyList())
+    if (nested == null) pkg.put("dsh.profile.bundles", kept)
+    else {
+      val dsh = pkg.optJSONObject("dsh") ?: org.json.JSONObject().also { pkg.put("dsh", it) }
+      val profile = dsh.optJSONObject("profile") ?: org.json.JSONObject().also { dsh.put("profile", it) }
+      profile.put("bundles", kept)
+    }
+    return BundleSelection((pkg.toString(2) + "\n").toByteArray(Charsets.UTF_8), removed)
+  }
+
+  private fun bundleMatchesFactory(
+    packageFile: File,
+    name: String,
+    expected: PluginMounts.FactoryBundle,
+  ): Boolean {
+    val profileRoot = packageFile.parentFile ?: return false
+    val dsh = profileRoot.parentFile?.parentFile ?: return false
+    val filesDir = dsh.parentFile?.parentFile ?: return false
+    val candidates = listOf(
+      File(profileRoot, "node_modules/$name"),
+      File(dsh, "node_modules/$name"),
+      File(filesDir, "usr/lib/node_modules/@deepseek-ai/dsh/node_modules/$name"),
+      File(filesDir, "usr/lib/node_modules/$name"),
+    )
+    for (candidate in candidates) {
+      val packagePath = File(candidate, "package.json")
+      if (!packagePath.exists()) continue
+      val canonicalRoot = try { candidate.canonicalFile } catch (_: Throwable) { return false }
+      if (!Files.isRegularFile(File(canonicalRoot, "package.json").toPath(), LinkOption.NOFOLLOW_LINKS)) return false
+      val manifest = try { org.json.JSONObject(File(canonicalRoot, "package.json").readText()) } catch (_: Throwable) { return false }
+      if (manifest.optString("name") != name || manifest.optString("version") != expected.version) return false
+      val declaration = manifest.optJSONObject("dsh")?.optJSONObject("bundle")?.opt("patch")
+      val paths = when (declaration) {
+        is String -> listOf(declaration)
+        is org.json.JSONArray -> (0 until declaration.length()).map { declaration.opt(it) as? String ?: return false }
+        else -> return false
+      }
+      if (paths.isEmpty()) return false
+      val rootPath = canonicalRoot.toPath()
+      val digest = MessageDigest.getInstance("SHA-256")
+      digest.update("DSHBNDL1".toByteArray(Charsets.US_ASCII))
+      for (relative in paths) {
+        if (relative.isEmpty() || relative.startsWith("/") || relative.contains('\\') || relative.contains('\u0000') ||
+          relative.split('/').any { it == ".." || it.isEmpty() }) return false
+        val raw = File(canonicalRoot, relative)
+        var cursor = canonicalRoot
+        for (part in relative.split('/')) {
+          cursor = File(cursor, part)
+          if (Files.isSymbolicLink(cursor.toPath())) return false
+        }
+        val target = try { raw.canonicalFile } catch (_: Throwable) { return false }
+        if (!target.toPath().startsWith(rootPath) || !Files.isRegularFile(target.toPath(), LinkOption.NOFOLLOW_LINKS)) return false
+        val pathBytes = relative.toByteArray(Charsets.UTF_8)
+        val bytes = try { target.readBytes() } catch (_: Throwable) { return false }
+        digest.update(java.nio.ByteBuffer.allocate(4).putInt(pathBytes.size).array())
+        digest.update(pathBytes)
+        digest.update(java.nio.ByteBuffer.allocate(8).putLong(bytes.size.toLong()).array())
+        digest.update(bytes)
+      }
+      val actual = digest.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
+      return actual == expected.patchSha256
+    }
+    return false
+  }
+
+  /**
+   * Safe Mode's web marker is shared with the shell/CLI. Only recognize the
+   * production path tuple; arbitrary test/custom autoDir values remain exact.
+   * Existing scoped state is authoritative for compatibility. Any marker in
+   * both roots is ambiguous, including malformed or dangling marker entries.
+   */
+  private fun resolveSafeModeAutoDir(patch: File, homePatch: File, autoDir: File): Pair<File, String?> {
+    val dsh = homePatch.parentFile ?: return autoDir to null
+    val productionPatch = File(dsh, "profiles/web/cordis.patch.yml")
+    val productionAuto = File(dsh, "undo-snapshots/auto")
+    val productionTuple = try {
+      dsh.name == ".dsh" && patch.canonicalFile == productionPatch.canonicalFile &&
+        autoDir.canonicalFile == productionAuto.canonicalFile
+    } catch (_: Throwable) { false }
+    if (!productionTuple) return autoDir to null
+    val flat = productionAuto
+    val scoped = File(dsh, "undo-snapshots/web/auto")
+    fun hasMarker(dir: File): Boolean = listOf("safe-mode.json", "safe-mode-state.json").any { name ->
+      try { Files.exists(File(dir, name).toPath(), LinkOption.NOFOLLOW_LINKS) } catch (_: Throwable) { false }
+    }
+    val flatHas = hasMarker(flat)
+    val scopedHas = hasMarker(scoped)
+    if (flatHas && scopedHas) {
+      return autoDir to "安全模式状态冲突：平铺与 web 作用域目录都存在状态标记（包括损坏标记）；拒绝选择恢复来源，未修改文件。"
+    }
+    return (if (scopedHas) scoped else flat) to null
+  }
+
+  private fun migrateLegacyState(autoDir: File, atomicWrite: (File, ByteArray) -> Unit): String? {
+    val current = File(autoDir, STATE_FILE)
+    val legacy = File(autoDir, "safe-mode-state.json")
+    val currentExists = Files.exists(current.toPath(), LinkOption.NOFOLLOW_LINKS)
+    val legacyExists = Files.exists(legacy.toPath(), LinkOption.NOFOLLOW_LINKS)
+    if (currentExists && legacyExists) return "安全模式同时存在新旧状态文件，拒绝猜测恢复来源。"
+    if (!legacyExists) return null
+    return try {
+      if (!Files.isRegularFile(legacy.toPath(), LinkOption.NOFOLLOW_LINKS)) error("旧状态不是普通文件")
+      val bytes = Files.readAllBytes(legacy.toPath())
+      org.json.JSONObject(String(bytes, Charsets.UTF_8))
+      atomicWrite(current, bytes)
+      if (!legacy.delete()) error("旧状态迁移后无法清理")
+      null
+    } catch (t: Throwable) {
+      "旧安全模式状态无法安全迁移，已保留恢复来源并拒绝操作：${t.message ?: t.javaClass.simpleName}"
     }
   }
 
@@ -350,8 +579,8 @@ internal object SafeMode {
   }.getOrDefault(false)
 
   /** 被摘掉的第三方插件名（供回执如实报数；纯函数）。 */
-  internal fun removedPluginNames(patchText: String, hardNames: Set<String> = emptySet(), hardEntries: Set<PluginMounts.HardEntry>? = null): List<String> {
-    return insertChildren(patchText).filter { row -> row.name != null && !isProductOwned(row.name, hardNames, hardEntries, row.id) }
+  internal fun removedPluginNames(patchText: String, hardEntries: Set<PluginMounts.HardEntry> = emptySet()): List<String> {
+    return insertChildren(patchText).filter { row -> row.name != null && !isProductOwned(row.name, hardEntries, row.id) }
       .mapNotNull { it.name }.distinct()
   }
 

@@ -17,7 +17,7 @@
 | diffutils | 3.12-2 | GPL-3.0+ | [termux-packages/diffutils](https://github.com/termux/termux-packages/tree/master/packages/diffutils) |
 | dpkg | 1.22.6-5 | GPL-2.0+ | [termux-packages/dpkg](https://github.com/termux/termux-packages/tree/master/packages/dpkg) |
 | findutils | 4.11.0 | GPL-3.0+ | [termux-packages/findutils](https://github.com/termux/termux-packages/tree/master/packages/findutils) |
-| gawk | 5.3.2 | GPL-3.0+ | [termux-packages/gawk](https://github.com/termux/termux-packages/tree/master/packages/gawk) |
+| gawk | 5.4.1 | GPL-3.0+ | [termux-packages/gawk](https://github.com/termux/termux-packages/tree/master/packages/gawk) |
 | gdbm | 1.26-1 | GPL-3.0+ | [termux-packages/gdbm](https://github.com/termux/termux-packages/tree/master/packages/gdbm) |
 | git | 2.56.0 | GPL-2.0 | [termux-packages/git](https://github.com/termux/termux-packages/tree/master/packages/git) |
 | grep | 3.12-3 | GPL-3.0+ | [termux-packages/grep](https://github.com/termux/termux-packages/tree/master/packages/grep) |

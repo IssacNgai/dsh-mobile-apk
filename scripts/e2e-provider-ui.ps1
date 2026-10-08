@@ -9,15 +9,15 @@
 # 换机型/分辨率需重新校准——脚本每步截图落 $ShotDir，便于核对。
 #
 # 用法：
-#   pwsh -File scripts\e2e-provider-ui.ps1 -ApiKey sk-xxx
-#   pwsh -File scripts\e2e-provider-ui.ps1 -ApiKey sk-xxx -FetchModels    # 额外点「获取可用模型」
-#   pwsh -File scripts\e2e-provider-ui.ps1 -ApiKey sk-xxx -ManualModel glm-5.3-flash
+#   pwsh -File scripts\e2e-provider-ui.ps1 -ApiKey (Read-Host 'API key' -AsSecureString)
+#   pwsh -File scripts\e2e-provider-ui.ps1 -ApiKey (Read-Host 'API key' -AsSecureString) -FetchModels
+#   pwsh -File scripts\e2e-provider-ui.ps1 -ApiKey (Read-Host 'API key' -AsSecureString) -ManualModel glm-5.3-flash
 param(
   [string]$Serial = "127.0.0.1:16416",
   [string]$ProviderId = "mhs",
   [string]$DisplayName = "MHS Relay",
   [string]$BaseUrl = "https://api.mhsapi.top/v1",
-  [string]$ApiKey = "",
+  [System.Security.SecureString]$ApiKey = $null,
   [switch]$FetchModels,
   [string]$ManualModel = "",
   [string]$ShotDir = ".deploy-tmp\0135",
@@ -27,8 +27,13 @@ param(
 $ErrorActionPreference = 'Stop'
 New-Item -ItemType Directory -Force -Path $ShotDir | Out-Null
 $step = 0
+$script:credentialCaptureRestricted = ($null -ne $ApiKey -and $ApiKey.Length -gt 0)
 
 function Shot([string]$name) {
+  if ($script:credentialCaptureRestricted) {
+    Write-Output "  shot: suppressed (secure credential supplied)"
+    return
+  }
   $script:step++
   $file = Join-Path $ShotDir ("ui-{0:d2}-{1}.png" -f $script:step, $name)
   adb -s $Serial exec-out screencap -p > $file
@@ -42,11 +47,25 @@ function Tap([int]$x, [int]$y, [int]$waitMs = 900, [string]$note = "") {
   if ($note -ne "") { Write-Output "  tap $x,$y ($note)" }
 }
 
-function TypeText([string]$text, [string]$note = "") {
-  if ($DryRun) { Write-Output ("  [dry] type {0} {1}" -f $text, $note); return }
-  adb -s $Serial shell input text $text | Out-Null
+function TypeText([string]$text, [string]$note = "", [switch]$Sensitive) {
+  $length = if ($null -eq $text) { 0 } else { $text.Length }
+  if ($DryRun) { Write-Output ("  [dry] type field={0} chars={1}" -f $note, $length); return }
+  adb -s $Serial shell input text $text *> $null
+  if ($LASTEXITCODE -ne 0) { throw ("ADB text entry failed (field={0} chars={1})" -f $note, $length) }
   Start-Sleep -Milliseconds 500
-  Write-Output "  type: $text ($note)"
+  $redacted = if ($Sensitive) { " (redacted)" } else { "" }
+  Write-Output ("  type field={0} chars={1}{2}" -f $note, $length, $redacted)
+}
+
+function ConvertFrom-SecureApiKey([System.Security.SecureString]$value) {
+  $pointer = [IntPtr]::Zero
+  try {
+    $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($value)
+    return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer)
+  }
+  finally {
+    if ($pointer -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer) }
+  }
 }
 
 Write-Output "== 1. 前置：应用置前台（要求从聊天页开始；若停在设置/表单里请先手动 BACK 或重开应用）=="
@@ -78,9 +97,15 @@ Tap 430 668 600 "显示名称输入框"
 TypeText $DisplayName "display name"
 Tap 430 818 600 "API 地址输入框"
 TypeText $BaseUrl "base url"
-if ($ApiKey -ne "") {
+if ($null -ne $ApiKey -and $ApiKey.Length -gt 0) {
   Tap 430 1100 600 "API 密钥输入框"
-  TypeText $ApiKey "api key"
+  if ($DryRun) {
+    Write-Output ("  [dry] type field=api key chars={0} (redacted)" -f $ApiKey.Length)
+  } else {
+    $plainApiKey = ConvertFrom-SecureApiKey $ApiKey
+    try { TypeText $plainApiKey "api key" -Sensitive }
+    finally { $plainApiKey = $null }
+  }
 }
 Shot "form-filled"
 
@@ -91,7 +116,7 @@ if ($FetchModels) {
 }
 
 if ($ManualModel -ne "") {
-  Write-Output "== 5b. 手工添加模型（$ManualModel）=="
+  Write-Output "== 5b. 手工添加模型 =="
   Tap 141 1391 900 "添加模型"
   Shot "model-row"
   # 模型行内的 ID 输入框（表单滚动后位置）——校准值见 model-row 截图
@@ -108,6 +133,6 @@ Shot "created"
 Write-Output "== 7. 校验落盘（settings.yaml 是否出现该路由）=="
 $yaml = adb -s $Serial shell "run-as com.dsharnessmobile.shell cat files/home/.dsh/settings.yaml" 2>$null
 $hasRoute = ($yaml -join "`n") -match "(?m)^\s*$([regex]::Escape($ProviderId)):"
-Write-Output ("  settings.yaml 含路由 {0}: {1}" -f $ProviderId, $hasRoute)
+Write-Output ("  settings.yaml route present: {0}" -f $hasRoute)
 if (-not $hasRoute) { Write-Output "  （提示：路由写入有延迟，可在 5-10 秒后重跑第 7 步校验）" }
 Write-Output "完成。截图见 $ShotDir"

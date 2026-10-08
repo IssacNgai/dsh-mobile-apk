@@ -109,7 +109,7 @@
 |---|---|---|
 | snapshot.tar.xz | 内嵌 Termux 运行时快照（usr/ + home/；引擎版本以构建输入为准） | SnapshotExtractor（首启解压到 filesDir） |
 | snapshot.sha256 | 快照指纹（随 ABI/批次变化，现数用 `check-snapshot-fingerprint` 对账） | EngineManager 读取；与 filesDir/.snapshot-fingerprint 比对——指纹翻转触发事务化全量重解压，`snapshotRefreshing` 闸门在刷新期禁止拉引擎 |
-| plugin-hard-manifest.json | 最终注入 snapshot 的精确 Hard `{id,name}` 清单，schema 2 含 profile 来源子集并绑定归档 SHA-256 | `build-hard-manifest.mjs` 在 final tar 生成后扫描；online sidecar 由 verified stage `usr` entries + embedded profile subset 生成，marker/.online-snapshot 双 fingerprint 选中；SWAPPING 或缺失/错版时归属动作不执行 |
+| plugin-hard-manifest.json | 最终注入 snapshot 的精确 Hard `{id,name}` 清单，schema 2 含 profile 来源子集与 `factoryBundles: [{name,version,patchSha256}]` 并绑定归档 SHA-256；字段缺席表示旧资产无法证明 bundle ownership，`[]` 表示可信空选择 | `build-hard-manifest.mjs` 从 final tar 的 web profile bundle 顺序及 app-boot install-first/profile-second 解析位置生成；patch SHA-256 使用 `DSHBNDL1` + 按声明顺序的 UTF-8 路径/长度帧/实际 bytes。online sidecar 仅由 verified stage 与当前 APK可信选择名重算身份，不继承 live HOME/旧 sidecar；marker/.online-snapshot 双 fingerprint 选中；SWAPPING 或缺失/错版时归属动作不执行 |
 | patched/ | 运行时补丁（文件清单与大小见 RUNTIME-PATCHES.md） | EngineManager.applyRuntimePatches()（内容指纹判定，目标包缺席跳过） |
 | console.html | 控制台终端 UI（consoleBridge 页面侧） | ConsoleActivity 加载 |
 | undo-emergency.mjs | undo 急救 CLI（list/restore/safe-mode，独立于引擎可运行） | EngineManager.deployUndoCli → UndoGate.execute 调用 |

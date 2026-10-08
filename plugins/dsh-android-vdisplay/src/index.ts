@@ -219,7 +219,11 @@ export function apply(ctx: Context): void {
         const message = typeof reply?.error === 'string' && reply.error !== ''
           ? reply.error
           : op + ' 调用失败（控制队列未返回结果）。'
-        return { ok: false, code: 'vdisplay-op-failed', guidance: message }
+        const replyCode = typeof reply?.code === 'string' ? reply.code : undefined
+        const stableCode = ['screen-out-of-scope', 'screen-not-ready', 'screen-not-found'].includes(replyCode ?? '')
+          ? replyCode
+          : /^(screen-out-of-scope|screen-not-ready|screen-not-found)(?=[:：]|$)/.exec(message)?.[1]
+        return { ok: false, code: stableCode ?? 'vdisplay-op-failed', guidance: message }
       }
       const data = (reply.data ?? {}) as Record<string, unknown>
       if (data.ok === false) {

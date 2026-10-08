@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test, after } from 'node:test'
-import { mkdtempSync, readFileSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
@@ -16,7 +16,7 @@ import {
   adbCommandDisplayTokens,
   screenTokensFromSfDump,
 } from '../lib/screen-scope.js'
-import { AndroidPrivilegeService, SHELL_EXEC_TIMEOUT_MS, SHELL_QUEUE_TIMEOUT_MS } from '../lib/index.js'
+import { AndroidPrivilegeService, SHELL_EXEC_TIMEOUT_MS, SHELL_QUEUE_TIMEOUT_MS, apply } from '../lib/index.js'
 import { ControlQueue } from '../lib/control-queue.js'
 
 // ── 0.14.1 块G（T3）：执行点范围门禁按**目标屏**判定 ──────────────────────────────
@@ -134,8 +134,7 @@ test('adb display target ids are extracted only from explicit -d/--display flags
   assert.deepEqual(adbCommandDisplayIds('dumpsys display'), [], 'display 是子命令词，不是目标屏')
 })
 
-// review C11 raw shell 面：virtual-only 下 screencap/input/uiautomator 等命令在执行点拒绝，
-// 只读元数据命令放行；real-only/all 不拦（真实屏本就在范围内）。
+// Raw shell 屏幕范围：virtual-only 需要注册虚拟目标；real-only 限物理 display 0；all 不变。
 test('raw adb real-screen commands are denied outside the real-screen scope', () => {
   assert.ok(realScreenAdbCommandDenied('virtual-only', 'screencap -p /sdcard/a.png'))
   assert.ok(realScreenAdbCommandDenied('virtual-only', 'input tap 100 200'))
@@ -147,6 +146,61 @@ test('raw adb real-screen commands are denied outside the real-screen scope', ()
   assert.equal(realScreenAdbCommandDenied('virtual-only', 'ls /sdcard/Download'), null)
   assert.equal(realScreenAdbCommandDenied('real-only', 'screencap -p /sdcard/a.png'), null)
   assert.equal(realScreenAdbCommandDenied('all', 'input tap 1 1'), null)
+})
+
+test('real-only raw shell admits physical targets and fails closed for virtual or unknown targets', async () => {
+  const deniedCommands = [
+    'input -d 47 tap 10 20',
+    'screencap --display=47 -p /sdcard/a.png',
+    'sh -c "screencap -d 0 -p; input -d 47 tap 10 20"',
+    'toybox sh -c "input --display 999 tap 1 2"',
+    'screencap --display-id 999 -p /sdcard/a.png',
+    'uiautomator dump /sdcard/tree.xml --display 2',
+    'echo ok; input -d 0 tap 1 2; screencap -d 7 -p /sdcard/a.png',
+    'sh -c "input -d 999 tap 1 2',
+  ]
+  for (const command of deniedCommands) {
+    assert.ok(realScreenAdbCommandDenied('real-only', command), command)
+  }
+  for (const command of [
+    'input tap 10 20',
+    'input -d 0 tap 10 20',
+    'input tap 10 20 --display=0',
+    'screencap -p -d 0 /sdcard/a.png',
+    'dumpsys window',
+    'am start -d https://example.test -n com.example/.Main',
+    'getprop ro.product.model',
+    'curl -d value https://example.test',
+  ]) {
+    assert.equal(realScreenAdbCommandDenied('real-only', command), null, command)
+  }
+  assert.equal(realScreenAdbCommandDenied('all', 'input -d 47 tap 1 2'), null,
+    'all retains its existing unrestricted screen contract')
+  assert.ok(realScreenAdbCommandDenied('virtual-only', 'input -d 0 tap 1 2'),
+    'virtual-only retains its existing physical-screen denial')
+
+  // Service execution path used by android_shell_exec: denied commands must stop before shExec enqueue.
+  a11yOnlinePrefs()
+  useScope('real-only')
+  const queue = new ControlQueue()
+  const svc = service(queue)
+  assert.equal(svc.screenScope(), 'real-only', 'android_shell_exec service must read current native test scope')
+  for (const command of deniedCommands.slice(0, 5)) {
+    const result = await svc.execAdbShell(command, { session: TEST_SESSION })
+    assert.equal(result.ok, false, command)
+    assert.match(String(result.guidance), /real-only/)
+    assert.equal(await takeNext(queue, 30), null, command + ' must not reach native shExec')
+  }
+  const physical = svc.execAdbShell('input -d 0 tap 10 20', { session: TEST_SESSION })
+  const request = await takeNext(queue)
+  assert.equal(request?.op, 'shExec')
+  queue.settle(request.reqId, { ok: true, data: { ok: true, stdout: '' } })
+  assert.equal((await physical).ok, true)
+  const nonScreen = svc.execAdbShell('getprop ro.product.model', { session: TEST_SESSION })
+  const metadata = await takeNext(queue)
+  assert.equal(metadata?.op, 'shExec')
+  queue.settle(metadata.reqId, { ok: true, data: { ok: true, stdout: 'model' } })
+  assert.equal((await nonScreen).ok, true)
 })
 
 test('test-only scope source cannot be overridden by an ordinary environment value', () => {
@@ -237,6 +291,34 @@ test('F1：real-only 下虚拟屏目标必须拒绝（范围优先于目标解�
   assert.equal(await takeNext(queue, 80), null, '范围不含 virtual 时不得投递')
 })
 
+test('vdInput 服务执行点在 real-only 下拒绝已解析虚拟目标且不入队', async () => {
+  useScope('real-only')
+  const queue = new ControlQueue()
+  const svc = service(queue)
+  const out = svc.controlExec('vdInput', { target: 'virtual-1', verb: 'tap', x: 1, y: 2 }, 15_000, { session: {} })
+  const r = await out
+  assert.equal(r.ok, false)
+  assert.match(String(r.error), /^screen-out-of-scope:/)
+  assert.equal(await takeNext(queue, 80), null, '显式目标拒绝时不得投递任何控制 op')
+})
+
+test('vdInput 缺省 target 以壳报告的 selected alias 为准并在 real-only 下拒绝', async () => {
+  useScope('real-only')
+  const queue = new ControlQueue()
+  const svc = service(queue)
+  const out = svc.controlExec('vdInput', { verb: 'keyevent', keycode: 4 }, 15_000, { session: {} })
+  const info = await takeNext(queue)
+  assert.equal(info?.op, 'vdInfo')
+  queue.settle(info.reqId, {
+    ok: true,
+    data: { selected: 'virtual-1', screens: [{ alias: 'virtual-1', kind: 'virtual', displayId: 6 }] },
+  })
+  const r = await out
+  assert.equal(r.ok, false)
+  assert.match(String(r.error), /^screen-out-of-scope:/)
+  assert.equal(await takeNext(queue, 80), null, 'selected 屏被拒绝后不得排入 vdInput')
+})
+
 test('F1：范围 all 下真实屏目标照旧放行（放宽只针对目标屏判定，不动 in-scope 路径）', async () => {
   a11yOnlinePrefs()
   useScope('all')
@@ -317,18 +399,70 @@ test('F2：无 -d 的 screencap 与真实屏命令照旧拒绝（放宽面收敛
   assert.equal(realScreenAdbCommandDenied('virtual-only', 'input -d 47 tap 100 200', { virtualDisplayIds: [47] }), null)
 })
 
-test('F2：范围含 real 时不打注册表往返（放宽不得引入新的固定开销）', async () => {
+test('real-only raw shell denies virtual targets without registry lookup and allows physical target', async () => {
   a11yOnlinePrefs()
   useScope('real-only')
   const queue = new ControlQueue()
   const svc = service(queue)
+  assert.equal(svc.screenScope(), 'real-only')
   const out = svc.execAdbShell('adb shell screencap -p -d 47 /data/local/tmp/a.png', { session: TEST_SESSION })
   const sh = await takeNext(queue)
-  assert.equal(sh?.op, 'shExec', 'real-only 下真实屏命令本就放行，不得先问 vdInfo')
-  queue.settle(sh.reqId, { ok: true, data: { ok: true, stdout: '' } })
-  const r = await out
+  assert.equal(sh, null, 'real-only 下虚拟目标必须在引擎拒绝，不得先问 vdInfo 或投递 shExec')
+  assert.equal((await out).ok, false)
+  assert.equal(await takeNext(queue, 80), null)
+
+  const physical = svc.execAdbShell('adb shell screencap -p -d 0 /data/local/tmp/a.png', { session: TEST_SESSION })
+  const physicalSh = await takeNext(queue)
+  assert.equal(physicalSh?.op, 'shExec', '物理 display 0 仍能执行，且不得先问 vdInfo')
+  queue.settle(physicalSh.reqId, { ok: true, data: { ok: true, stdout: '' } })
+  const r = await physical
   assert.equal(r.ok, true, JSON.stringify(r))
   assert.equal(await takeNext(queue, 80), null, '不得留下第二个在途请求')
+})
+
+test('registered android_shell_exec tool entry rejects virtual display commands in real-only', async () => {
+  const keys = ['DSH_HOME', 'DSH_ADB_PREFS_PATH', 'DSH_SCREEN_SCOPE_TEST', 'DSH_SCREEN_SCOPE']
+  const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]))
+  const home = mkdtempSync(join(tmpdir(), 'dsh-real-only-tool-'))
+  const prefs = join(home, 'dsh-adb.xml')
+  writeFileSync(prefs, '<map>\n'
+    + '<boolean name="fullAccess" value="true" />\n'
+    + '<boolean name="allowSwitch" value="true" />\n'
+    + '<boolean name="paired" value="true" />\n'
+    + '<boolean name="wirelessOn" value="true" />\n'
+    + '</map>\n')
+  process.env.DSH_HOME = home
+  process.env.DSH_ADB_PREFS_PATH = prefs
+  useScope('real-only')
+  const registered = []
+  const provided = new Map()
+  try {
+    apply({
+      provide: (key, value) => provided.set(key, value),
+      tools: { register: (tool) => registered.push(tool) },
+      on: () => undefined,
+      effect: () => undefined,
+      get: () => undefined,
+      logger: () => ({ debug() {}, warn() {} }),
+      sandboxPolicy: { defaultMode: 'danger-full-access', resolve: () => ({ mode: 'danger-full-access' }) },
+    })
+    const tool = registered.find((candidate) => candidate.name === 'android_shell_exec')
+    assert.ok(tool, '实际注册工具必须存在')
+    const serviceInstance = provided.get('androidPrivilege')
+    const result = await tool.execute(
+      { command: 'sh -c "input --display 47 tap 10 20"' },
+      { agent: { session: TEST_SESSION } },
+    )
+    assert.equal(result.ok, false)
+    assert.match(String(result.text ?? result.guidance), /real-only/)
+    assert.equal(serviceInstance.controlQueue.take(), null, '工具入口拒绝必须发生在 native shExec 入队之前')
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+    rmSync(home, { recursive: true, force: true })
+  }
 })
 
 // ── F4b 执行点半边（0.14.1 块G）：WebView 通道 op 不得被设备屏范围门拦 ─────────────────// 两层门禁必须同改：manage 的 SCREEN_ACTIONS 已按 device_info 判例移出 web_dump，

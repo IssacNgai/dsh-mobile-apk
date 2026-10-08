@@ -498,11 +498,31 @@ async function main() {
     !mountsBad && byteIdentical
       ? `cordis.patch.yml 与基线**逐字节相同**（sha ${String(patchSha2).slice(0, 12)}）⇒ 其余条目与注释一字未动`
       : (mountsBad ? '坏插件仍被 cordis.patch.yml 挂载' : `已拔除但清单与基线不一致：${String(patchSha2).slice(0, 12)} vs ${String(patchSha0).slice(0, 12)}`))
-  // 清单式回滚的两份清单必须真的落地（否则「硬清单保护」只是纸面）
+  // 清单式回滚的两份清单必须真的落地（否则「硬清单保护」只是纸面）。
+  // 判据必须**按各自 schema**核对：两份清单由不同序列化器写出，键集合不同，
+  // 用同一个键名判两者是错的（2026-10-08 实测：本判据在本机稳态下恒假）。
+  //   硬清单 .plugin-hard-manifest.json  <- PluginMounts.cacheHard()
+  //     顶层键：schema, complete, fingerprint, entries, profileEntries（**无** names）
+  //   软清单 .plugin-soft-manifest.json  <- PluginMounts 软清单写出器
+  //     顶层键：names, digest, at, lastProbeDigest, lastProbeBoot, lastProbeAt
+  // 注意：只有 writeOnlineHardManifest() 写的 *online* 硬清单（.plugin-hard-manifest-online-<archive>.json）
+  // 才额外带 names；本判据读的是**常驻**那份，故 names 不是它的判据。
   const hard = runAs(`cat ${FILES}/.plugin-hard-manifest.json 2>/dev/null`)
   const soft = runAs(`cat ${FILES}/.plugin-soft-manifest.json 2>/dev/null`)
-  record('P4 两份清单在场（硬/软）', hard.includes('names') && soft.includes('names') ? 'PASS' : 'FAIL',
-    `硬清单片段=${hard.slice(0, 120).replace(/\n/g, ' ')}`)
+  const hardOk = (() => {
+    try {
+      const j = JSON.parse(hard)
+      return j && j.schema === 2 && j.complete === true && Array.isArray(j.entries) && Array.isArray(j.profileEntries)
+    } catch { return false }
+  })()
+  const softOk = (() => {
+    try {
+      const j = JSON.parse(soft)
+      return j && Array.isArray(j.names)
+    } catch { return false }
+  })()
+  record('P4 两份清单在场（硬/软）', hardOk && softOk ? 'PASS' : 'FAIL',
+    `硬清单 schema/entries/profileEntries=${hardOk}；软清单 names=${softOk}；硬清单片段=${hard.slice(0, 120).replace(/\n/g, ' ')}`)
 
   const man1 = manifestMap(runAs(`cd ${NM} && find . -type f | sort | xargs sha256sum`))
   const diff = manifestDiff(man0, man1)

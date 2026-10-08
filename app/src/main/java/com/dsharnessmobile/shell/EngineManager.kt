@@ -1264,6 +1264,32 @@ class EngineManager(private val context: Context, private val pickToken: String?
       LogCollector.log(TAG, "engine start refused (live runtime incomplete) evidence=" + lastStartRefusalEvidence)
       return false
     }
+    // Persisted profile state can predate the current Hard manifest (for example, a bundle
+    // selection missing from an older migration). Reconcile before *every* spawn decision, even
+    // when the extracted snapshot fingerprint is already fresh. Only exact installed identities
+    // from the trusted manifest may be added; user Soft selections and pins remain intact.
+    val hard = PluginMounts.ensureHard(context, PluginMounts.currentFingerprint(context))
+    if (hard == null) {
+      lastStartRefusalCode = REFUSAL_HARD_BUNDLE_SELECTION
+      lastStartRefusal = "当前版本 Hard 插件清单缺失或与运行时快照不匹配；拒绝启动引擎，profile 未修改"
+      Log.e(TAG, "engine start refused: " + lastStartRefusal)
+      return false
+    }
+    val hardBundleRepair = PluginMounts.ensureHardBundlesSelected(
+      File(homeDir, ".dsh/profiles/web/package.json"),
+      File(usrDir, "lib/node_modules/@deepseek-ai/dsh/node_modules"),
+      hard,
+    )
+    if (hardBundleRepair.failure != null) {
+      lastStartRefusalCode = REFUSAL_HARD_BUNDLE_SELECTION
+      lastStartRefusal = "Hard bundle profile 校验/修复失败；拒绝启动引擎，" + hardBundleRepair.failure
+      Log.e(TAG, "engine start refused: " + lastStartRefusal)
+      return false
+    }
+    if (hardBundleRepair.changed) {
+      LogCollector.log(TAG, "required Hard factory bundles added to web profile; engine restart required")
+    }
+    val restartForHardBundleRepair = hardBundleRepair.changed
     // 通过闸门 A：码与确诊项已在入口清过（见函数头注释），此处无需重复。
     // 取证字段**刻意不清**：它是只增的现场记录，供诊断包读取。
     val now = System.currentTimeMillis()
@@ -1287,12 +1313,12 @@ class EngineManager(private val context: Context, private val pickToken: String?
     val engineUsable = availability == EngineProbe.EngineAvailability.OUR_PROCESS ||
       availability == EngineProbe.EngineAvailability.OUR_HTTP
     val degradedHttp = engineUsable && WatchdogV2.degradedHttpTripped()
-    if (!force && engineUsable && !degradedHttp) {
+    if (!force && !restartForHardBundleRepair && engineUsable && !degradedHttp) {
       STARTING.set(false)
       LogCollector.log(TAG, "engine start skipped (existing engine usable: " + availability + ")")
       return true
     }
-    if ((force || degradedHttp) && availability == EngineProbe.EngineAvailability.OUR_HTTP && !managedProcessAlive) {
+    if ((force || restartForHardBundleRepair || degradedHttp) && availability == EngineProbe.EngineAvailability.OUR_HTTP && !managedProcessAlive) {
       lastStartRefusal = "引擎 HTTP 响应可归属，但本壳没有可安全停止的子进程句柄；拒绝盲目重启"
       LogCollector.log(TAG, "engine restart refused (owned HTTP without tracked process handle)")
       STARTING.set(false)
@@ -2227,6 +2253,9 @@ description: 手机操控纪律：无障碍语义树优先、ref 语义点击/�
    * 调用方（EngineStartFlow 的拒启分支）据此触发一次删指纹 + 清账本的恢复动作。
    */
   const val REFUSAL_LIVE_RUNTIME_INCOMPLETE = "live-runtime-incomplete"
+
+  /** Refusal code: Hard bundle ownership or installed identity could not be proven safely. */
+  const val REFUSAL_HARD_BUNDLE_SELECTION = "hard-bundle-selection-unverified"
 
     /** Process handle shared by every EngineManager in the application process. */
     @Volatile

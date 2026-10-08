@@ -16,7 +16,8 @@ import org.json.JSONObject
  * as an APK asset, and atomically cached under [hardFile]. Live patch contents are never merged into
  * that authority. Missing or mismatched identity data makes destructive ownership decisions fail closed.
  *
- * Soft state records per-entry `{id,name}` identities. A changed digest starts Candidate; only the
+ * Soft state records per-entry `{id,name}` identities. Its composition digest binds selected bundle
+ * identities and patch bytes followed by profile and optional HOME Cordis bytes in rc2 layer order. A changed digest starts Candidate; only the
  * same digest passing authenticated Cordis inventory, enabled preset fiber, `session/list`, and
  * `session/modelCatalog` checks on two separate spawned engine launches may become Stable. Manual
  * disabled overrides remain Disabled; automatic failure quarantine adds a marked disabled override
@@ -78,9 +79,18 @@ object PluginMounts {
   fun patchFile(engine: EngineManager): File = File(File(engine.homeDir, ".dsh"), PATCH_REL)
 
   /** 一次点名的失败条目：loader entry 的 id（`- id:`）与包名（`name:`），任一可为 null。 */
-  data class FailedEntry(val id: String?, val name: String?)
+  enum class FailedLayer { PROFILE, BUNDLE, HOME }
+  data class FailedEntry(
+    val id: String?,
+    val name: String?,
+    val bundleIdentity: FactoryBundle? = null,
+    val layer: FailedLayer = FailedLayer.PROFILE,
+    /** True only when a selector resolved this identity from the current parsed composition. */
+    val sourceVerified: Boolean = false,
+  )
 
   data class HardEntry(val id: String?, val name: String)
+  data class FactoryBundle(val name: String, val version: String, val patchSha256: String)
 
   enum class SoftEntryState { CANDIDATE, STABLE, DISABLED, QUARANTINED }
   data class SoftEntryStatus(val id: String, val name: String, val state: SoftEntryState)
@@ -90,10 +100,95 @@ object PluginMounts {
     val entries: Set<HardEntry>,
     val baseFingerprint: String? = null,
     val profileEntries: Set<HardEntry> = emptySet(),
+    /** null means schema-2 authority predates bundle ownership; empty means known no bundles. */
+    val factoryBundles: Set<FactoryBundle>? = null,
   ) {
     val names: Set<String> get() = entries.map { it.name }.toSet()
     fun owns(id: String?, name: String?): Boolean = entries.any { entry ->
       id != null && name != null && entry.id != null && entry.id == id && entry.name == name
+    }
+  }
+
+  internal data class HardBundleSelectionRepair(val changed: Boolean, val failure: String? = null)
+
+  /**
+   * Reconcile only the factory bundles bound by the current Hard manifest into the live web
+   * profile. Bundle identities must resolve from the installed engine tree with the exact version
+   * and patch digest recorded by that manifest. User bundles and all other package fields remain
+   * untouched. A failure is returned before writing anything.
+   */
+  internal fun ensureHardBundlesSelected(
+    profilePackage: File,
+    installModules: File,
+    hard: HardManifest,
+  ): HardBundleSelectionRepair {
+    val expected = hard.factoryBundles
+      ?: return HardBundleSelectionRepair(false, "Hard manifest has no authoritative factory bundle identities")
+    if (expected.isEmpty() || expected.any {
+        it.name.isBlank() || it.version.isBlank() || !it.patchSha256.matches(Regex("[0-9a-f]{64}"))
+      } || expected.map { it.name }.distinct().size != expected.size) {
+      return HardBundleSelectionRepair(false, "Hard manifest factory bundle identities are empty, malformed, or ambiguous")
+    }
+    val exactInstalled = resolveBundleLayers(
+      installModules, expected.map { it.name }, profileModules = null, allowContainedSymlinks = false,
+    ) ?: return HardBundleSelectionRepair(false, "Installed factory bundle package or patch identity is missing or unsafe")
+    if (exactInstalled.map { it.identity }.toSet() != expected) {
+      return HardBundleSelectionRepair(false, "Installed factory bundle identity does not match the Hard manifest")
+    }
+
+    val profileDir = profilePackage.parentFile
+      ?: return HardBundleSelectionRepair(false, "Web profile package path has no parent")
+    if (!Files.isRegularFile(profilePackage.toPath(), java.nio.file.LinkOption.NOFOLLOW_LINKS) ||
+      hasSymlinkWithin(profileDir, profilePackage)) {
+      return HardBundleSelectionRepair(false, "Web profile package.json is missing, non-regular, or traverses a symlink")
+    }
+    val text = try { profilePackage.readText() } catch (_: Throwable) {
+      return HardBundleSelectionRepair(false, "Web profile package.json cannot be read")
+    }
+    val manifest = try { JSONObject(text) } catch (_: Throwable) {
+      return HardBundleSelectionRepair(false, "Web profile package.json is malformed JSON")
+    }
+
+    // app-boot rc2 reads the nested shape. A dotted legacy key alongside it is ambiguous if the
+    // selections disagree, so refuse to guess which user intent should win.
+    val dottedPresent = manifest.has("dsh.profile.bundles")
+    val dotted = if (dottedPresent) manifest.optJSONArray("dsh.profile.bundles")
+      ?: return HardBundleSelectionRepair(false, "Web profile has a malformed legacy bundle selection") else null
+    val dsh = if (!manifest.has("dsh") || manifest.isNull("dsh")) JSONObject()
+      else manifest.optJSONObject("dsh") ?: return HardBundleSelectionRepair(false, "Web profile dsh field is malformed")
+    val profile = if (!dsh.has("profile") || dsh.isNull("profile")) JSONObject()
+      else dsh.optJSONObject("profile") ?: return HardBundleSelectionRepair(false, "Web profile dsh.profile field is malformed")
+    val nestedPresent = profile.has("bundles")
+    val nested = if (nestedPresent) profile.optJSONArray("bundles")
+      ?: return HardBundleSelectionRepair(false, "Web profile dsh.profile.bundles is malformed") else null
+    if (dotted != null && nested != null && dotted.toString() != nested.toString()) {
+      return HardBundleSelectionRepair(false, "Web profile has conflicting legacy and nested bundle selections")
+    }
+    if (dotted != null && nested == null) {
+      return HardBundleSelectionRepair(false, "Web profile has only a legacy bundle selection; refusing ambiguous migration")
+    }
+
+    val bundles = nested ?: org.json.JSONArray()
+    val selected = LinkedHashSet<String>()
+    for (index in 0 until bundles.length()) {
+      val name = bundles.opt(index) as? String
+        ?: return HardBundleSelectionRepair(false, "Web profile bundle selection contains a non-string entry")
+      if (!validPackageName(name) || !selected.add(name)) {
+        return HardBundleSelectionRepair(false, "Web profile bundle selection contains an invalid or duplicate entry")
+      }
+    }
+    val missing = expected.map { it.name }.filterNot(selected::contains)
+    if (missing.isEmpty()) return HardBundleSelectionRepair(changed = false)
+
+    for (name in missing) bundles.put(name)
+    profile.put("bundles", bundles)
+    dsh.put("profile", profile)
+    manifest.put("dsh", dsh)
+    return try {
+      writeTextAtomically(profilePackage, manifest.toString(2))
+      HardBundleSelectionRepair(changed = true)
+    } catch (_: Throwable) {
+      HardBundleSelectionRepair(false, "Could not atomically update web profile package.json")
     }
   }
 
@@ -317,6 +412,40 @@ object PluginMounts {
     return FailedEntry(id, name)
   }
 
+  /** Production selector matches loader failures against actual bundle layers and the user layer. */
+  internal fun clientPullCandidate(context: Context, patch: File, ids: List<String>, hard: HardManifest): FailedEntry? {
+    val composition = liveComposition(context, patch) ?: return null
+    return clientPullCandidate(composition, ids, hard)
+  }
+
+  internal fun clientPullCandidate(composition: CompositionSnapshot, ids: List<String>, hard: HardManifest): FailedEntry? {
+    val wanted = ids.map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+    if (wanted.isEmpty()) return null
+    val matches = ArrayList<Pair<HardEntry, FactoryBundle?>>()
+    for (entry in composition.profileInsertEntries) {
+      if (entry.id?.let { it in wanted } == true || entry.name in wanted) matches += entry to null
+    }
+    for (entry in composition.homeInsertEntries) {
+      if (entry.id?.let { it in wanted } == true || entry.name in wanted) matches += entry to null
+    }
+    for ((bundle, entries) in composition.bundles) {
+      for (entry in entries) if (entry.id?.let { it in wanted } == true || entry.name in wanted) matches += entry to bundle
+    }
+    if (matches.size != 1) return null
+    val (entry, bundle) = matches.single()
+    if (hard.owns(entry.id, entry.name) || hard.entries.any { it.id == entry.id || it.name == entry.name }) return null
+    if (bundle != null) {
+      val trustedFactoryBundles = hard.factoryBundles ?: return null
+      if (bundle in trustedFactoryBundles) return null
+    }
+    val layer = when {
+      bundle != null -> FailedLayer.BUNDLE
+      composition.homeInsertEntries.any { it == entry } -> FailedLayer.HOME
+      else -> FailedLayer.PROFILE
+    }
+    return FailedEntry(entry.id, entry.name, bundle, layer, sourceVerified = true)
+  }
+
   /**
    * 纯逻辑：对唯一命中的 insert 子条目追加 Cordis `disabled: true` override。
    * 插件源码、原始配置块和未知字段逐字保留；无法唯一定位或条目没有 id 时返回 null。
@@ -429,8 +558,50 @@ object PluginMounts {
     return patchText + (if (patchText.isNotEmpty() && !patchText.endsWith("\n")) newline else "") + override
   }
 
+  /** Revalidate the exact loader row, then quarantine at HOME, the last persistent Android profile layer. */
+  internal fun quarantineCompositionEntry(
+    failed: FailedEntry,
+    composition: CompositionSnapshot,
+    hard: HardManifest,
+  ): String? {
+    val id = failed.id?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+    val name = failed.name?.trim()?.trim('"', '\'')?.takeIf { it.isNotEmpty() } ?: return null
+    if (hard.entries.any { it.id == id || it.name == name }) return null
+    val profileRows = composition.profileInsertEntries.filter { it.id == id || it.name == name }
+    val homeRows = composition.homeInsertEntries.filter { it.id == id || it.name == name }
+    val bundleRows = composition.bundles.flatMap { (bundle, rows) ->
+      rows.filter { it.id == id || it.name == name }.map { bundle to it }
+    }
+    val total = profileRows.size + homeRows.size + bundleRows.size
+    if (total != 1) return null
+    val sourceBundle = bundleRows.singleOrNull()?.first
+    val sourceRow = when {
+      profileRows.isNotEmpty() -> profileRows.single()
+      homeRows.isNotEmpty() -> homeRows.single()
+      else -> bundleRows.single().second
+    }
+    if (sourceRow != HardEntry(id, name)) return null
+    val sourceLayer = when {
+      sourceBundle != null -> FailedLayer.BUNDLE
+      homeRows.isNotEmpty() -> FailedLayer.HOME
+      else -> FailedLayer.PROFILE
+    }
+    if (failed.sourceVerified && (failed.layer != sourceLayer || failed.bundleIdentity != sourceBundle)) return null
+    if (sourceBundle != null) {
+      val trusted = hard.factoryBundles ?: return null
+      if (sourceBundle in trusted) return null
+    }
+    val text = if (composition.homePatch.exists()) try { composition.homePatch.readText() } catch (_: Throwable) { return null } else ""
+    val lines = text.split("\n")
+    if (hasDisabledOverride(lines, id, name)) return text
+    val newline = if (text.contains("\r\n")) "\r\n" else "\n"
+    val override = "$QUARANTINE_MARKER\n- id: ${JSONObject.quote(id)}\n  name: ${JSONObject.quote(name)}\n  disabled: true\n".replace("\n", newline)
+    return text + (if (text.isNotEmpty() && !text.endsWith("\n")) newline else "") + override
+  }
+
 
   private fun hasDisabledOverride(lines: List<String>, id: String, name: String?): Boolean {
+    var effectiveDisabled: Boolean? = null
     var start = 0
     while (start < lines.size) {
       if (!TOP_LEVEL.matches(lines[start])) { start++; continue }
@@ -442,12 +613,17 @@ object PluginMounts {
         val rowName = block.firstNotNullOfOrNull { line ->
           Regex("""^\s{2}name:\s*['\"]?([^'\"\s]+)""").find(line)?.groupValues?.get(1)
         }
-        val disabled = block.any { Regex("""^\s{2}disabled:\s*true(?:\s+#.*)?$""").matches(it) }
-        if (disabled && (rowName == null || rowName == name)) return true
+        if (rowName == null || rowName == name) {
+          val disabledRows = block.filter { Regex("""^\s{2}disabled:\s*.*$""").matches(it) }
+          val assignment = disabledRows.lastOrNull()?.let { line ->
+            Regex("""^\s{2}disabled:\s*(true|false)(?:\s+#.*)?$""").matchEntire(line)?.groupValues?.get(1)
+          }
+          if (disabledRows.isNotEmpty()) effectiveDisabled = assignment?.let { it == "true" }
+        }
       }
       start = end
     }
-    return false
+    return effectiveDisabled == true
   }
 
   private fun hasQuarantineOverride(lines: List<String>, id: String, name: String?): Boolean {
@@ -552,23 +728,24 @@ object PluginMounts {
     val archive = normalizeFingerprint(archiveFingerprint) ?: return null
     val base = normalizeFingerprint(baseFingerprint) ?: return null
     val embedded = readEmbeddedHard(context)?.takeIf { it.fingerprint == base } ?: return null
-    val composition = onlineComposition(snapshotRoot, embedded.profileEntries) ?: return null
-    val result = HardManifest(archive, composition.entries, base, composition.profileEntries)
+    val composition = onlineComposition(snapshotRoot, embedded.profileEntries, embedded.factoryBundles) ?: return null
+    val result = HardManifest(archive, composition.entries, base, composition.profileEntries, composition.factoryBundles)
     if (!writeOnlineHardManifest(context, result)) return null
     return result
   }
 
-  internal fun onlineHardEntries(snapshotRoot: File, profileEntries: Set<HardEntry>): Set<HardEntry>? {
-    return onlineComposition(snapshotRoot, profileEntries)?.entries
+  internal fun onlineHardEntries(snapshotRoot: File, profileEntries: Set<HardEntry>, factoryBundles: Set<FactoryBundle>? = emptySet()): Set<HardEntry>? {
+    return onlineComposition(snapshotRoot, profileEntries, factoryBundles)?.entries
   }
 
-  private data class OnlineComposition(val entries: Set<HardEntry>, val profileEntries: Set<HardEntry>)
+  private data class OnlineComposition(val entries: Set<HardEntry>, val profileEntries: Set<HardEntry>, val factoryBundles: Set<FactoryBundle>)
 
-  private fun onlineComposition(snapshotRoot: File, profileEntries: Set<HardEntry>): OnlineComposition? {
+  private fun onlineComposition(snapshotRoot: File, profileEntries: Set<HardEntry>, embeddedFactoryBundles: Set<FactoryBundle>?): OnlineComposition? {
     if (profileEntries.isEmpty() || profileEntries.any { it.id.isNullOrBlank() || it.name.isBlank() }) return null
     val profiles = LinkedHashSet<HardEntry>().apply { addAll(profileEntries) }
     val archiveHome = File(snapshotRoot, "home")
     val archivedProfile = File(snapshotRoot, "home/.dsh/profiles/web/cordis.patch.yml")
+    val profilePackage = File(snapshotRoot, "home/.dsh/profiles/web/package.json")
     val homePresent = Files.exists(archiveHome.toPath(), java.nio.file.LinkOption.NOFOLLOW_LINKS)
     if (homePresent) {
       if (!Files.isDirectory(archiveHome.toPath(), java.nio.file.LinkOption.NOFOLLOW_LINKS)) return null
@@ -576,6 +753,20 @@ object PluginMounts {
       val parsed = strictEntryIdentities(try { archivedProfile.readText() } catch (_: Throwable) { return null }) ?: return null
       if (!mergeHardEntries(profiles, parsed)) return null
     }
+    // Complete archives own their profile selection. usr-only archives can only inherit the
+    // selected names from the APK's verified manifest; package identity and patch bytes are always
+    // recomputed from this freshly verified stage.
+    val selectedBundleNames = if (homePresent) {
+      val packageExists = Files.exists(profilePackage.toPath(), java.nio.file.LinkOption.NOFOLLOW_LINKS)
+      if (!packageExists) embeddedFactoryBundles?.map { it.name }?.toSet() ?: return null
+      else {
+        if (!profilePackage.isFile || Files.isSymbolicLink(profilePackage.toPath())) return null
+        selectedFactoryBundleNames(try { JSONObject(profilePackage.readText()) } catch (_: Throwable) { return null }) ?: return null
+      }
+    } else {
+      embeddedFactoryBundles?.map { it.name }?.toSet() ?: return null
+    }
+    val bundles = resolveFactoryBundles(snapshotRoot, selectedBundleNames, if (homePresent) File(snapshotRoot, "home/.dsh/profiles/web/node_modules") else null) ?: return null
     val merged = LinkedHashSet<HardEntry>().apply { addAll(profiles) }
     val inputs = listOf(
       File(snapshotRoot, "usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-base/cordis.patch.yml"),
@@ -589,7 +780,231 @@ object PluginMounts {
       }
     } catch (_: Throwable) { return null }
     if (merged.isEmpty()) return null
-    return OnlineComposition(merged, profiles)
+    return OnlineComposition(merged, profiles, bundles)
+  }
+
+  private fun selectedFactoryBundleNames(profile: JSONObject): Set<String>? {
+    val selected = profile.optJSONObject("dsh")?.optJSONObject("profile")?.optJSONArray("bundles") ?: return null
+    val names = LinkedHashSet<String>()
+    for (i in 0 until selected.length()) {
+      val name = selected.opt(i) as? String ?: return null
+      if (name.isBlank() || name.startsWith("/") || name.contains('\\') || name.split('/').any { it == ".." || it.isEmpty() }) return null
+      if (!names.add(name)) return null
+    }
+    return names
+  }
+
+  private fun resolveFactoryBundles(snapshotRoot: File, selected: Set<String>, profileModules: File? = null): Set<FactoryBundle>? {
+    val root = File(snapshotRoot, "usr/lib/node_modules/@deepseek-ai/dsh/node_modules")
+    val resolved = resolveBundleLayers(root, selected.toList(), profileModules, allowContainedSymlinks = false) ?: return null
+    return resolved.mapTo(LinkedHashSet()) { it.identity }
+  }
+
+  private data class ResolvedBundleLayer(
+    val identity: FactoryBundle,
+    val packageDir: File,
+    val patchBytes: List<Pair<String, ByteArray>>,
+  )
+
+  /** Resolve exactly like rc2: install node_modules first, then profile node_modules. */
+  private fun resolveBundleLayers(
+    installModules: File,
+    selected: List<String>,
+    profileModules: File?,
+    allowContainedSymlinks: Boolean,
+  ): List<ResolvedBundleLayer>? {
+    val result = ArrayList<ResolvedBundleLayer>(selected.size)
+    for (name in selected) {
+      if (!validPackageName(name)) return null
+      var resolvedPackageDir: File? = null
+      for (candidateRoot in listOfNotNull(installModules, profileModules)) {
+        val candidate = File(candidateRoot, name)
+        val packageManifest = File(candidate, "package.json")
+        if (!packageManifest.isFile) {
+          if (!allowContainedSymlinks && hasSymlinkWithin(candidateRoot, packageManifest)) return null
+          continue
+        }
+        if (allowContainedSymlinks) {
+          if (!isCanonicalContained(candidateRoot, packageManifest)) return null
+        } else if (hasSymlinkWithin(candidateRoot, packageManifest) || !isRegularContained(candidateRoot, packageManifest)) return null
+        resolvedPackageDir = try { candidate.canonicalFile } catch (_: Throwable) { return null }
+        break
+      }
+      val packageDir = resolvedPackageDir ?: return null
+      val packageFile = File(packageDir, "package.json")
+      val pkg = try { JSONObject(packageFile.readText()) } catch (_: Throwable) { return null }
+      val version = pkg.optString("version", "").trim()
+      if (pkg.optString("name", "") != name || version.isEmpty()) return null
+      val bundle = pkg.optJSONObject("dsh")?.optJSONObject("bundle") ?: return null
+      val declared = bundle.opt("patch")
+      val paths = when (declared) {
+        is String -> listOf(declared)
+        is JSONArray -> (0 until declared.length()).map { declared.opt(it) as? String ?: return null }
+        else -> return null
+      }
+      if (paths.isEmpty() || paths.any { it.isEmpty() || it.startsWith("/") || it.contains('\\') || it.contains('\u0000') || it.split('/').any { part -> part == ".." } }) return null
+      val patchBytes = ArrayList<Pair<String, ByteArray>>(paths.size)
+      val digest = MessageDigest.getInstance("SHA-256")
+      digest.update("DSHBNDL1".toByteArray(Charsets.US_ASCII))
+      for (relative in paths) {
+        val relBytes = relative.toByteArray(Charsets.UTF_8)
+        val patch = File(packageDir, relative)
+        if (!patch.isFile) return null
+        if (allowContainedSymlinks) {
+          if (!isCanonicalContained(packageDir, patch)) return null
+        } else if (hasSymlinkWithin(packageDir, patch) || !isRegularContained(packageDir, patch)) return null
+        val bytes = try { patch.readBytes() } catch (_: Throwable) { return null }
+        digest.update(java.nio.ByteBuffer.allocate(4).putInt(relBytes.size).array())
+        digest.update(relBytes)
+        digest.update(java.nio.ByteBuffer.allocate(8).putLong(bytes.size.toLong()).array())
+        digest.update(bytes)
+        patchBytes += relative to bytes
+      }
+      val hash = digest.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
+      result += ResolvedBundleLayer(FactoryBundle(name, version, hash), packageDir, patchBytes)
+    }
+    return result
+  }
+
+  private fun validPackageName(name: String): Boolean = name.isNotBlank() && !name.startsWith("/") &&
+    !name.contains('\\') && !name.contains('\u0000') && name.split('/').none { it.isEmpty() || it == "." || it == ".." }
+
+  private fun isCanonicalContained(root: File, target: File): Boolean {
+    val canonicalRoot = try { root.canonicalFile.toPath() } catch (_: Throwable) { return false }
+    val canonicalTarget = try { target.canonicalFile.toPath() } catch (_: Throwable) { return false }
+    return canonicalTarget.startsWith(canonicalRoot)
+  }
+
+  internal data class CompositionSnapshot(
+    val digest: String,
+    val entries: Set<HardEntry>,
+    val profileInsertEntries: List<HardEntry>,
+    val homeInsertEntries: List<HardEntry>,
+    val bundles: List<Pair<FactoryBundle, List<HardEntry>>>,
+    val homePatch: File,
+  )
+
+  /** Build the digest and identities of the exact rc2 profile composition from live package files. */
+  internal fun compositionSnapshot(patch: File, installModules: File): CompositionSnapshot? {
+    if (!patch.isFile || Files.isSymbolicLink(patch.toPath())) return null
+    val profileDir = patch.parentFile ?: return null
+    val dshDir = profileDir.parentFile?.parentFile ?: return null
+    val homePatch = File(dshDir, "cordis.patch.yml")
+    if (Files.isSymbolicLink(homePatch.toPath()) || (homePatch.exists() && !homePatch.isFile)) return null
+    val homeBytes = if (homePatch.exists()) try { homePatch.readBytes() } catch (_: Throwable) { return null } else null
+    val packageFile = File(profileDir, "package.json")
+    if (!packageFile.isFile || Files.isSymbolicLink(packageFile.toPath()) || hasSymlinkWithin(profileDir, packageFile)) return null
+    val profile = try { JSONObject(packageFile.readText()) } catch (_: Throwable) { return null }
+    val dsh = if (!profile.has("dsh") || profile.isNull("dsh")) JSONObject() else profile.optJSONObject("dsh") ?: return null
+    val profileConfig = if (!dsh.has("profile") || dsh.isNull("profile")) JSONObject() else dsh.optJSONObject("profile") ?: return null
+    val selected = if (!profileConfig.has("bundles") || profileConfig.isNull("bundles")) emptyList() else {
+      val array = profileConfig.optJSONArray("bundles") ?: return null
+      (0 until array.length()).map { index ->
+        val name = array.opt(index) as? String ?: return null
+        if (!validPackageName(name)) return null
+        name
+      }
+    }
+    val resolved = resolveBundleLayers(installModules, selected, File(profileDir, "node_modules"), allowContainedSymlinks = true) ?: return null
+    val profileBytes = try { patch.readBytes() } catch (_: Throwable) { return null }
+    val profileText = strictUtf8(profileBytes) ?: return null
+    val profileInsertEntries = insertEntryIdentities(profileText)
+    val homeText = homeBytes?.let { strictUtf8(it) ?: return null }
+    val homeInsertEntries = homeText?.let(::insertEntryIdentities) ?: emptyList()
+    val entries = LinkedHashSet<HardEntry>().apply {
+      addAll(entryIdentities(profileText))
+      if (homeText != null) addAll(entryIdentities(homeText))
+    }
+    val bundleEntries = ArrayList<Pair<FactoryBundle, List<HardEntry>>>(resolved.size)
+    for (layer in resolved) {
+      val identities = ArrayList<HardEntry>()
+      for ((_, bytes) in layer.patchBytes) {
+        val text = strictUtf8(bytes) ?: return null
+        identities.addAll(insertEntryIdentities(text))
+        entries.addAll(entryIdentities(text))
+      }
+      bundleEntries += layer.identity to identities
+    }
+    val md = MessageDigest.getInstance("SHA-256")
+    md.update("DSHCOMP2".toByteArray(Charsets.US_ASCII))
+    md.update(java.nio.ByteBuffer.allocate(4).putInt(resolved.size).array())
+    for (layer in resolved) {
+      updateLengthFrame(md, layer.identity.name.toByteArray(Charsets.UTF_8))
+      updateLengthFrame(md, layer.identity.version.toByteArray(Charsets.UTF_8))
+      md.update(hexBytes(layer.identity.patchSha256) ?: return null)
+    }
+    updateLengthFrame(md, profileBytes)
+    md.update(if (homeBytes == null) 0.toByte() else 1.toByte())
+    if (homeBytes != null) updateLengthFrame(md, homeBytes)
+    val digest = md.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
+    return CompositionSnapshot(digest, entries, profileInsertEntries, homeInsertEntries, bundleEntries, homePatch)
+  }
+
+  private fun insertEntryIdentities(text: String): List<HardEntry> {
+    val lines = text.split("\n")
+    val insertBlocks = ArrayList<String>()
+    var index = 0
+    while (index < lines.size) {
+      if (!TOP_ITEM.containsMatchIn(lines[index])) { index++; continue }
+      val start = index
+      index++
+      while (index < lines.size && !TOP_ITEM.containsMatchIn(lines[index])) index++
+      if (TOP_INSERT.matches(lines[start].trimEnd('\r'))) insertBlocks += lines.subList(start, index).joinToString("\n")
+    }
+    return parseEntryNames(insertBlocks.joinToString("\n")).mapNotNull { (id, name) ->
+      if (id.isNullOrBlank() || name.isNullOrBlank()) null else HardEntry(id, name)
+    }
+  }
+
+  private fun updateLengthFrame(md: MessageDigest, bytes: ByteArray) {
+    md.update(java.nio.ByteBuffer.allocate(8).putLong(bytes.size.toLong()).array())
+    md.update(bytes)
+  }
+
+  private fun hexBytes(value: String): ByteArray? {
+    if (!value.matches(Regex("[0-9a-f]{64}"))) return null
+    return try { ByteArray(32) { index -> value.substring(index * 2, index * 2 + 2).toInt(16).toByte() } } catch (_: Throwable) { null }
+  }
+
+  private fun strictUtf8(bytes: ByteArray): String? = try {
+    Charsets.UTF_8.newDecoder()
+      .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+      .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+      .decode(java.nio.ByteBuffer.wrap(bytes)).toString()
+  } catch (_: Throwable) { null }
+
+  private fun liveComposition(context: Context, patch: File): CompositionSnapshot? = compositionSnapshot(
+    patch,
+    File(context.filesDir, "usr/lib/node_modules/@deepseek-ai/dsh/node_modules"),
+  )
+
+  internal fun onlineFactoryBundles(snapshotRoot: File, selected: Set<String>, profileModules: File? = null): Set<FactoryBundle>? =
+    resolveFactoryBundles(snapshotRoot, selected, profileModules)
+
+  private fun isRegularContained(root: File, target: File): Boolean {
+    val canonicalRoot = try { root.canonicalFile.toPath() } catch (_: Throwable) { return false }
+    val canonicalTarget = try { target.canonicalFile.toPath() } catch (_: Throwable) { return false }
+    if (!canonicalTarget.startsWith(canonicalRoot)) return false
+    var current: File? = target
+    while (current != null && current.toPath().startsWith(root.toPath())) {
+      if (Files.isSymbolicLink(current.toPath())) return false
+      if (current == root) break
+      current = current.parentFile
+    }
+    return current == root
+  }
+
+  private fun hasSymlinkWithin(root: File, target: File): Boolean {
+    val rootPath = root.toPath().normalize()
+    val targetPath = target.toPath().normalize()
+    if (!targetPath.startsWith(rootPath)) return true
+    var current = rootPath
+    if (Files.isSymbolicLink(current)) return true
+    for (part in rootPath.relativize(targetPath)) {
+      current = current.resolve(part)
+      if (Files.isSymbolicLink(current)) return true
+    }
+    return false
   }
 
   private fun strictEntryIdentities(text: String): Set<HardEntry>? {
@@ -612,6 +1027,8 @@ object PluginMounts {
     val archive = normalizeFingerprint(manifest.fingerprint) ?: return false
     val base = normalizeFingerprint(manifest.baseFingerprint) ?: return false
     if (manifest.entries.isEmpty() || manifest.entries.any { it.id.isNullOrBlank() || it.name.isBlank() }) return false
+    val factoryBundles = manifest.factoryBundles ?: return false
+    if (factoryBundles.any { it.name.isBlank() || it.version.isBlank() || !it.patchSha256.matches(Regex("[0-9a-f]{64}")) } || factoryBundles.map { it.name }.distinct().size != factoryBundles.size) return false
     val rows = JSONArray(manifest.entries.sortedWith(compareBy({ it.name }, { it.id ?: "" })).map {
       JSONObject().put("id", it.id).put("name", it.name)
     })
@@ -620,6 +1037,9 @@ object PluginMounts {
       .put("baseFingerprint", base).put("entries", rows)
       .put("profileEntries", JSONArray(manifest.profileEntries.sortedWith(compareBy({ it.name }, { it.id ?: "" })).map {
         JSONObject().put("id", it.id).put("name", it.name)
+      }))
+      .put("factoryBundles", JSONArray(factoryBundles.sortedBy { it.name }.map {
+        JSONObject().put("name", it.name).put("version", it.version).put("patchSha256", it.patchSha256)
       }))
       .put("names", JSONArray(manifest.entries.map { it.name }.distinct().sorted()))
     return try {
@@ -654,7 +1074,8 @@ object PluginMounts {
       if (!profileEntries.add(HardEntry(id, name))) return null
     }
     if (profileEntries.isEmpty() || !entries.containsAll(profileEntries)) return null
-    return HardManifest(archive, entries, base, profileEntries)
+    val factoryBundles = if (json.has("factoryBundles")) readFactoryBundles(json) ?: return null else null
+    return HardManifest(archive, entries, base, profileEntries, factoryBundles)
   }
 
   private fun onlineHardFile(context: Context, archive: String) =
@@ -685,7 +1106,25 @@ object PluginMounts {
       if (!profileEntries.add(HardEntry(id, name))) return null
     }
     if (profileEntries.isEmpty() || !entries.containsAll(profileEntries)) return null
-    return HardManifest(fingerprint, entries, profileEntries = profileEntries)
+    val factoryBundles = if (json.has("factoryBundles")) readFactoryBundles(json) ?: return null else null
+    return HardManifest(fingerprint, entries, profileEntries = profileEntries, factoryBundles = factoryBundles)
+  }
+
+  /** Missing remains inconclusive for legacy schema-2 assets; present [] is authoritative empty. */
+  private fun readFactoryBundles(json: JSONObject): Set<FactoryBundle>? {
+    if (!json.has("factoryBundles")) return null
+    val rows = json.optJSONArray("factoryBundles") ?: return null
+    val result = LinkedHashSet<FactoryBundle>()
+    val names = HashSet<String>()
+    for (i in 0 until rows.length()) {
+      val row = rows.optJSONObject(i) ?: return null
+      val name = row.optString("name", "").trim()
+      val version = row.optString("version", "").trim()
+      val hash = row.optString("patchSha256", "").lowercase(java.util.Locale.ROOT)
+      if (name.isEmpty() || version.isEmpty() || !hash.matches(Regex("[0-9a-f]{64}")) || !names.add(name)) return null
+      if (!result.add(FactoryBundle(name, version, hash))) return null
+    }
+    return result
   }
 
   /** Selects only transaction-authorized online manifests; interrupted swaps are inconclusive. */
@@ -784,7 +1223,10 @@ object PluginMounts {
   /** Per-entry lifecycle is derived from the stable identity list plus effective disabled overrides. */
   fun softEntryStates(context: Context, patch: File): List<SoftEntryStatus> {
     val text = try { patch.readText() } catch (_: Throwable) { return emptyList() }
+    val composition = liveComposition(context, patch)
+    val composedEntries = composition?.entries ?: entryIdentities(text)
     val lines = text.split("\n")
+    val homeLines = composition?.homePatch?.takeIf { it.isFile }?.let { runCatching { it.readText().split("\n") }.getOrNull() }.orEmpty()
     val stable = softFile(context).takeIf { it.isFile }?.let { file ->
       try {
         val rows = JSONObject(file.readText()).optJSONArray("stableEntries") ?: return@let emptySet()
@@ -795,9 +1237,12 @@ object PluginMounts {
         }.toSet()
       } catch (_: Throwable) { emptySet() }
     } ?: emptySet()
-    return entryIdentities(text).map { entry ->
-      val isQuarantined = hasQuarantineOverride(lines, entry.id!!, entry.name)
-      val isDisabled = !isQuarantined && (hasDisabledOverride(lines, entry.id, entry.name) || hasDisabledInsertEntry(lines, entry.id, entry.name))
+    return composedEntries.map { entry ->
+      val isQuarantined = hasQuarantineOverride(lines, entry.id!!, entry.name) || hasQuarantineOverride(homeLines, entry.id, entry.name)
+      val isDisabled = !isQuarantined && (
+        hasDisabledOverride(lines, entry.id, entry.name) || hasDisabledInsertEntry(lines, entry.id, entry.name) ||
+          hasDisabledOverride(homeLines, entry.id, entry.name) || hasDisabledInsertEntry(homeLines, entry.id, entry.name)
+        )
       val state = classifySoftEntry(entry, stable, isDisabled, isQuarantined)
       SoftEntryStatus(entry.id, entry.name, state)
     }.sortedWith(compareBy({ it.name }, { it.id }))
@@ -856,11 +1301,11 @@ object PluginMounts {
     now: Long = System.currentTimeMillis(),
   ): Boolean {
     if (!completeHealth || bootIdentity <= 0L) return false
-    val text = try { patch.readText() } catch (_: Throwable) { return false }
-    val d = digest(text)
+    val composition = liveComposition(context, patch) ?: return false
+    val d = composition.digest
     val file = softFile(context)
     val state = try { JSONObject(file.readText()) } catch (_: Throwable) { JSONObject() }
-    val transition = softHealthTransition(state, d, entryIdentities(text), bootIdentity, now)
+    val transition = softHealthTransition(state, d, composition.entries, bootIdentity, now)
       ?: return false
     return try {
       writeJsonAtomically(file, transition.state)
@@ -905,10 +1350,19 @@ object PluginMounts {
   /** Rate-limit complete health RPCs to one attempt per launch and at most once/minute on that launch. */
   fun shouldProbeHealth(context: Context, patch: File, bootIdentity: Long, now: Long = System.currentTimeMillis()): Boolean {
     if (bootIdentity <= 0L) return false
-    val text = try { patch.readText() } catch (_: Throwable) { return false }
-    val d = digest(text)
     val f = softFile(context)
     val state = try { JSONObject(f.readText()) } catch (_: Throwable) { JSONObject() }
+    val composition = liveComposition(context, patch)
+    if (composition == null) {
+      // Unknown composition still deserves one diagnostic health probe per launch; noteHealthy
+      // refuses to promote it because it cannot bind that health to exact composition bytes.
+      val unknown = "inconclusive-composition"
+      if (state.optString("lastProbeDigest") == unknown && state.optLong("lastProbeBoot") == bootIdentity &&
+        now - state.optLong("lastProbeAt") < HEALTH_RETRY_MS) return false
+      state.put("lastProbeDigest", unknown).put("lastProbeBoot", bootIdentity).put("lastProbeAt", now)
+      return try { writeJsonAtomically(f, state); true } catch (_: Throwable) { false }
+    }
+    val d = composition.digest
     if (state.optString("stableDigest") == d) return false
     if (state.optString("lastProbeDigest") == d && state.optLong("lastProbeBoot") == bootIdentity &&
       now - state.optLong("lastProbeAt") < HEALTH_RETRY_MS) return false
@@ -942,8 +1396,8 @@ object PluginMounts {
   /** 挂载清单是否与软清单一致（一致 = 这次的故障不是插件清单变化引起的）。 */
   fun mountUnchangedSinceHealthy(context: Context, patch: File): Boolean {
     val recorded = softDigest(context) ?: return false
-    val text = try { patch.readText() } catch (_: Throwable) { return false }
-    return digest(text) == recorded
+    val composition = liveComposition(context, patch) ?: return false
+    return composition.digest == recorded
   }
 
   /**
@@ -952,11 +1406,20 @@ object PluginMounts {
    * @return true = 已隔离或原已禁用；false = 未能唯一定位/不属于insert条目/写回失败。
    */
   fun pull(context: Context, patch: File, failed: FailedEntry): Boolean {
-    val text = try { patch.readText() } catch (_: Throwable) { return false }
-    val next = quarantineEntry(text, failed) ?: return false
+    val hard = ensureHard(context, currentFingerprint(context)) ?: return false
+    return pullWithManifest(context, patch, failed, hard)
+  }
+
+  /** Shared executor after the caller has obtained an authoritative manifest. */
+  internal fun pullWithManifest(context: Context, patch: File, failed: FailedEntry, hard: HardManifest): Boolean {
+    if (!validHardForMutation(hard)) return false
+    val composition = liveComposition(context, patch) ?: return false
+    val target = composition.homePatch
+    val text = if (target.exists()) try { target.readText() } catch (_: Throwable) { return false } else ""
+    val next = quarantineCompositionEntry(failed, composition, hard) ?: return false
     if (next == text) return true
     return try {
-      writeTextAtomically(patch, next)
+      writeTextAtomically(target, next)
       true
     } catch (_: Throwable) {
       false
@@ -967,7 +1430,7 @@ object PluginMounts {
    * 外科拔除的**客户端点名**入口（CONTRACT §5）：语义与副作用必须与 [pull] 完全一致。
    *
    * 与 [pull] 的唯一区别是调用来源（页面契约行点名 ⇒ clientPullCandidate ⇒ 这里），而不是行为：
-   * 同样读盘 → [quarantineEntry] 保留原条目并追加禁用 override → 写回；无法安全定位 / 写回失败一律
+   * 同样读盘 → 重验当前 bundle/profile/HOME 的唯一 insert 来源，保留来源块并把禁用 override 原子追加到后置 HOME 层 → 写回；无法安全定位 / 写回失败一律
    * 返回 false 且**不落任何改动**。因此调用方可以照 [pull] 的既有方式判成败，不需要两套口径。
    *
    * 独立成入口（而不是让调用方直接调 [pull]）是为了把「页面侧点名」这条路固化成一个可被
@@ -977,6 +1440,14 @@ object PluginMounts {
    */
   fun pullByClientIds(context: Context, patch: File, failed: FailedEntry): Boolean =
     pull(context, patch, failed)
+
+  internal fun pullByClientIdsWithManifest(context: Context, patch: File, failed: FailedEntry, hard: HardManifest): Boolean =
+    pullWithManifest(context, patch, failed, hard)
+
+  private fun validHardForMutation(hard: HardManifest): Boolean =
+    normalizeFingerprint(hard.fingerprint) != null && hard.entries.isNotEmpty() && hard.profileEntries.isNotEmpty() &&
+      hard.entries.containsAll(hard.profileEntries) &&
+      hard.entries.all { !it.id.isNullOrBlank() && it.name.isNotBlank() }
 
   /** 引擎日志尾部 4KB（loader 失败原文只在这份日志里；与 `WatchdogV2` 同口径）。 */
   fun readEngineLogTail(context: Context, bytes: Int = 4096): String {

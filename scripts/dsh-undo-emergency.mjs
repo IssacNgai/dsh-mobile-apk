@@ -16,9 +16,10 @@
 // 安全边界：本工具只写配置文件与插件代码树（同快照范围），不触碰用户数据目录
 // （sessions/storages/凭据真实值）；敏感文件快照为脱敏副本，真实值在本机 vault 中，
 // 恢复时优先从 vault 取真实值（与插件 applySnapshot 语义一致），vault 缺失才写占位。
-import { readdirSync, readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, rmSync, cpSync, renameSync, realpathSync, lstatSync } from 'node:fs'
-import { join, basename, dirname, sep, resolve } from 'node:path'
+import { readdirSync, readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync, rmSync, cpSync, renameSync, realpathSync, lstatSync, openSync, closeSync, fstatSync, constants as fsConstants } from 'node:fs'
+import { join, basename, dirname, sep, resolve, relative, isAbsolute } from 'node:path'
 import { homedir } from 'node:os'
+import { createRequire } from 'node:module'
 import { createHash, randomBytes } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 
@@ -34,7 +35,10 @@ function selectHardOwnershipManifest(filesRoot) {
     value.entries.every((entry) => entry && typeof entry.id === 'string' && entry.id.length > 0 && typeof entry.name === 'string' && entry.name.length > 0) &&
     Array.isArray(value.profileEntries) && value.profileEntries.length > 0 &&
     value.profileEntries.every((entry) => entry && typeof entry.id === 'string' && typeof entry.name === 'string' &&
-      value.entries.some((hard) => hard.id === entry.id && hard.name === entry.name))
+      value.entries.some((hard) => hard.id === entry.id && hard.name === entry.name)) &&
+    (value.factoryBundles === undefined || value.factoryBundles === null ||
+      (Array.isArray(value.factoryBundles) && value.factoryBundles.every((bundle) => bundle && typeof bundle.name === 'string' &&
+        typeof bundle.version === 'string' && /^[0-9a-f]{64}$/.test(bundle.patchSha256 ?? ''))))
   const cache = readJson(join(filesRoot, '.plugin-hard-manifest.json'))
   const installed = readFileSync(join(filesRoot, '.snapshot-fingerprint'), 'utf8').trim().toLowerCase()
   if (!valid(cache) || !/^[0-9a-f]{64}$/.test(installed)) throw new Error('ownership cache/fingerprint unavailable')
@@ -101,6 +105,23 @@ function storeDirs() {
   // 两种都存在时 scoped 优先（新布局），blobs 在各自根下
   if (scopedExists || !flat) return { root: scoped, blobs: join(scoped, 'blobs'), scoped: true }
   return { root: UNDO_ROOT, blobs: join(UNDO_ROOT, 'blobs'), scoped: false }
+}
+
+// Safe Mode alone shares the Android shell's flat web store by default. If an
+// older scoped marker exists, keep using the directory that owns that marker;
+// never merge two independent recovery authorities.
+function safeModeStoreRoot() {
+  if (process.env.DSH_UNDO_ROOT !== undefined || PROFILE !== 'web') return { root: storeDirs().root }
+  const flatAuto = join(UNDO_ROOT, 'auto')
+  const scopedAuto = join(UNDO_ROOT, 'web', 'auto')
+  const markerNames = ['safe-mode.json', 'safe-mode-state.json']
+  const hasMarker = (dir) => markerNames.some((name) => {
+    try { lstatSync(join(dir, name)); return true } catch { return false }
+  })
+  const flatHas = hasMarker(flatAuto)
+  const scopedHas = hasMarker(scopedAuto)
+  if (flatHas && scopedHas) return { error: `安全模式状态冲突：${flatAuto} 与 ${scopedAuto} 都有状态文件；未读取或修改任何文件。` }
+  return { root: scopedHas ? join(UNDO_ROOT, 'web') : UNDO_ROOT }
 }
 
 function listSnapshots() {
@@ -249,6 +270,78 @@ function restoreLastGood({ pretend = false } = {}) {
 
 function sha256(bytes) { return createHash('sha256').update(bytes).digest('hex') }
 
+function safeModeBundlePatchSha(packageRoot, declared) {
+  const paths = typeof declared === 'string' ? [declared] : declared
+  if (!Array.isArray(paths) || paths.length === 0) throw new Error('bundle patch declaration missing')
+  const digest = createHash('sha256').update(Buffer.from('DSHBNDL1', 'ascii'))
+  const root = realpathSync(packageRoot)
+  for (const rel of paths) {
+    if (typeof rel !== 'string' || !rel || isAbsolute(rel) || rel.includes('\\') || rel.includes('\0') || rel.split('/').includes('..')) throw new Error('unsafe bundle patch path')
+    const target = resolve(root, rel)
+    const fromRoot = relative(root, target)
+    if (!fromRoot || fromRoot.startsWith(`..${sep}`) || fromRoot === '..') throw new Error('bundle patch escapes package')
+    let cursor = root
+    for (const segment of fromRoot.split(sep)) {
+      cursor = join(cursor, segment)
+      const info = lstatSync(cursor)
+      if (info.isSymbolicLink() || (cursor === target ? !info.isFile() : !info.isDirectory())) throw new Error('bundle patch path is not regular')
+    }
+    const pathBytes = Buffer.from(rel, 'utf8')
+    const patchBytes = readFileSync(target)
+    const pathLength = Buffer.alloc(4); pathLength.writeUInt32BE(pathBytes.length)
+    const contentLength = Buffer.alloc(8); contentLength.writeBigUInt64BE(BigInt(patchBytes.length))
+    digest.update(pathLength).update(pathBytes).update(contentLength).update(patchBytes)
+  }
+  return digest.digest('hex')
+}
+
+function safeModeResolveBundle(name) {
+  for (const anchor of [PROFILE_ROOT, DSH_HOME]) {
+    const req = createRequire(join(anchor, 'package.json'))
+    for (const search of req.resolve.paths(name) ?? []) {
+      const packageRoot = join(search, name)
+      try {
+        const packagePath = join(packageRoot, 'package.json')
+        const info = lstatSync(packagePath)
+        if (!info.isFile() || info.isSymbolicLink()) continue
+        const packageInfo = JSON.parse(readFileSync(packagePath, 'utf8'))
+        if (packageInfo.name !== name || typeof packageInfo.version !== 'string') continue
+        return { packageInfo, packageRoot: realpathSync(packageRoot) }
+      } catch { /* try next resolution root */ }
+    }
+  }
+  return null
+}
+
+function safeModeSelectFactoryBundles(packageText, trustedBundles) {
+  const packageInfo = JSON.parse(packageText)
+  const nested = packageInfo.dsh?.profile && Object.hasOwn(packageInfo.dsh.profile, 'bundles')
+  const dotted = Object.hasOwn(packageInfo, 'dsh.profile.bundles')
+  const source = nested ? packageInfo.dsh.profile.bundles : dotted ? packageInfo['dsh.profile.bundles'] : undefined
+  if (source === undefined) return { bytes: null, removed: [] }
+  if (!Array.isArray(source)) throw new Error('profile bundles must be an array')
+  if (source.length === 0) return { bytes: null, removed: [] }
+  if (!Array.isArray(trustedBundles)) throw new Error('factory bundle identities unavailable for active profile bundles')
+  const trusted = new Map(trustedBundles.map((entry) => [entry.name, entry]))
+  const kept = [], removed = []
+  for (const value of source) {
+    if (typeof value !== 'string') { removed.push(String(value)); continue }
+    const expected = trusted.get(value)
+    const resolved = safeModeResolveBundle(value)
+    let matches = false
+    if (expected && resolved && resolved.packageInfo.version === expected.version) {
+      const digest = safeModeBundlePatchSha(resolved.packageRoot, resolved.packageInfo.dsh?.bundle?.patch)
+      matches = digest === expected.patchSha256
+    }
+    if (matches) kept.push(value)
+    else removed.push(value)
+  }
+  if (kept.length === source.length && kept.every((value, i) => value === source[i])) return { bytes: null, removed }
+  if (nested) packageInfo.dsh.profile.bundles = kept
+  else packageInfo['dsh.profile.bundles'] = kept
+  return { bytes: Buffer.from(JSON.stringify(packageInfo, null, 2) + '\n', 'utf8'), removed }
+}
+
 function safeModeAtomicWrite(target, bytes) {
   mkdirSync(dirname(target), { recursive: true })
   const tmp = `${target}.safe-mode-${randomBytes(6).toString('hex')}.tmp`
@@ -260,18 +353,19 @@ function safeModeAtomicWrite(target, bytes) {
   }
 }
 
-function safeModeBackup(autoDir, value, id, prefix) {
+function safeModeBackup(autoDir, value, id, prefix, suffix = '.yml') {
   if (typeof value !== 'string' || value === '') return null
   try {
     const root = realpathSync(autoDir)
     const candidate = resolve(value)
-    const expectedName = `${prefix}${id}.yml`
+    const expectedName = `${prefix}${id}${suffix}`
     if (basename(candidate) !== expectedName || realpathSync(dirname(candidate)) !== root) return null
     // Permit a symlink alias for autoDir's parent; never follow a symlink backup.
-    const info = lstatSync(candidate)
-    if (!info.isFile() || info.isSymbolicLink()) return null
     const canonical = join(root, expectedName)
-    if (realpathSync(candidate) !== canonical) return null
+    try {
+      const info = lstatSync(candidate)
+      if (!info.isFile() || info.isSymbolicLink() || realpathSync(candidate) !== canonical) return null
+    } catch (error) { if (error?.code !== 'ENOENT') return null }
     return canonical
   } catch { return null }
 }
@@ -284,36 +378,105 @@ function safeModeVerifyBackup(path, expectedSha) {
   } catch { return false }
 }
 
+// Shared Safe Mode recovery contract with the vendor transaction snippet:
+// sibling directory + SHA-256 object name + legacy digest-less primary fallback.
+function safeModeReadRegular(path) {
+  let fd
+  try {
+    fd = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0))
+    if (!fstatSync(fd).isFile()) return null
+    return readFileSync(fd)
+  } catch { return null } finally { if (fd !== undefined) closeSync(fd) }
+}
+
+function safeModeEntryExists(path) { try { lstatSync(path); return true } catch { return false } }
+function safeModeRecoveryObjectName(sha) {
+  return typeof sha === 'string' && /^[0-9a-f]{64}$/.test(sha) ? `safe-mode-${sha}.yml` : null;
+}
+
+function safeModeRecoveryPath(autoDir, sha, create = false) {
+  const objectName = safeModeRecoveryObjectName(sha)
+  if (!objectName) return null
+  try {
+    const root = realpathSync(dirname(autoDir))
+    const dir = join(root, 'safe-mode-recovery')
+    if (create) mkdirSync(dir, { recursive: true })
+    const info = lstatSync(dir)
+    if (!info.isDirectory() || info.isSymbolicLink() || realpathSync(dir) !== dir) return null
+    return join(dir, objectName)
+  } catch { return null }
+}
+
+function safeModeEnsureRecovery(autoDir, bytes, sha, atomicWrite) {
+  const target = safeModeRecoveryPath(autoDir, sha, true)
+  if (!target) throw new Error('invalid recovery directory or digest')
+  const existing = safeModeReadRegular(target)
+  if (!existing || sha256(existing) !== sha) atomicWrite(target, bytes)
+  const verified = safeModeReadRegular(target)
+  if (!verified || !verified.equals(bytes)) throw new Error('recovery copy verification failed')
+}
+
+function safeModeLoadBackup(autoDir, primary, expectedSha) {
+  if (!primary) return null
+  const primaryBytes = safeModeReadRegular(primary)
+  if (primaryBytes && (typeof expectedSha !== 'string' || expectedSha === '' || sha256(primaryBytes) === expectedSha)) return primaryBytes
+  if (typeof expectedSha !== 'string' || expectedSha === '') return null
+  const copy = safeModeReadRegular(safeModeRecoveryPath(autoDir, expectedSha))
+  return copy && sha256(copy) === expectedSha ? copy : null
+}
+
 export function safeMode(action, { atomicWrite = safeModeAtomicWrite } = {}) {
-  const { root } = storeDirs()
+  const selected = safeModeStoreRoot()
+  if (selected.error) { console.error(selected.error); return false }
+  const { root } = selected
   const autoDir = join(root, 'auto')
   // 与插件一致的状态文件名（v0.3 插件用 safe-mode.json；旧急救 CLI 误用
   // safe-mode-state.json 造成两侧状态互相不可见）
   const stateFile = join(autoDir, 'safe-mode.json')
+  const legacy = join(autoDir, 'safe-mode-state.json')
   const patch = join(PROFILE_ROOT, 'cordis.patch.yml')
   const homePatch = join(DSH_HOME, 'cordis.patch.yml')
   const id = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14) + '-' + Math.random().toString(16).slice(2, 6)
+  for (const marker of [stateFile, legacy]) {
+    if (!safeModeEntryExists(marker)) continue
+    try { const info = lstatSync(marker); if (!info.isFile() || info.isSymbolicLink()) throw new Error('not a regular file') }
+    catch (error) { console.error(`安全模式状态不是安全的普通文件：${marker}；拒绝操作：${error.message}`); return false }
+  }
+  if (safeModeEntryExists(legacy)) {
+    if (safeModeEntryExists(stateFile)) {
+      console.error('安全模式同时存在新旧状态文件，拒绝猜测恢复来源')
+      return false
+    }
+    try {
+      const bytes = readFileSync(legacy)
+      JSON.parse(bytes.toString('utf8'))
+      atomicWrite(stateFile, bytes)
+      rmSync(legacy)
+    } catch (error) {
+      console.error(`旧安全模式状态无法安全迁移，保留原状态并拒绝操作：${error.message}`)
+      return false
+    }
+  }
   if (action === 'on') {
     mkdirSync(autoDir, { recursive: true })
-    // 兼容旧急救 CLI 写的 safe-mode-state.json：迁移后仍按 active 状态幂等处理。
-    const legacy = join(autoDir, 'safe-mode-state.json')
-    if (existsSync(legacy) && !existsSync(stateFile)) {
-      try { copyFileSync(legacy, stateFile) } catch { /* 保留旧 marker 并拒绝下方写入 */ }
-    }
-    if (existsSync(stateFile)) {
+    if (safeModeEntryExists(stateFile)) {
       try {
         const prev = JSON.parse(readFileSync(stateFile, 'utf8'))
+        if (prev.profile && prev.profile !== PROFILE) {
+          console.error(`安全模式状态属于 profile ${prev.profile}，当前是 ${PROFILE}；拒绝处理`)
+          return false
+        }
         if (prev?.active) { console.log('安全模式已在开启状态'); return true }
       } catch {
         console.error('安全模式状态文件损坏，已拒绝覆盖；请先恢复状态文件')
         return false
       }
     }
-    let hardEntries
+    let hardEntries, ownershipManifest
     try {
       const filesRoot = dirname(dirname(DSH_HOME))
-      const manifest = selectHardOwnershipManifest(filesRoot)
-      hardEntries = manifest.entries
+      ownershipManifest = selectHardOwnershipManifest(filesRoot)
+      hardEntries = ownershipManifest.entries
     } catch {
       console.error('安全模式未生效：本版本插件归属清单缺失或损坏，无法安全区分产品插件与用户插件；原配置未改动。')
       return false
@@ -321,15 +484,39 @@ export function safeMode(action, { atomicWrite = safeModeAtomicWrite } = {}) {
     const backup = join(autoDir, `safe-mode-backup-${id}.yml`)
     const homeBackup = join(autoDir, `safe-mode-home-backup-${id}.yml`)
     // 先做变更前建档（等价 Windows 版 pre-snapshot）。快照失败时原配置仍未动。
-    createManifestSnapshot('safe-mode-before')
+    createManifestSnapshot('safe-mode-before', root)
     const patchBytes = existsSync(patch) ? readFileSync(patch) : Buffer.from('[]\n')
-    atomicWrite(backup, patchBytes)
     const homeExisted = existsSync(homePatch)
     const homeBytes = homeExisted ? readFileSync(homePatch) : null
-    if (homeBytes) atomicWrite(homeBackup, homeBytes)
-    if (!safeModeVerifyBackup(backup, sha256(patchBytes)) ||
-      (homeBytes && !safeModeVerifyBackup(homeBackup, sha256(homeBytes)))) {
-      console.log('安全模式备份校验失败，拒绝进入；原配置未改动')
+    const pkgPath = join(PROFILE_ROOT, 'package.json')
+    const pkgBytes = existsSync(pkgPath) ? readFileSync(pkgPath) : null
+    const pkgBackup = join(autoDir, `safe-mode-pkg-${id}.json`)
+    let pkgSafeBytes = null, removedBundles = []
+    if (pkgBytes) {
+      try {
+        const selectedBundles = safeModeSelectFactoryBundles(pkgBytes.toString('utf8'), ownershipManifest.factoryBundles)
+        pkgSafeBytes = selectedBundles.bytes
+        removedBundles = selectedBundles.removed
+      } catch (error) {
+        console.error(`安全模式未生效：package.json bundles 无法由本版本工厂身份安全筛选（${error.message}）；未改动 live 文件。`)
+        return false
+      }
+    }
+    try {
+      atomicWrite(backup, patchBytes)
+      if (homeBytes) atomicWrite(homeBackup, homeBytes)
+      if (pkgBytes) atomicWrite(pkgBackup, pkgBytes)
+      safeModeEnsureRecovery(autoDir, patchBytes, sha256(patchBytes), atomicWrite)
+      if (homeBytes) safeModeEnsureRecovery(autoDir, homeBytes, sha256(homeBytes), atomicWrite)
+      if (pkgBytes) safeModeEnsureRecovery(autoDir, pkgBytes, sha256(pkgBytes), atomicWrite)
+      if (!safeModeVerifyBackup(backup, sha256(patchBytes)) ||
+        (homeBytes && !safeModeVerifyBackup(homeBackup, sha256(homeBytes))) ||
+        (pkgBytes && !safeModeVerifyBackup(pkgBackup, sha256(pkgBytes)))) {
+        console.log('安全模式备份校验失败，拒绝进入；原配置未改动')
+        return false
+      }
+    } catch (error) {
+      console.error(`安全模式备份或恢复副本写入失败，拒绝进入且未写状态：${error.message}`)
       return false
     }
     // 与插件核心（core.mjs 的 undo-safe-align-S1）同口径：只摘第三方 insert 子条目，
@@ -371,41 +558,52 @@ export function safeMode(action, { atomicWrite = safeModeAtomicWrite } = {}) {
     const minimal = filterThirdPartyInserts(patchBytes.toString('utf8'), hardEntries)
     // Marker is the recovery authority. Persist it atomically before touching any live config.
     const state = {
-      active: true, enteredAt: new Date().toISOString(), backup, homeBackup,
+      active: true, profile: PROFILE, enteredAt: new Date().toISOString(), backup, homeBackup,
       snapshotId: id, homeExisted,
       backupSha256: sha256(patchBytes), homeBackupSha256: homeBytes ? sha256(homeBytes) : '',
+      pkgBackup: pkgBytes ? pkgBackup : undefined,
+      pkgBackupSha256: pkgBytes ? sha256(pkgBytes) : undefined,
     }
     try {
       atomicWrite(stateFile, Buffer.from(JSON.stringify(state, null, 2)))
       mkdirSync(PROFILE_ROOT, { recursive: true })
       atomicWrite(patch, Buffer.from(minimal))
       if (homeExisted) atomicWrite(homePatch, Buffer.from('# dsh-undo-savepoint SAFE MODE (home level)\n[]\n'))
+      if (pkgSafeBytes) atomicWrite(pkgPath, pkgSafeBytes)
     } catch (error) {
       console.error(`安全模式写入未完成；状态与备份已保留，可修复原因后重试 off：${error.message}`)
       return false
     }
     rmSync(legacy, { force: true })
-    console.log(`安全模式 ON（建档 ${id}）。已摘除第三方插件条目、保留产品自有插件；重启 DSH 生效。`)
+    console.log(`安全模式 ON（建档 ${id}）。已摘除第三方插件条目与非工厂 bundle（${removedBundles.length} 项），保留已校验的工厂内容；重启 DSH 生效。`)
     return true
   }
   if (action === 'off') {
-    if (!existsSync(stateFile)) { console.log('安全模式未开启'); return true }
+    if (!safeModeEntryExists(stateFile)) { console.log('安全模式未开启'); return true }
     let st
     try { st = JSON.parse(readFileSync(stateFile, 'utf8')) } catch {
       console.error('安全模式状态文件损坏；保留状态与备份，拒绝还原')
       return false
     }
+    if (st.profile && st.profile !== PROFILE) {
+      console.error(`安全模式状态属于 profile ${st.profile}，当前是 ${PROFILE}；拒绝还原`)
+      return false
+    }
     const backupPath = safeModeBackup(autoDir, st.backup, st.snapshotId, 'safe-mode-backup-')
     const homeBackupPath = st.homeExisted
       ? safeModeBackup(autoDir, st.homeBackup, st.snapshotId, 'safe-mode-home-backup-') : null
-    if (!st.active || !safeModeVerifyBackup(backupPath, st.backupSha256) ||
-      (st.homeExisted && !safeModeVerifyBackup(homeBackupPath, st.homeBackupSha256))) {
+    const patchBytes = safeModeLoadBackup(autoDir, backupPath, st.backupSha256)
+    const homeBytes = homeBackupPath ? safeModeLoadBackup(autoDir, homeBackupPath, st.homeBackupSha256) : null
+    const pkgBackupPath = st.pkgBackup ? safeModeBackup(autoDir, st.pkgBackup, st.snapshotId, 'safe-mode-pkg-', '.json') : null
+    const pkgBytes = pkgBackupPath ? safeModeLoadBackup(autoDir, pkgBackupPath, st.pkgBackupSha256) : null
+    if (!st.active || !patchBytes || (st.homeExisted && !homeBytes) || (st.pkgBackup && !pkgBytes)) {
       console.error('安全模式备份缺失、损坏或路径无效；保留状态与文件，拒绝还原')
       return false
     }
     try {
-      atomicWrite(patch, readFileSync(backupPath))
-      if (st.homeExisted) atomicWrite(homePatch, readFileSync(homeBackupPath))
+      atomicWrite(patch, patchBytes)
+      if (st.homeExisted) atomicWrite(homePatch, homeBytes)
+      if (pkgBackupPath) atomicWrite(join(PROFILE_ROOT, 'package.json'), pkgBytes)
     } catch (error) {
       console.error(`安全模式还原未完成；状态与备份已保留，可修复原因后重试：${error.message}`)
       return false
@@ -415,8 +613,12 @@ export function safeMode(action, { atomicWrite = safeModeAtomicWrite } = {}) {
     return true
   }
   if (action === 'status') {
-    if (existsSync(stateFile)) {
-      const st = JSON.parse(readFileSync(stateFile, 'utf8'))
+    if (safeModeEntryExists(stateFile)) {
+      let st
+      try { st = JSON.parse(readFileSync(stateFile, 'utf8')) } catch {
+        console.error('安全模式状态文件损坏，拒绝将其视为未开启')
+        return false
+      }
       console.log(`安全模式：开启中（进入于 ${st.enteredAt}）`)
     } else {
       console.log('安全模式：未开启')
@@ -427,10 +629,10 @@ export function safeMode(action, { atomicWrite = safeModeAtomicWrite } = {}) {
   return false
 }
 
-function createManifestSnapshot(reason) {
+function createManifestSnapshot(reason, rootOverride = null) {
   // 与插件一致的最小建档：profile/home 配置文件的现价拷贝（不建插件树 blob，避免重复实现；
   // 完整快照由插件在 DSH 可启动时生成；本工具保住"回退入口"而非"全量备份"）。
-  const { root } = storeDirs()
+  const root = rootOverride ?? storeDirs().root
   const dir = join(root, 'manual', 'emg-' + new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14) + '-0000')
   mkdirSync(dir, { recursive: true })
   const files = []
