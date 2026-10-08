@@ -54,6 +54,10 @@ internal object SnapshotRecoveryNotice {
     )
   }
 
+  /** An unresolved journal plus a recorded recovery refusal must never reach probe or spawn. */
+  internal fun blocksRuntimeStart(detail: String?, transactionMarkerPresent: Boolean): Boolean =
+    !detail.isNullOrBlank() && transactionMarkerPresent
+
   // ── 一次性标记：让提示能跨到 WebUI 可见面 ──────────────────────────────────
 
   /**

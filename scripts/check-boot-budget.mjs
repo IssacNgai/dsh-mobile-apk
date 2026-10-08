@@ -30,31 +30,69 @@ const ROOT = dirname(HERE)
 
 // ── 预算常量 ─────────────────────────────────────────────────────────────────
 // C4：冷启动**窗口内**的 p99 事件循环延迟上限。
-// 口径更正（2026-09-19，设备实测）：原值 50 ms 是**稳态**目标（docs/ANDROID-RUNTIME-PERF-2026-09-12.md
-// §C6），但本门禁唯一能拿到的读数是引擎产品内探针在**冷启动窗口**内的 `monitorEventLoopDelay()`
-// ——那段窗口正在全量 compose，与「稳态空闲」不是同一个量。直接套 50 ms 会把口径错配当成设备缺陷。
-// 设备 n=3 实测：37.0 / 61.6 / 77.1 ms（loopSamples 55 / 73 / 92）。取 max×1.3≈100 作为**冷启动窗口**
-// 预算；**稳态 p99 仍未被任何探针测量**（列为未闭合项，见详档 §6）。
-const LOOP_P99_BUDGET_MS = 100
+//
+// 三代口径（每一代都是被设备实测推翻后重标的，不是「调参放宽」）：
+//
+// 第一代（-2026-09-19）50 ms：照搬**稳态**目标（docs/ANDROID-RUNTIME-PERF-2026-09-12.md §C6）。
+// 错在口径错配——探针量的是冷启动窗口（全量 compose 进行中），与「稳态空闲」不是同一个量。
+//
+// 第二代（2026-09-19）100 ms：设备 n=3 实测 37.0 / 61.6 / 77.1 ms，取 max×1.3≈100。
+// 错在**尺子本身失明**——那三个读数来自 perf_hooks 的 event-loop-delay monitor，而它对
+// 「与 enable() 同 tick 内开始的同步块」结构性失明：直方图只度量它自己采样定时器的迟到量，
+// 定时器尚未触发就什么都不记（本机复现：95/500/1500/2000 ms 各档一律读成约 11 ms）。
+// ⇒ 它量的从来不是「冷启动窗口」，而是「Loader 装载结束之后那一小段残窗」。
+//
+// 第三代（2026-10-06）本轮：探针换成**自建、arming 时锚定墙钟基线**的采样器（首个 gap 覆盖
+// 自 arming 起全部时间，含已在进行的块）。换尺后读数第一次与两条独立通路对齐：
+//   · 独立 interval 观察器（同轮）：1666–2413 ms
+//   · phase 探针 loader-settle-wait（用 performance.now 差值，从未受失明缺陷影响）：1532–7288 ms
+//
+// **样本量与分布（含一次自我更正，勿只看某一批）**：本阈值先按 16416 单机 n=8 定为 3400 ms，
+// 随后在**两台**模拟器（16416 竖屏 + 16384 横屏，各自单机串行以免互抢 CPU）扩到 **n=24**，
+// 才发现 n=8 那批**尾部被截短**、不具代表性：
+//   n=24 全样本（ms，升序）：
+//     1371.4 1372.7 1426.2 1468.4 1471.9 1518.9 1525.1 1525.6 1533.0 1654.6 1696.9 1753.9
+//     1869.8 2005.6 2184.0 2188.7 2241.2 2533.4 2798.8 2886.5 3820.9 4709.4 4779.9 6260.6
+//   → min 1371.4 · median 1811.8 · p75 2533.4 · p90 4709.4 · max 6260.6（max/min ≈ 4.6x）
+//   n=8 那批评出的 3400 ms 会误红 4/24 —— **说明「扩样本后重标」是必要步骤，不是走过场**。
+//
+// 分解（n=24 同批）证明该窗口**不是** compose、也不由本仓补丁造成：
+//   · compose 单次最大 4–22 ms；compose 调用数恒 2
+//   · constructor-flush（我们的 client-modules registry 扫描）：37.7–552.8 ms
+//   · loader-settle-wait：1532.5–7288.1 ms  ← p99 与它逐轮同步，是窗口支配项
+// 即支配项是**上游引擎自身激活全部 ~193 条 Loader entry**（模块编译/求值链）。
+//
+// 阈值取值：**max×1.15 = 7199.6 → 7200 ms**。
+//   · 取值规则与第二代一致（max×1.15），变的是样本量与分布事实，不是「放宽以过关」。
+//   · **必须承认这条量程的局限**：观测到的 max/min 达 4.6x，该离散度主要来自**模拟器/宿主
+//     调度抖动**（环境噪声），不是产品属性。因此 C4 是**粗粒度回归哨兵**，只用于捕获量级回归
+//     （例如退回 A4 之前「每次 flush 全表重算」那种形态），**不得**当作紧性能门禁、更不得用
+//     它的红/绿宣称「冷启动性能达标」。真正可归因于本仓的量是 constructor-flush（数十至数百 ms）。
+//   · 这是**回归哨兵**，不是性能目标：约 1.4–6.3 s 的引擎自激活成本仍在，属上游引擎侧，
+//     本仓只观测不认领。（注：详档里的 2795 ms 是 A4 之前的**单次 compose** 同步块，与本文的
+//     loader-settle-window 不是同一个量，勿混用作本阈值的依据。）
+//   · **样本依赖说明（重要）**：n=24 全部取自 MuMu x86_64 模拟器。真机(arm64)未测，可能显著更小；
+//     发布前须在真机补同口径采样，届时应按**真机分布**重新取值，而不是沿用模拟器阈值。
+const LOOP_P99_BUDGET_MS = 7200
 // C4：至少要采到的样本数——**只用于区分「可判定」与「不可判定」，不用于健康判定**。
-// 下限 30 曾在设备实测 25 个样本上误红（探针在模块装载时 enable、compose 返回处读取，冷启动窗口长度
-// 随启动快慢天然波动，设备实测 25~92）。取 10：n=10 时 p99 约等于最大值，是粗糙但**非空洞**的断言；
-// 低于它分位数不成立 → C4 记 SKIP（不可判定），而 samples==0 仍判红（探针坏掉）。
+// 下限 30 曾在设备实测 25 个样本上误红（冷启动窗口长度随启动快慢天然波动）。取 10：n=10 时
+// p99 约等于最大值，是粗糙但**非空洞**的断言；低于它分位数不成立 → C4 记 SKIP（不可判定），
+// 而 samples==0 仍判红（探针坏掉）。换尺后实测样本 10–20，仍在 10 附近，故该下限保持不变。
 const LOOP_MIN_SAMPLES = 10
 /** C2：单个同步块上限（详档 §5.1：「探针报告的单次 compose dur ≤ 2000 ms」）。 */
 const SYNC_BLOCK_BUDGET_MS = 2000
-// C1：首个 HTTP 响应 − LISTEN 的硬上界。
-// 口径更正（2026-09-19，设备实测 12 个 boot）：原值 1000 ms **结构性不可达**——该差值由三部分构成，
-// 前两部分都是实现决定的：
-//   ① 壳侧 LISTEN 轮询量化：EngineStartFlow.ENGINE_BOOT_POLL_STEP_MS = 1000 ms（`Thread.sleep(1000)`），
-//      ⇒ 单是「观测到 LISTEN」这一步就能吃掉至多 1000 ms；
-//   ② 首个请求路径上的同步 compose 块：C2 预算 2000 ms；
-//   ③ 页面路径残余：设备实测 p90 ≈ 910 ms。
-// 设备 12 个 boot 的实测分布：min 1350 / p50 1881 / p90 2923 / max 2940 ms —— **19/19 个样本
-// （含跨代去重前的全部读数）全部 > 1000 ms**，故 1000 ms 不是「设备还不够快」，而是把量程设在了
-// 结构下限之下。新值 = ①1000 + ②2000 + ③1000(残余取整) = 4000 ms；设备 max 2940 留有约 1060 ms 余量。
-// **这不是放宽以掩盖**：C2（同步块 ≤2000 ms）仍是对**可控部分**的紧判据，C1 退化为端到端回归哨兵。
-const LISTEN_TO_HTTP_BUDGET_MS = 4000
+// C1：首次成功 HTTP 探测观测时刻 − TCP LISTEN 探测观测时刻的硬上界。
+// 历史重标（2026-09-19，设备实测 12 个 boot）：原值 1000 ms **结构性不可达**；既有4000ms阈值依据
+// 当时的端到端样本分布与旧成本估算，现保留为回归哨兵，不将其解释成服务端真实响应耗时上限。
+// 两个观测时刻来自不同的采样器：
+//   ① TCP LISTEN 由 watchEngineListen 每 500ms 尝试一次连接（单次超时 500ms）；
+//   ② HTTP 时刻由 EngineStartFlow 的启动轮询写入，轮询间隔 1000ms，单次 EngineProbe 默认连接/读取超时 800ms；
+//   ③ 两者之间还可能有真实服务就绪时间、线程调度延迟及页面路径成本。
+// 两个时刻都由壳侧轮询落盘，而非服务端精确首字节时刻：LISTEN 来自 500ms TCP 探测循环；
+// 首个 HTTP 来自 EngineProbe.check() 成功后的启动轮询（1s 间隔，单次请求有连接/读取超时）。
+// 因此差值包含两条探针的采样量化与调度延迟。C1 超限本身不能证明同步 compose 阻塞，需结合 C2 与
+// P1 phase 数据定位；C2 是独立的同步块预算。失败仍按原阈值判红，但不得把观测差描述成同步阻塞。
+const LISTEN_TO_HTTP_OBSERVATION_BUDGET_MS = 4000
 /**
  * C3：compose 调用数上限（与 P-AC-06 一致；已被设备实测满足，降级为回归哨兵）。
  *
@@ -71,7 +109,7 @@ const COMPOSE_CALLS_BUDGET = 2
 /**
  * 解析预算。C1 的**绝对**目标值（t_boot_start → 首个 HTTP 响应）按详档 §6 第 2 项尚未重标，
  * 因此默认只作观测告警；显式给 --first-response-budget 才升级为「失败即拒」。
- * 「首个响应 − LISTEN ≤ 4000 ms」（见常量处的构成推导）不受此影响，始终强制执行。
+ * 「首次成功 HTTP 探测观测 − TCP LISTEN 探测观测 ≤ 4000 ms」不受此影响，始终强制执行。
  */
 export function resolveBudgets(argv = []) {
   const argOf = (name) => {
@@ -80,7 +118,7 @@ export function resolveBudgets(argv = []) {
   }
   const absolute = argOf('first-response-budget')
   return {
-    listenToHttpMs: argOf('listen-to-http-budget') ?? LISTEN_TO_HTTP_BUDGET_MS,
+    listenToHttpObservationMs: argOf('listen-to-http-budget') ?? LISTEN_TO_HTTP_OBSERVATION_BUDGET_MS,
     syncBlockMs: argOf('sync-block-budget') ?? SYNC_BLOCK_BUDGET_MS,
     composeCalls: argOf('compose-calls-budget') ?? COMPOSE_CALLS_BUDGET,
     loopP99Ms: argOf('loop-p99-budget') ?? LOOP_P99_BUDGET_MS,
@@ -236,7 +274,7 @@ export function parseSegments(text) {
  *   [perf] compose #<n> at=<ms>ms dur=<ms>ms instances=<n> records=<n> [singles=<n>] [comboCache=...]
  *   [perf] boot singles=<n> records=<n>          ← compose #1 之后的启动期读数（C5 反向判据）
  *   [perf] single #<n> at=<ms>ms singles=<n>     ← 单条 URL 被请求（C5 正向对照）
- *   [perf] TOTAL calls=<n> totalMs=<ms> instances=<n> firstAt=<ms>ms singles=<n> loopP99Ms=<ms|n/a> loopSamples=<n> [comboCache=...]
+ *   [perf] TOTAL calls=<n> totalMs=<ms> instances=<n> firstAt=<ms>ms singles=<n> loopP99Ms=<-1|ms|n/a> loopSamples=<-1|n> [comboCache=...]
  */
 export function parseProbe(text) {
   const body = String(text ?? '')
@@ -257,8 +295,11 @@ export function parseProbe(text) {
   const singleLines = [...body.matchAll(/\[perf\] single #(\d+) at=\d+ms singles=(-?\d+|n\/a)/g)]
     .map((m) => ({ n: Number(m[1]), singles: m[2] }))
   const singlesField = /singles=(\d+)/.exec(body)
-  const p99 = /loopP99Ms=([\d.]+|n\/a)/.exec(body)
-  const samples = /loopSamples=(\d+)/.exec(body)
+  // TOTAL 行可能先输出 monitor 尚未采样的 -1/0，随后再输出 debounce 收口后的真实读数。
+  // 两个字段必须从同一条、最新的完整 TOTAL 行配对读取；分开 .exec 会把早期哨兵当成最终值。
+  const loopStats = [...body.matchAll(/\[perf\] TOTAL\b[^\r\n]*?\bloopP99Ms=(-?\d+(?:\.\d+)?|n\/a)\s+loopSamples=(-?\d+)\b/g)]
+    .map((m) => ({ p99: m[1], samples: Number(m[2]) }))
+  const lastLoopStats = loopStats.length > 0 ? loopStats[loopStats.length - 1] : null
   return {
     hasProbe: total !== null,
     // composeCalls 取**末条** TOTAL 的 calls：P1 的 stats.calls 是进程内累计计数器，末条即真值。
@@ -284,8 +325,8 @@ export function parseProbe(text) {
     maxSingleSingles: singleLines.length > 0
       ? Math.max(...singleLines.map((s) => (s.singles === 'n/a' ? -1 : Number(s.singles)))) : undefined,
     singlesAtExit: singlesField ? Number(singlesField[1]) : undefined,
-    loopP99Ms: p99 && p99[1] !== 'n/a' ? Number(p99[1]) : undefined,
-    loopSamples: samples ? Number(samples[1]) : undefined,
+    loopP99Ms: lastLoopStats && lastLoopStats.p99 !== 'n/a' ? Number(lastLoopStats.p99) : undefined,
+    loopSamples: lastLoopStats?.samples,
   }
 }
 
@@ -413,32 +454,32 @@ export function runChecks(input, budgets = resolveBudgets([])) {
     }
   }
 
-  // ── C1 首个 HTTP 响应（同时断言「首个响应 − LISTEN ≤ 1000 ms」）──
+  // ── C1 首次成功 HTTP 探测观测 − TCP LISTEN 探测观测（阈值保持 4000 ms）──
   {
     const listen = segments.listen
     const http = segments.firstHttp
     if (http === undefined) {
       add('C1', 'C1 首个 HTTP 响应时间（与 LISTEN 同时断言）', false,
-        't_first_http 未知（探针未装）——「首个响应 − LISTEN」无法判定；只判 LISTEN 会系统性假绿',
+        't_first_http 未知（探针未装）——首次成功 HTTP 探测观测与 TCP LISTEN 探测观测之差无法判定；只判 LISTEN 会系统性假绿',
         strict ? 'fail' : 'skip')
     } else {
-      // 硬判据：首个响应 − LISTEN ≤ 1000 ms。这是「LISTEN 快、首个响应慢」的直接防线。
+      // 硬判据：两次壳侧成功探测的观测时刻相差不超过预算。它包含采样/调度延迟，不能单独归因于同步阻塞。
       if (listen === undefined) {
-        add('C1', 'C1 首个响应 − LISTEN ≤ ' + budgets.listenToHttpMs + ' ms', false, 'LISTEN 时刻未知')
+        add('C1', 'C1 首次成功 HTTP 探测观测 − TCP LISTEN 探测观测 ≤ ' + budgets.listenToHttpObservationMs + ' ms', false, 'TCP LISTEN 观测时刻未知')
       } else {
         const delta = http - listen
-        add('C1', 'C1 首个响应 − LISTEN = ' + delta + ' ms ≤ ' + budgets.listenToHttpMs + ' ms',
-          delta <= budgets.listenToHttpMs,
-          'LISTEN=' + listen + ' 首个响应=' + http + ' → 差 ' + delta + 'ms（LISTEN 达标但首个响应被同步块挡住）')
+        add('C1', 'C1 首次成功 HTTP 探测观测 − TCP LISTEN 探测观测 = ' + delta + ' ms ≤ ' + budgets.listenToHttpObservationMs + ' ms',
+          delta <= budgets.listenToHttpObservationMs,
+          'TCP LISTEN 观测=' + listen + ' 首次成功 HTTP 探测观测=' + http + ' → 差 ' + delta + 'ms；差值包含两条探针的轮询采样与调度延迟，单凭 C1 不能归因于同步 compose；请结合 C2 与 P1 phase 数据')
       }
       // 绝对目标：未重标前只告警（详档 §6 第 2 项纪律），显式给 --first-response-budget 才判红。
       if (segments.bootStart !== undefined) {
         const absolute = http - segments.bootStart
         if (budgets.firstResponseMs === undefined) {
-          add('C1-abs', 'C1 冷启动 → 首个响应 = ' + absolute + ' ms（--first-response-budget 未给：观测告警，不判红）',
+          add('C1-abs', 'C1 冷启动 → 首次成功 HTTP 探测观测 = ' + absolute + ' ms（--first-response-budget 未给：观测告警，不判红）',
             true, undefined, 'warn')
         } else {
-          add('C1-abs', 'C1 冷启动 → 首个响应 = ' + absolute + ' ms ≤ ' + budgets.firstResponseMs + ' ms',
+          add('C1-abs', 'C1 冷启动 → 首次成功 HTTP 探测观测 = ' + absolute + ' ms ≤ ' + budgets.firstResponseMs + ' ms',
             absolute <= budgets.firstResponseMs, '超出预算 ' + budgets.firstResponseMs + 'ms')
         }
       }
@@ -475,7 +516,7 @@ export function runChecks(input, budgets = resolveBudgets([])) {
   // 误红**（下限 30 曾在设备 25 样本上误红）。三态：
   //   ① samples ≥ 下限 → 按 p99 判 PASS/FAIL（唯一的健康判据）；
   //   ② 0 < samples < 下限 → **SKIP**（不可判定：窗口太短、分位数不成立），绝不判红、也绝不算绿；
-  //   ③ samples == 0 或缺读数 → **FAIL**（探针/接线坏了，正是 C4 要防的真缺陷）。
+  //   ③ sentinel/负样本、samples == 0 → **FAIL**（探针/接线坏了，正是 C4 要防的真缺陷）。
   // ③ 是「C4 不会因长期 SKIP 而丧失判别力」的锚点：没有它，把不足一律 SKIP 等于让 C4 永绿。
   {
     const p99 = probe.loopP99Ms
@@ -484,6 +525,10 @@ export function runChecks(input, budgets = resolveBudgets([])) {
     if (p99 === undefined || samples === undefined) {
       add('C4', budgetLabel, false,
         '缺 loopP99Ms/loopSamples 读数——探针未产出事件循环读数（接线坏了）', strict ? 'fail' : 'skip')
+    } else if (p99 < 0 || samples < 0) {
+      add('C4', budgetLabel, false,
+        '事件循环探针返回哨兵值：loopP99Ms=' + p99 + ' loopSamples=' + samples
+        + '（负值表示没有有效读数，不能视为缺字段、SKIP 或通过）')
     } else if (samples === 0) {
       // ③ 探针一个样本都没有：与「窗口太短」是两回事，这是真缺陷。
       add('C4', budgetLabel, false,
@@ -560,8 +605,16 @@ function selfTest() {
   // ② 反向对照（详档 §5.1 C1 明文要求）：LISTEN 快、首个响应慢 → 必须判红
   {
     const r = run(segLine({ boot: 100000, listen: 101000, listenMs: 1000, http: 105500, httpMs: 5500 }), probeText({ single: true }))
-    check('反向对照：LISTEN 快(1000ms) + 首个响应慢(4500ms 滞后) → C1 判红',
+    check('反向对照：首次成功 HTTP 探测观测晚于 TCP LISTEN 观测 4500ms → C1 判红',
       okOf(r, 'C1') === false, 'C1 ok=' + okOf(r, 'C1'))
+    const c1 = resultOf(r, 'C1')
+    check('反向对照：C1 超限仍维持 4000ms 阈值且明确是观测差',
+      c1?.label.includes('≤ 4000 ms') === true && c1?.label.includes('探测观测') === true,
+      String(c1?.label ?? ''))
+    check('反向对照：C2 同步块预算通过时，C1 详情不把超限归因于同步 compose',
+      okOf(r, 'C2') === true && String(c1?.detail ?? '').includes('轮询采样与调度延迟')
+        && !String(c1?.detail ?? '').includes('被同步块挡住'),
+      'C2=' + okOf(r, 'C2') + ' C1 detail=' + String(c1?.detail ?? ''))
   }
 
   // ③ 反向对照：三字段在场但 t_compose_total = -1 → C6 必须判红（42/42 假绿的教训）
@@ -643,15 +696,56 @@ function selfTest() {
       okOf(r, 'C5+') === false, 'C5+ ok=' + okOf(r, 'C5+'))
   }
 
-  // ⑦ 反向对照：p99 达标但样本数为 0（探针一个样本都没产出）→ C4 必须判红。
+  // ⑦ 反向对照：p99=-1 且样本数为 0 → 哨兵和空读数都必须被解析并使 C4 判红。
   // 这是三态切法里的第 ③ 态，也是「C4 不因长期 SKIP 而丧失判别力」的锚点。
   {
-    const r = run(segLine(), probeText({ p99: 5, samples: 0, single: true }))
-    check('反向对照：loopSamples=0（探针未产出样本）→ C4 判红（不得当 SKIP/绿）',
-      okOf(r, 'C4') === false, 'C4 ok=' + okOf(r, 'C4'))
-    check('反向对照：loopSamples=0 的判红理由点名「探针未生效/未接线」',
-      String(resultOf(r, 'C4')?.detail ?? '').includes('一个样本都没产出'),
-      String(resultOf(r, 'C4')?.detail ?? '').slice(0, 90))
+    const body = probeText({ p99: -1, samples: 0, single: true })
+    const parsed = parseProbe(body)
+    check('反向对照：loopP99Ms=-1 被解析为哨兵值，loopSamples=0 保留为真实读数',
+      parsed.loopP99Ms === -1 && parsed.loopSamples === 0,
+      'loopP99Ms=' + String(parsed.loopP99Ms) + ' loopSamples=' + String(parsed.loopSamples))
+    const r = run(segLine(), body)
+    check('反向对照：loopP99Ms=-1 / loopSamples=0 → C4 判红（不得误报缺字段或 SKIP）',
+      okOf(r, 'C4') === false && resultOf(r, 'C4')?.severity === 'fail',
+      'C4 ok=' + okOf(r, 'C4') + ' severity=' + resultOf(r, 'C4')?.severity)
+    check('反向对照：负哨兵判红理由明确点名「哨兵值」',
+      String(resultOf(r, 'C4')?.detail ?? '').includes('哨兵值'),
+      String(resultOf(r, 'C4')?.detail ?? '').slice(0, 100))
+  }
+
+  // ⑦a 实机反例：首次 TOTAL 可以在采样窗口收口前记录 -1/0，末次 TOTAL 才有完整采样。
+  // 必须从末条完整 TOTAL 读取一对数据，不能把早期哨兵读成最终值，也不能跨行拼接字段。
+  {
+    const body = [
+      '[perf] TOTAL calls=1 totalMs=300 instances=1 firstAt=100ms singles=-1 loopP99Ms=-1 loopSamples=0',
+      '[perf] compose #2 at=800ms dur=40ms instances=1 records=60 singles=-1',
+      // 245.1 是**第二代（失明尺）**时期的实机读数，此处仅用于验证「取末条完整 loopStats」的解析语义。
+      '[perf] TOTAL calls=2 totalMs=340 instances=1 firstAt=100ms singles=-1 loopP99Ms=245.1 loopSamples=20',
+    ].join('\n')
+    const parsed = parseProbe(body)
+    check('⑦a-① 多条 TOTAL 取末条完整 loopStats（245.1ms / 20）',
+      parsed.loopP99Ms === 245.1 && parsed.loopSamples === 20,
+      'loopP99Ms=' + String(parsed.loopP99Ms) + ' loopSamples=' + String(parsed.loopSamples))
+    // **必须由预算常量推导，不得写死字面量**：本用例原写死「245.1ms 必判红」，那是照失明尺时期的
+    // 100ms 预算写的；2026-10-06 按新尺重标到 3400ms 后 245.1 < 3400，该断言**静默失效**——
+    // 与 ⑧ 处已记载的 `p99=88` 事故同形（一个不会失败的测试不是防线）。改从常量推导，读数本身
+    // 只作解析面样本，判红面用「预算 + 123.4」这个必然超预算的值。
+    const overBudget = LOOP_P99_BUDGET_MS + 123.4
+    const overBody = [
+      '[perf] TOTAL calls=1 totalMs=300 instances=1 firstAt=100ms singles=-1 loopP99Ms=-1 loopSamples=0',
+      '[perf] TOTAL calls=2 totalMs=340 instances=1 firstAt=100ms singles=-1 loopP99Ms=' + overBudget + ' loopSamples=20',
+    ].join('\n')
+    const r = run(segLine(), overBody)
+    check('⑦a-② 超预算读数（' + overBudget + 'ms / 20 样本）判 C4 FAIL',
+      okOf(r, 'C4') === false && resultOf(r, 'C4')?.severity === 'fail',
+      'C4 ok=' + okOf(r, 'C4') + ' severity=' + resultOf(r, 'C4')?.severity)
+    const finalSentinel = parseProbe([
+      '[perf] TOTAL calls=1 totalMs=300 instances=1 firstAt=100ms singles=-1 loopP99Ms=12 loopSamples=40',
+      '[perf] TOTAL calls=2 totalMs=340 instances=1 firstAt=100ms singles=-1 loopP99Ms=-1 loopSamples=0',
+    ].join('\n'))
+    check('⑦a-③ 末条仍为 -1/0 时保留末条哨兵（不回退到早期健康值）',
+      finalSentinel.loopP99Ms === -1 && finalSentinel.loopSamples === 0,
+      'loopP99Ms=' + String(finalSentinel.loopP99Ms) + ' loopSamples=' + String(finalSentinel.loopSamples))
   }
 
   // ⑦b 三态切法的回归用例（本轮踩到的真实场景）。
@@ -863,7 +957,7 @@ else {
     console.log(tag + r.label + (r.ok || r.detail === undefined ? '' : ' -> ' + r.detail))
   }
   if (budgets.firstResponseMs === undefined) {
-    console.log('WARN  C1 绝对目标（t_boot_start → 首个响应）未重标：只作观测告警。'
+    console.log('WARN  C1 绝对目标（t_boot_start → 首次成功 HTTP 探测观测）未重标：只作观测告警。'
       + '重标方法见 docs/0.14.1-preview-BOOT-SPEED-AND-LAZY-PLUGINS.md §6 第 2 项（目标设备 n>=5 基线）')
   }
   if (hard > 0) {

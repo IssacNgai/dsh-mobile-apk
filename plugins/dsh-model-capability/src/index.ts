@@ -7,8 +7,8 @@
  *   2. `vendor-descriptor`  — explicit capability schemas (OpenRouter / Google / Ollama);
  *   3. `engine-catalog`     — exact model-id lookup in the pi-ai vendor catalogs the
  *      engine ships (a vendor *declaration*, never a name heuristic);
- *   4. `active-probe`       — only with explicit approval, and only after a negative
- *      control proves the endpoint actually validates the effort field.
+ *   4. active reasoning probes run only after explicit confirmation, through a
+ *      known serializer, with a rejecting negative control.
  *
  * Write-back is opt-in per call (or by the startup pass) and field-level: it only
  * fills missing model-level fields and never overwrites a value the user declared.
@@ -19,12 +19,17 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import {
   DIALECT_COMPAT_KEYS,
   THINKING_LEVELS,
+  canApplyReasoningEfforts,
+  effortsFrom,
+  normalizeReasoningEfforts,
   probePassive,
-  probeReasoningEfforts,
+  probeOpenAICompletionsReasoningEfforts,
+  probeResponsesReasoningEfforts,
   type FetchLike,
   type Modality,
   type ModelCapabilities,
   type ProbeReport,
+  type ProviderConfig,
   type ReasoningEfforts,
 } from './capability-probe.js'
 import { hasCapabilities, lookupCatalog, type CatalogSnapshot } from './catalog-lookup.js'
@@ -52,7 +57,11 @@ export const inject = ['tools', 'settings'] as const
 
 export {
   THINKING_LEVELS,
+  canApplyReasoningEfforts,
+  normalizeReasoningEfforts,
   probePassive,
+  probeOpenAICompletionsReasoningEfforts,
+  probeResponsesReasoningEfforts,
   probeReasoningEfforts,
   parseDescriptor,
   parseOllamaShow,
@@ -194,6 +203,152 @@ export function pickDialect(compat: Record<string, unknown> | undefined): Record
   return out
 }
 
+function effectiveCompat(
+  provider: ProviderConfig | undefined,
+  id: string,
+  catalogCompat?: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+  const merged = { ...catalogCompat, ...provider?.compat, ...provider?.modelProfiles?.[id]?.compat }
+  return Object.keys(merged).length > 0 ? merged : undefined
+}
+
+function hasConfiguredEfforts(provider: ProviderConfig | undefined, id: string): boolean {
+  return Boolean(provider?.modelProfiles?.[id]
+    && Object.prototype.hasOwnProperty.call(provider.modelProfiles[id], 'reasoningEfforts'))
+}
+
+/** Official, exact-id profile. Its profile id versions this protocol assertion. */
+export const MIMO_THINKING_PROFILES = Object.freeze([{
+  profileId: 'xiaomi-mimo-openai-completions-thinking-toggle-v1',
+  api: 'openai-completions',
+  modelIds: ['mimo-v2.5', 'mimo-v2.5-pro'],
+  sourceUrl: 'https://mimo.mi.com/docs/zh-CN/api/chat/openai-api',
+}] as const)
+
+/** Apply only a versioned exact-model profile or a user's explicit mimo dialect. */
+export function applyMimoThinkingProfile(provider: ProviderConfig, report: ProbeReport): void {
+  if ((provider.api ?? '').toLowerCase() !== 'openai-completions') return
+  for (const id of provider.models ?? []) {
+    const model = report.models.find((item) => item.id === id)
+    const explicit = effectiveCompat(provider, id)
+    if (explicit?.thinkingFormat !== undefined && explicit.thinkingFormat !== 'mimo') continue
+    const official = MIMO_THINKING_PROFILES.find((profile) => profile.api === provider.api?.toLowerCase()
+      && profile.modelIds.includes(id.toLowerCase() as typeof profile.modelIds[number]))
+    if (explicit?.thinkingFormat !== 'mimo' && !official) continue
+    const source = explicit?.thinkingFormat === 'mimo' ? 'user profile' : official?.profileId
+    const target = model ?? { id, sources: {} }
+    const configured = provider.modelProfiles?.[id]
+    const hasConfiguredValue = configured !== undefined && Object.prototype.hasOwnProperty.call(configured, 'reasoningEfforts')
+    const configuredEfforts = configured && hasConfiguredValue
+      ? configured.reasoningEfforts : undefined
+    const explicitlyDisabled = hasConfiguredValue && configuredEfforts === false
+    const preserveUserMap = (configuredEfforts && typeof configuredEfforts === 'object' && !Array.isArray(configuredEfforts))
+      ? configuredEfforts as ReasoningEfforts
+      : model?.sources.reasoningEfforts === 'user-fallback' ? model.reasoningEfforts : undefined
+    if (explicitlyDisabled) {
+      delete target.reasoningEfforts
+      delete target.sources.reasoningEfforts
+    } else if (preserveUserMap) {
+      // The old saved map remains visible in the report/settings. The pinned DSH
+      // overlay presents it as a binary mode and PiAi serializes only the toggle.
+      target.reasoningEfforts = preserveUserMap
+      target.sources.reasoningEfforts = 'user-fallback'
+    } else {
+      target.reasoningEfforts = { off: 'off', low: 'low' }
+      target.sources.reasoningEfforts = 'protocol-profile'
+    }
+    const compat = { ...target.compat }
+    for (const [key, value] of Object.entries(explicit ?? {})) {
+      if (compat[key] === undefined) compat[key] = value
+    }
+    // An official exact-id profile outranks passive/catalog descriptions. Explicit
+    // user compat above remains intact because conflicting user thinkingFormat exits.
+    if (explicit?.thinkingFormat === undefined) compat.thinkingFormat = 'mimo'
+    if (explicit?.supportsReasoningEffort === undefined) compat.supportsReasoningEffort = false
+    if (explicit?.requiresReasoningContentOnAssistantMessages === undefined) compat.requiresReasoningContentOnAssistantMessages = true
+    target.compat = compat
+    if (!report.models.includes(target)) report.models.push(target)
+    report.notes.push(`${id}: 使用 ${source} MiMo 二态思考 profile（off/low 映射为关闭/开启；不会发送 reasoning_effort）`)
+  }
+  report.models.sort((a, b) => a.id.localeCompare(b.id))
+  report.unknown = (provider.models ?? []).filter((id) => {
+    const model = report.models.find((item) => item.id === id)
+    return !model || Object.keys(model.sources).length === 0
+  })
+}
+
+/** Add an explicitly authorized active result without replacing declared/discovered levels. */
+export async function runConfirmedActiveProbe(
+  provider: ProviderConfig,
+  report: ProbeReport,
+  options: {
+    active?: boolean
+    confirm?: boolean
+    offline?: boolean
+    source?: 'auto' | 'endpoint' | 'catalog' | 'modelsdev' | 'offline'
+    levels?: string[]
+    fetchImpl?: FetchLike
+  },
+): Promise<void> {
+  if (!options.active) return
+  if (options.confirm !== true) {
+    report.notes.push('主动 reasoning probe 未执行：必须同时设置 active=true 与 confirm=true')
+    return
+  }
+  if (options.offline === true || options.source === 'offline' || options.source === 'catalog' || options.source === 'modelsdev') {
+    report.notes.push('主动 reasoning probe 未执行：当前请求为离线或非端点网络模式')
+    return
+  }
+  const api = (provider.api ?? '').toLowerCase()
+  const isResponses = api === 'openai-responses'
+  const isCompletions = api === 'openai-completions'
+  if (!isResponses && !isCompletions) {
+    report.notes.push(`主动 reasoning probe 未执行：API 方言「${provider.api ?? 'unknown'}」没有已验证的主动请求序列化，能力保持未知`)
+    return
+  }
+  const levels = options.levels?.length ? options.levels : ['low', 'medium', 'high']
+  for (const id of provider.models ?? []) {
+    const model = report.models.find((item) => item.id === id)
+    const compat = effectiveCompat(provider, id, model?.compat)
+    if (isCompletions && compat?.thinkingFormat === 'mimo') {
+      report.notes.push(`${id}: MiMo thinking.type 是二态开关，主动 reasoning_effort probe 未执行`)
+      continue
+    }
+    if (isCompletions && (compat?.thinkingFormat !== 'openai' || compat.supportsReasoningEffort !== true)) {
+      report.notes.push(`${id}: 主动 reasoning probe 未执行：Completions 缺少明确的 thinkingFormat=openai + supportsReasoningEffort=true 序列化声明`)
+      continue
+    }
+    if (hasConfiguredEfforts(provider, id)) {
+      report.notes.push(`${id}: 已存在用户声明的 reasoningEfforts，主动探测跳过并保留原值`)
+      continue
+    }
+    if (model?.reasoningEfforts) {
+      report.notes.push(`${id}: 已有来源声明 reasoningEfforts，主动探测跳过并保留原值`)
+      continue
+    }
+    const result = isResponses
+      ? await probeResponsesReasoningEfforts(provider, id, levels, { fetchImpl: options.fetchImpl })
+      : await probeOpenAICompletionsReasoningEfforts(provider, id, compat, levels, { fetchImpl: options.fetchImpl })
+    const negative = result.negativeControl
+    if (negative?.reason) report.notes.push(`${id}: reasoning effort 负控未能证明服务端校验字段（${negative.reason}），候选接受结果不写入`)
+    else if (negative) report.notes.push(`${id}: reasoning effort 负控被服务端拒绝（HTTP ${negative.status}），继续核验指定档位`)
+    if (result.accepted.length > 0) {
+      const { efforts } = effortsFrom(result.accepted)
+      if (efforts) {
+        const target = model ?? { id, sources: {} }
+        target.reasoningEfforts = efforts
+        target.sources.reasoningEfforts = 'active-probe'
+        if (!report.models.includes(target)) report.models.push(target)
+      }
+    }
+    report.notes.push(`${id}: 主动 reasoning probe accepted=${result.accepted.join('/') || 'none'} rejected=${result.rejected.map((item) => item.level).join('/') || 'none'} inconclusive=${result.inconclusive.map((item) => item.level).join('/') || 'none'}`)
+  }
+  report.unknown = (provider.models ?? []).filter((id) => {
+    const model = report.models.find((item) => item.id === id)
+    return !model || Object.keys(model.sources).length === 0
+  })
+}
+
 /**
  * Injects models.dev (S3) capabilities into a probe report and recomputes unknowns.
  *
@@ -211,6 +366,7 @@ export function mergeModelsDevInto(
   snapshot: ModelsDevSnapshot | undefined,
   /** Filled with levels that must wait for a wire dialect (see applyDeferredModelsDevLevels). */
   deferred?: Map<string, ReasoningEfforts>,
+  provider?: ProviderConfig,
 ): ProbeReport {
   if (!snapshot) return report
   const byId = new Map(report.models.map((model) => [model.id, model]))
@@ -239,14 +395,17 @@ export function mergeModelsDevInto(
       model.maxTokens = agreed.maxTokens
       model.sources.maxTokens = 'models-dev'
     }
-    // 与引擎目录同纪律：只有方言明确时才写 reasoningEfforts。models.dev 不声明 wire 方言，
-    // 所以档位写入仍然要等 S4（或用户显式 compat）给出 thinkingFormat——否则跳过并记 note。
+    // models.dev supplies names, not endpoint-specific meaning. Responses can
+    // encode one declared on-level safely; several levels stay unknown because
+    // some Responses providers document them as enable-only.
     const levels = effortsFromLevels(agreed.thinkingLevels)
-    if (levels && !model.reasoningEfforts) {
-      const dialect = pickDialect(model.compat)
-      if (dialect) {
-        model.reasoningEfforts = levels
-        model.sources.reasoningEfforts = 'models-dev'
+    if (levels && !model.reasoningEfforts && !hasConfiguredEfforts(provider, model.id)) {
+      const api = provider?.api ?? model.api
+      const compat = effectiveCompat(provider, model.id, model.compat)
+      if (canApplyReasoningEfforts(api, compat)) {
+        model.reasoningEfforts = normalizeReasoningEfforts(api, compat, levels, 'models-dev')
+        if (model.reasoningEfforts) model.sources.reasoningEfforts = 'models-dev'
+        else report.notes.push(`${model.id}: models.dev 档位无法证明 Responses 各等级语义不同，保持推理能力未知`)
       } else {
         // 方言还没到（models.dev 不声明 wire 方言，S4 目录可能稍后给出）。先挂起，
         // 由 applyDeferredModelsDevLevels 在 S4 之后决定写或跳过——方言门本身不动。
@@ -281,6 +440,7 @@ export function mergeFallbacks(
   declared: string[],
   fallbacks: { contextWindow?: number; maxTokens?: number; input?: Modality[]; reasoningEfforts?: ReasoningEfforts } | undefined,
   configured: boolean,
+  provider?: ProviderConfig,
 ): ProbeReport {
   if (!configured || !fallbacks) return report
   // 先确保每个 declared 模型都有条目：models.dev 关闭/无缓存时它不会建条目（提前返回），
@@ -298,6 +458,7 @@ export function mergeFallbacks(
     for (const key of ['input', 'contextWindow', 'maxTokens', 'reasoningEfforts'] as const) {
       const value = fallbacks[key]
       if (value === undefined) continue
+      if (key === 'reasoningEfforts' && hasConfiguredEfforts(provider, model.id)) continue
       if (model[key] !== undefined) continue
       if (Object.prototype.hasOwnProperty.call(model.sources, key)) continue
       ;(model as unknown as Record<string, unknown>)[key] = value
@@ -315,24 +476,31 @@ export function mergeFallbacks(
  * Writes levels that models.dev reported but could not yet write, now that the
  * engine catalog (S4) may have supplied the wire dialect.
  *
- * The dialect gate is unchanged: a level set is written only when a dialect is
- * explicit, exactly as for a catalog-sourced effort map. When no dialect exists the
- * levels are dropped with a note — the encyclopedia saying "this model offers
- * high/max" does not say how the gateway spells them, and guessing has already cost
- * a real 400 (issue #134).
+ * Deferred levels are applied only after the route/model API and serializer compat
+ * are known. Responses accepts a serializer mapping but unverified multi-level
+ * lists remain unknown because some gateways expose enable-only reasoning.
  * @param report - report to update in place.
  * @param deferred - levels parked by {@link mergeModelsDev}.
  * @returns the same report.
  */
-export function applyDeferredModelsDevLevels(report: ProbeReport, deferred: Map<string, ReasoningEfforts>): ProbeReport {
+export function applyDeferredModelsDevLevels(
+  report: ProbeReport,
+  deferred: Map<string, ReasoningEfforts>,
+  provider?: ProviderConfig,
+): ProbeReport {
   if (deferred.size === 0) return report
   for (const model of report.models) {
     const levels = deferred.get(model.id)
-    if (!levels || model.reasoningEfforts) continue
-    const dialect = pickDialect(model.compat)
-    if (dialect) {
-      model.reasoningEfforts = levels
-      model.sources.reasoningEfforts = 'models-dev'
+    if (!levels || model.reasoningEfforts || hasConfiguredEfforts(provider, model.id)) continue
+    const api = provider?.api ?? model.api
+    const compat = effectiveCompat(provider, model.id, model.compat)
+    if (canApplyReasoningEfforts(api, compat)) {
+      model.reasoningEfforts = normalizeReasoningEfforts(api, compat, levels, 'models-dev')
+      if (model.reasoningEfforts) {
+        model.sources.reasoningEfforts = 'models-dev'
+        continue
+      }
+      report.notes.push(`${model.id}: models.dev 档位无法证明 Responses 各等级语义不同，保持推理能力未知`)
       continue
     }
     report.notes.push(
@@ -348,6 +516,7 @@ export function applyDeferredModelsDevLevels(report: ProbeReport, deferred: Map<
   declared: string[],
   snapshot: CatalogSnapshot | undefined,
   api: string | undefined,
+  provider?: ProviderConfig,
 ): ProbeReport {
   const byId = new Map<string, ModelCapabilities>(report.models.map((model) => [model.id, model]))
   for (const id of declared) {
@@ -362,21 +531,33 @@ export function applyDeferredModelsDevLevels(report: ProbeReport, deferred: Map<
     if (match.providers.length > 0) report.notes.push(`${model.id}: 引擎目录命中 ${match.providers.join('/')}`)
     for (const conflict of match.conflicts) report.notes.push(`${model.id}: ${conflict}`)
     const capabilities = match.capabilities
-    // 方言优先（issue #134）：reasoningEfforts 只有在「pi-ai 知道该模型的方言」时才写。
-    // 目录里同名模型来自多个厂商、thinkingFormat 冲突或缺失时，pi-ai 会按探测默认
-    // （未知 baseURL → openai）序列化 reasoning_effort，真实网关可能直接 400。
-    const dialect = pickDialect(capabilities.compat)
-    if (dialect && !model.compat) {
-      model.compat = dialect
+    if (capabilities.api) model.api = capabilities.api
+    const explicitCompat = effectiveCompat(provider, model.id)
+    const resolvedCompatForGate = effectiveCompat(provider, model.id, capabilities.compat)
+    const explicitToggleDialect = resolvedCompatForGate?.thinkingFormat === 'mimo'
+    const catalogDialect = pickDialect(capabilities.compat)
+    if (catalogDialect) {
+      const missing: Record<string, unknown> = {}
+      for (const [key, value] of Object.entries(catalogDialect)) {
+        // A toggle serializer has no effort parameter, even when another catalog
+        // row for the same id claims that one is accepted.
+        if (explicitToggleDialect && key === 'supportsReasoningEffort') continue
+        if (explicitCompat?.[key] === undefined && model.compat?.[key] === undefined) missing[key] = value
+      }
+      if (Object.keys(missing).length > 0) model.compat = { ...model.compat, ...missing }
     }
-    if (capabilities.reasoningEfforts && !model.reasoningEfforts) {
-      if (dialect) {
-        model.reasoningEfforts = capabilities.reasoningEfforts
-        model.sources.reasoningEfforts = 'engine-catalog'
+    if (capabilities.reasoningEfforts && !model.reasoningEfforts && !hasConfiguredEfforts(provider, model.id)) {
+      const effectiveApi = provider?.api ?? capabilities.api
+      const resolvedCompat = effectiveCompat(provider, model.id, capabilities.compat)
+      if (canApplyReasoningEfforts(effectiveApi, resolvedCompat)) {
+        model.reasoningEfforts = normalizeReasoningEfforts(
+          effectiveApi, resolvedCompat, capabilities.reasoningEfforts, 'engine-catalog',
+        )
+        if (model.reasoningEfforts) model.sources.reasoningEfforts = 'engine-catalog'
       } else {
         report.notes.push(
-          `${model.id}: 目录未给出统一 thinkingFormat（方言不明）——跳过 reasoningEfforts 写入，`
-          + '避免按错误方言发送推理等级导致请求被拒；如需档位请在设置里显式声明 compat.thinkingFormat',
+          `${model.id}: API=${effectiveApi ?? 'unknown'} 的推理序列化信息不足`
+          + '——跳过 reasoningEfforts 写入；Completions 请显式声明 compat.thinkingFormat',
         )
       }
     }
@@ -408,7 +589,13 @@ function summarize(report: ProbeReport): string {
     if (model.input) parts.push('模态 ' + model.input.join('/'))
     if (model.contextWindow) parts.push('上下文 ' + model.contextWindow)
     if (model.maxTokens) parts.push('输出上限 ' + model.maxTokens)
-    if (model.reasoningEfforts) parts.push('推理等级 ' + Object.keys(model.reasoningEfforts).join('/'))
+    if (model.reasoningEfforts) {
+      if (model.sources.reasoningEfforts === 'protocol-profile' && model.compat?.thinkingFormat === 'mimo') {
+        parts.push('思考开关 关闭/开启')
+      } else {
+        parts.push('推理等级 ' + Object.keys(model.reasoningEfforts).join('/'))
+      }
+    }
     const sources = Object.entries(model.sources).map(([key, source]) => `${key}<-${source}`).join(' ')
     lines.push(`- ${model.id}: ${parts.length > 0 ? parts.join('，') : '未声明任何能力'}${sources ? ' [' + sources + ']' : ''}`)
   }
@@ -603,64 +790,34 @@ export function apply(ctx: Context, config: PluginConfig = {}) {
     if (wantModelsDev) {
       const allowNetwork = options.allowModelsDevNetwork !== false
       const dev = await ensureModelsDev(options.refresh === true, allowNetwork)
-      mergeModelsDevInto(report, providerConfig.models ?? [], dev, deferred)
+      mergeModelsDevInto(report, providerConfig.models ?? [], dev, deferred, providerConfig)
     }
     if (source !== 'endpoint' && source !== 'modelsdev') {
-      mergeCatalog(report, providerConfig.models ?? [], snapshot, providerConfig.api)
-      applyDeferredModelsDevLevels(report, deferred)
+      mergeCatalog(report, providerConfig.models ?? [], snapshot, providerConfig.api, providerConfig)
+      applyDeferredModelsDevLevels(report, deferred, providerConfig)
     }
-    mergeFallbacks(report, providerConfig.models ?? [], config.fallbacks, config.fallbacks !== undefined)
-    if (options.active) {
-      if (!options.confirm) {
-        report.notes.push('active=true 但缺少 confirm=true（主动探测会消耗额度，需用户明确批准）——本次仅做被动发现')
-      } else {
-        const levels = options.levels && options.levels.length > 0 ? options.levels : ['low', 'medium', 'high']
-        const url = providerConfig.baseURL.replace(/\/+$/, '') + '/chat/completions'
-        const headers: Record<string, string> = {
-          'content-type': 'application/json',
-          ...(providerConfig.apiKey ? { authorization: `Bearer ${providerConfig.apiKey}` } : {}),
-          ...(providerConfig.headers ?? {}),
-        }
-        // 负控（决策 D7）：端点若连无效值都接受，则「接受某个等级」不构成证据。
-        const control = await probeReasoningEfforts({
-          url, headers, levels: ['__dsh_invalid__'], fetchImpl, timeoutMs: 15_000,
-          body: (level) => ({ model: report.models[0]?.id ?? '', messages: [{ role: 'user', content: 'ping' }], max_tokens: 1, reasoning_effort: level }),
-        })
-        const validates = control.rejected.length > 0
-        if (!validates) {
-          report.notes.push('负控失败：端点接受无效 reasoning_effort 值 → 接受性探测不可信，本次不据此写入等级（只保留被动/目录结论）')
-        } else {
-          for (const model of report.models) {
-            if (model.reasoningEfforts) continue
-            const result = await probeReasoningEfforts({
-              url, headers, levels, fetchImpl,
-              body: (level) => ({ model: model.id, messages: [{ role: 'user', content: 'ping' }], max_tokens: 1, reasoning_effort: level }),
-            })
-            if (result.efforts) {
-              model.reasoningEfforts = result.efforts
-              model.sources.reasoningEfforts = 'active-probe'
-            }
-            if (result.rejected.length > 0) report.notes.push(`${model.id}: 端点拒绝的等级 ${result.rejected.map((r) => r.level).join(', ')}`)
-            for (const item of result.inconclusive) report.notes.push(`${model.id}: 等级 ${item.level} 结果不确定（${item.reason}）`)
-          }
-        }
-      }
-    }
+    mergeFallbacks(report, providerConfig.models ?? [], config.fallbacks, config.fallbacks !== undefined, providerConfig)
+    applyMimoThinkingProfile(providerConfig, report)
+    await runConfirmedActiveProbe(providerConfig, report, {
+      ...options,
+      offline: skipNetwork,
+      fetchImpl,
+    })
     return { providerConfig, report }
   }
 
   const probeTool = defineTool({
     name: 'model_capability_probe',
     description:
-      'Discover capability metadata for a user-declared provider route, in source order: endpoint descriptor, vendor schema, models.dev encyclopedia, engine catalog. ' +
-      'Never inferred from URLs or names; unknown stays unknown. ' +
-      'Active probes spend quota, so they need active=true and confirm=true, and are discarded unless a negative control proves the endpoint validates the field. ' +
-      'apply=true writes the discovered fields back (missing fields only).',
+      'Discover capabilities for a user-declared route in source order: endpoint descriptor, vendor schema, models.dev, engine catalog. ' +
+      'Never infer from URL/name; unknown stays unknown. ' +
+      'Active probes are billable, require active=true and confirm=true, and use supported Responses or explicitly configured standard OpenAI Completions with a rejecting negative control. MiMo toggles are not effort probes. ' +
+      'apply=true fills missing fields only.',
     parameters: {
       provider: { type: 'string', required: true, description: 'llm-pi-ai provider route id, e.g. "my-gateway"' },
-      active: { type: 'boolean', description: 'Also run active reasoning-effort probes (default false)' },
-      confirm: { type: 'boolean', description: 'Explicit user approval for active probes (required when active=true)' },
-      levels: { type: 'array', items: { type: 'string' }, description: 'Candidate effort words for active probes (default low/medium/high)' },
+      active: { type: 'boolean', description: 'Run billable probes (default false)' },
+      confirm: { type: 'boolean', description: 'Required with active=true' },
+      levels: { type: 'array', items: { type: 'string' }, description: 'Candidate levels (default low/medium/high)' },
       apply: { type: 'boolean', description: 'Write discovered capabilities back to settings (missing fields only)' },
       offline: { type: 'boolean', description: 'Skip network entirely and use only the engine catalog (default false)' },
       source: { type: 'string', description: 'Source stage (default auto)' },
@@ -700,13 +857,12 @@ export function apply(ctx: Context, config: PluginConfig = {}) {
   const applyTool = defineTool({
     name: 'model_capability_apply',
     description:
-      'Discover and write back missing model-level capabilities for one user-declared provider route. ' +
-      'Only fills fields the route does not declare; never overwrites a user value. ' +
-      'Spends quota only with active=true and confirm=true.',
+      'Discover and fill missing model-level capabilities for a declared route; preserve user values. ' +
+      'Active probes are billable, require active=true and confirm=true, and use supported Responses or explicitly configured standard OpenAI Completions with a rejecting negative control. MiMo and offline mode never send effort probes.',
     parameters: {
       provider: { type: 'string', required: true, description: 'llm-pi-ai provider route id' },
-      active: { type: 'boolean', description: 'Also run active reasoning-effort probes (default false)' },
-      confirm: { type: 'boolean', description: 'Explicit approval for active probes' },
+      active: { type: 'boolean', description: 'Run billable probes (default false)' },
+      confirm: { type: 'boolean', description: 'Required with active=true' },
       offline: { type: 'boolean', description: 'Use only the engine catalog (default true for apply)' },
       source: { type: 'string', description: 'Source stage (default auto)' },
     },
@@ -818,6 +974,11 @@ export function apply(ctx: Context, config: PluginConfig = {}) {
     /** 来源戳：记录「该字段现在的值是我方写下的」，使新发现的值可刷新我方旧写入（用户手写值无戳）。 */
     const stamps = createStampStore()
 
+    // settings.describe performs full profile/schema projection even with a namespace
+    // hint. Cached catalog parsing and the final fresh signature must run in separate
+    // event-loop turns so an offline pass cannot combine their synchronous cost.
+    const yieldAutoPass = () => new Promise<void>((resolve) => setImmediate(resolve))
+
     const runAutoPass = async () => {
       const routes = routesToConsider()
       diag(`runAutoPass: routes=${JSON.stringify(routes)}`)
@@ -835,6 +996,8 @@ export function apply(ctx: Context, config: PluginConfig = {}) {
       // 只在「本轮已经写过」之后才重读：首轮零额外开销，多路由时也只在必要时才多读一次。
       let wroteThisPass = false
       for (const route of routes) {
+        await yieldAutoPass()
+        if (stoppedRef.value) return
         try {
           // offline 保持既有「不联网」语义，useCachedModelsDev 让 S3 用缓存参与补给；
           // allowModelsDevNetwork=false 保证 tick 绝不触发网络（T1 回归判据，见 t1-poll-cost.test.mjs）。
@@ -898,6 +1061,8 @@ export function apply(ctx: Context, config: PluginConfig = {}) {
             diag(force ? 'tick: event-driven (settings/document-updated)' : 'tick: first pass (baseline)')
           }
           await runAutoPass()
+          await yieldAutoPass()
+          if (stoppedRef.value) return
           // 写回会改变签名，刷新一次基线避免下一轮重复执行
           tickSection = undefined
           signature = signatureOf()

@@ -51,15 +51,31 @@ internal object WebViewShim {
    */
   fun providerAvailable(): Boolean = providerPackageName().isNotEmpty()
 
-  /** 内核主版本号；读不到记 0（显式未知——判据侧 0 不冒充通过）。 */
-  fun providerMajor(): Int = majorOf(providerVersionName())
-
   /**
    * 「首个点分段数字」主版本号解析。**纯函数**（不碰 android.*）：JVM 单测直接跑，
    * UA-CH 等需要「任意版本串 → major」的调用点也复用它；版本串异形或空串一律回 0。
    */
   internal fun majorOf(versionName: String): Int =
     Regex("(\\d+)\\.").find(versionName)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+
+  /**
+   * Returns the Chromium build version reported by this WebView's actual User-Agent.
+   * Vendor provider package versions (for example Huawei's `14.0.0.370`) are not
+   * Chromium versions and must not be compared with Chromium syntax or UA-CH floors.
+   */
+  internal fun chromiumVersionFromUserAgent(userAgent: String): String =
+    Regex("(?:^|\\s)Chrome/([0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+)")
+      .find(userAgent)?.groupValues?.get(1).orEmpty()
+
+  /** Three-state result prevents a vendor package version or missing UA from masquerading as a Chromium floor failure. */
+  internal fun syntaxFloorStatus(chromiumVersion: String, floorMajor: Int): String {
+    val major = majorOf(chromiumVersion)
+    return when {
+      major <= 0 -> "unknown"
+      major >= floorMajor -> "true"
+      else -> "false"
+    }
+  }
 
   // ── androidx.webkit 能力门 ──────────────────────────────────────────
 

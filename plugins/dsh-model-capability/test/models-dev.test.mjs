@@ -159,6 +159,18 @@ test('E-P2-2 S3 命中引擎目录没有的 id 并给出字段（source=models-d
   assert.equal(report.unknown.length, 0, '被 S3 覆盖后不再是 unknown')
 })
 
+test('Responses models.dev multi-effort lists remain unknown without evidence of distinct semantics', () => {
+  const snap = buildModelsDevSnapshot([
+    { id: 'mimo-like', provider: 'declared-source', thinkingLevels: ['low', 'medium', 'high'] },
+  ])
+  const report = emptyReport('route', ['mimo-like'])
+  mergeModelsDevInto(report, ['mimo-like'], snap, new Map(), {
+    route: 'route', api: 'openai-responses', baseURL: 'https://example.invalid', models: ['mimo-like'],
+  })
+  assert.equal(report.models[0].reasoningEfforts, undefined)
+  assert.ok(report.notes.some((note) => note.includes('无法证明 Responses 各等级语义不同')))
+})
+
 test('E-P2-2 反证：S1-S4 全空且无 S5 -> 不写任何字段，unknown 保留', () => {
   const report = emptyReport('gw', ['nobody-knows-this'])
   mergeModelsDevInto(report, ['nobody-knows-this'], buildModelsDevSnapshot([]))

@@ -1,5 +1,5 @@
 # PR Gate — dsh-mobile-apk: static scan + Kotlin compile gate + PR spec checks
-# Release gating still lives in the local build-release.ps1; this only blocks low-level errors and spec issues.
+# Release and APK packaging use the repository build entrypoints; this workflow checks source contracts.
 name: PR Gate
 
 on:
@@ -7,12 +7,24 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   static:
     name: 冲突标记与敏感信息扫描
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with: { node-version: '24' }
+      # APK assembly/version/signature contracts are small Node-only regressions; run them on every PR
+      # instead of waiting for a manual local build or the release workflow to exercise them.
+      - name: APK 组装、版本与签名回归
+        if: always()
+        run: node --test scripts/check-apk-signatures.test.mjs scripts/resolve-version-suffix.test.mjs scripts/build-apk-engine.test.mjs scripts/check-third-party.test.mjs
       - name: 冲突标记检查
         if: always()
         run: |
@@ -20,7 +32,7 @@ jobs:
             echo "::error::检测到未解决的 merge conflict 标记"
             exit 1
           fi
-          echo "无冲突标记 ✓"
+          echo "无冲突标记"
       - name: 敏感信息扫描
         if: always()
         run: |
@@ -28,19 +40,12 @@ jobs:
             echo "::error::检测到疑似密钥/令牌"
             exit 1
           fi
-          echo "无敏感信息 ✓"
+          echo "无敏感信息"
       - name: 来源审计源码替换回归
         if: always()
         run: |
           python3 -m unittest discover -s scripts/source-build -p 'test_*.py' -v
-          node --test scripts/source-build/reconcile-harness-vendor-lock.test.mjs
-          node --test scripts/source-build/check-package-lock-roots.test.mjs
-          node --test scripts/source-build/check-android-native-runtime-packages.test.mjs
-          node --test scripts/source-build/preset-carriers.test.mjs
-          node --test scripts/source-build/restore-overlay-pins.test.mjs
-          node --test scripts/source-build/reconcile-engine-patch-copies.test.mjs
-          node --test scripts/source-build/normalize-snapshot.test.mjs
-          node --test scripts/source-build/source-chain-rerun.test.mjs
+          node --test scripts/source-build/*.test.mjs
           node scripts/source-build/check-package-lock-roots.mjs
       # 补丁镜像面（自我一致性，不引用协调仓）：本仓是公开的自包含构建宿主，**不得**依赖
       # 私有协调仓——此前用 `GH_PAT` 跨仓检出私有 dsh-mobile，PAT 失效即在检出步骤硬失败，
@@ -56,15 +61,27 @@ jobs:
           node scripts/check-patch-mirror.mjs --self
           # 0.14.2 T6：夹具停在上一代引擎时补丁回归测试是结构性假绿（本仓同样携带 tests/ 镜像面）
           node scripts/check-patch-fixtures.mjs
-          node scripts/patches/tests/spj-migration-link-f5.test.mjs
-          node scripts/patches/tests/atomic-stale-lock.test.mjs
-          node scripts/patches/tests/publish-exclusive-reclaim.test.mjs
+          # 0.14.5 C-1：原先此处硬编码跑 3 个补丁回归（26 个里只覆盖 3 个）。改用清单门禁——
+          # 它串行跑全部 26 个，并对已知失败要求带 reason/since 的显式声明，新增失败立刻判红。
+          # 那 3 条已被完整覆盖，故删除硬编码行而不是并行保留（避免两处清单各自漂移）。
+          node scripts/check-patch-test-manifest.mjs
+      - name: 准备插件产物（单次锁解析、安装与构建）
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          # termux 位于统一清单首位，linux-env 编译依赖它的 lib；各消费者复用本次产物。
+          mapfile -t plugin_dirs < <(node -e "const {dirs}=require('./scripts/plugin-dirs.json'); console.log(dirs.filter(d=>d==='dsh-shell-termux'||d.startsWith('plugins/')).join('\n'))")
+          test "${#plugin_dirs[@]}" -gt 0
+          for d in "${plugin_dirs[@]}"; do
+            node scripts/source-build/install-project-dependencies.mjs "$d" .deploy-tmp/source-build/plugin-lock-resolution-pr.json
+            (cd "$d" && npm run build)
+          done
       # 控制协议 V2（0.13.8 批 F）：引擎侧编解码的往返等价与体积基线（壳侧 Kotlin 一侧由
       # 本仓单测 + 跨语言往返门禁另守）。
       - name: 协议 V2 往返与体积门禁
         if: always()
         run: |
-          (cd plugins/dsh-android-manage && npm install --no-audit --no-fund && npm run build)
           node scripts/check-protocol-v2.mjs
       - name: 控制 op 登记链门禁
         if: always()
@@ -84,9 +101,6 @@ jobs:
       - name: 插件单测门禁
         if: always()
         run: |
-          for d in dsh-shell-termux plugins/dsh-android-bridge plugins/dsh-android-manage plugins/dsh-android-linux-env plugins/dsh-android-file-open plugins/dsh-android-browser plugins/dsh-android-vdisplay plugins/dsh-model-capability; do
-            (cd "$d" && npm install --no-audit --no-fund && npm run build)
-          done
           node scripts/check-plugin-tests.mjs
       # 工具返回值 vs output.schema 运行时契约门禁（0.13.8-b 批 B2 T2 / E-10）。
       # 依赖上一步构建出的 8 个包 lib（门禁要求 7 个插件的 lib/index.js 在场，缺产物判红——
@@ -94,17 +108,8 @@ jobs:
       - name: 工具输出 schema 契约门禁
         if: always()
         run: |
-          # 净检出里没有引擎校验器 `@deepseek-ai/dsh-tools`（它是各插件的 peerDependency，
-          # 上一步的 `npm install` 在 CI 上不会把它带进来）⇒ 本门禁在 CI 结构上取不到判据、
-          # 只能直接判红（本轮实锤：PR 恒红）。该包**公开可取**，故显式装到 manage 的 node_modules
-          # （门禁的首选候选路径），门禁照常真跑，不用 SKIP 掩盖。
-          #
-          # 版本**从 manage 的 peerDependencies 现取**，不写字面量：追版时 pin 一抬，写死的旧版本就会
-          # 与它冲突（实测 0.1.7-rc.1 的 peer 与写死的 0.1.1-rc.2 触发 ERESOLVE，整步 exit 1）。
-          # 该 pin 是 semver range（^0.1.7-rc.1），npm install 需要确切版本号，故取 range 里的下限。
-          TOOLS_PIN=$(node -e "const r=require('./plugins/dsh-android-manage/package.json').peerDependencies['@deepseek-ai/dsh-tools'];console.log(r.replace(/^[\^~>=]+/,''))")
-          echo "dsh-tools pin (from peerDependencies) = $TOOLS_PIN"
-          (cd plugins/dsh-android-manage && npm install --no-save --no-audit --no-fund "@deepseek-ai/dsh-tools@$TOOLS_PIN")
+          # manage 将引擎校验器列为固定 devDependency；准备阶段的已解析 lock/npm ci 已安装它。
+          # 契约脚本直接导入该真实校验器，缺席仍判红，不重新解析第二套依赖图。
           node scripts/check-tool-output-schema.mjs
       # 壳侧加固语义（NSC / backup 规则 / exported）与子进程有界读（0.13.8-b FX-208.4 / E1）
       - name: 壳侧加固与有界读门禁
@@ -152,17 +157,13 @@ jobs:
           # 执行地图覆盖与锚点（0.14.2 D7）：纳入聚合声明集后，apk 侧 CI 也必须有独立调用点。
           node scripts/check-code-map.mjs
           node scripts/check-build-chain-abort.mjs
+          node scripts/check-perf-instrumentation.test.mjs
           node scripts/check-perf-instrumentation.mjs
       # 模型面工具 wire 预算（0.14.0 §4.1 渐进披露）：双口径；名单从 capability-gate 导出。
       # 需先构建七个模型面插件的 lib（门禁真跑 apply()），缺产物时门禁明确拒绝而非假绿。
       - name: 模型面工具 wire 预算门禁
         if: always()
         run: |
-          # dsh-shell-termux 必须在列（linux-env 的 src 直接 import @dsh-android/dsh-shell-termux，
-          # 缺它 tsc 报 TS2307）。顺序与云端 build-apk.yml 一致：termux -> 插件。
-          for d in dsh-shell-termux plugins/dsh-android-bridge plugins/dsh-android-manage plugins/dsh-android-linux-env plugins/dsh-android-file-open plugins/dsh-android-browser plugins/dsh-android-vdisplay plugins/dsh-model-capability; do
-            (cd "$d" && npm install --no-audit --no-fund && npm run build)
-          done
           node scripts/check-tool-surface-budget.mjs
 
   compile:
@@ -170,6 +171,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-java@v4
         with:
           distribution: temurin

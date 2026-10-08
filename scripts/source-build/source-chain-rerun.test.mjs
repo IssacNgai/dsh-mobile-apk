@@ -9,11 +9,11 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 const ROOT = resolve(import.meta.dirname, '../..')
 const yaml = readFileSync(join(ROOT, '.github/workflows/build-apk-source.yml'), 'utf8').replaceAll('\r\n', '\n')
-function step(name) {
-  const start = yaml.indexOf('      - name: ' + name + '\n')
+function step(name, workflow = yaml) {
+  const start = workflow.indexOf('      - name: ' + name + '\n')
   assert.notEqual(start, -1)
-  const end = yaml.indexOf('\n      - name:', start + 1)
-  const block = yaml.slice(start, end < 0 ? undefined : end)
+  const end = workflow.indexOf('\n      - name:', start + 1)
+  const block = workflow.slice(start, end < 0 ? undefined : end)
   const marker = '        run: |\n'
   assert.ok(block.includes(marker))
   return block.slice(block.indexOf(marker) + marker.length).split('\n').map(line => line.startsWith('          ') ? line.slice(10) : line).join('\n')
@@ -31,6 +31,56 @@ function bash(script, root, extra = {}) {
   return r
 }
 const linux = { skip: process.platform !== 'linux' }
+const buildYaml = readFileSync(join(ROOT, '.github/workflows/build-apk.yml'), 'utf8').replaceAll('\r\n', '\n')
+const pluginDirs = JSON.parse(readFileSync(join(ROOT, 'scripts/plugin-dirs.json'), 'utf8')).dirs
+const buildableDirs = pluginDirs.filter(d => JSON.parse(readFileSync(join(ROOT, d, 'package.json'), 'utf8')).scripts?.build)
+function preparePluginBuild(root) {
+  mkdirSync(join(root, 'scripts'), { recursive: true })
+  mkdirSync(join(root, 'bin'))
+  writeFileSync(join(root, 'scripts/plugin-dirs.json'), JSON.stringify({ dirs: pluginDirs }))
+  for (const d of pluginDirs) {
+    mkdirSync(join(root, d), { recursive: true })
+    writeFileSync(join(root, d, 'package.json'), JSON.stringify({ scripts: buildableDirs.includes(d) ? { build: 'fixture' } : {} }))
+  }
+  const quote = value => "'" + value.replaceAll("'", "'\\''") + "'"
+  writeFileSync(join(root, 'bin/node'), [
+    '#!/bin/bash', 'set -eu',
+    'if [ "$1" = -e ]; then exec ' + quote(process.execPath) + ' "$@"; fi',
+    'printf "deps:%s\\n" "$2" >> "$HOME/plugin-calls"',
+    'if [ "$2" = "${FAILURE_PACKAGE:-}" ]; then exit 23; fi', '',
+  ].join('\n'))
+  writeFileSync(join(root, 'bin/npm'), [
+    '#!/bin/bash', 'set -eu', 'test "$1" = run; test "$2" = build',
+    'printf "build:%s\\n" "${PWD#"$HOME/"}" >> "$HOME/plugin-calls"', '',
+  ].join('\n'))
+  chmodSync(join(root, 'bin/node'), 0o755)
+  chmodSync(join(root, 'bin/npm'), 0o755)
+}
+for (const [label, script] of [
+  ['normal', step('准备并构建插件（统一清单、锁解析与单次构建）', buildYaml)],
+  ['source', step('Build project plugins from source')],
+]) {
+  test(label + ' plugin preparation: manifest order, one install and build per package', linux, () => fixture(root => {
+    preparePluginBuild(root)
+    const r = bash(script, root)
+    assert.equal(r.status, 0, r.stderr)
+    assert.deepEqual(readFileSync(join(root, 'plugin-calls'), 'utf8').trim().split('\n'),
+      buildableDirs.flatMap(d => ['deps:' + d, 'build:' + d]))
+    assert.ok(buildableDirs.indexOf('dsh-shell-termux') < buildableDirs.indexOf('plugins/dsh-android-linux-env'))
+  }))
+  test(label + ' plugin preparation: dependency failure stops before any package build', linux, () => fixture(root => {
+    preparePluginBuild(root)
+    const r = bash(script, root, { FAILURE_PACKAGE: buildableDirs[0] })
+    assert.equal(r.status, 23, r.stderr)
+    assert.equal(readFileSync(join(root, 'plugin-calls'), 'utf8'), 'deps:' + buildableDirs[0] + '\n')
+  }))
+  test(label + ' plugin preparation: broken manifest cannot silently produce an empty success', linux, () => fixture(root => {
+    preparePluginBuild(root)
+    writeFileSync(join(root, 'scripts/plugin-dirs.json'), '{broken')
+    assert.notEqual(bash(script, root).status, 0)
+    assert.equal(existsSync(join(root, 'plugin-calls')), false)
+  }))
+}
 const bootstrap = step('Authenticate official Termux bootstrap and extract signing keys')
 const guard = bootstrap.slice(bootstrap.indexOf('bootstrap_sha256='), bootstrap.indexOf('\n# 先清空'))
 const good = Buffer.from('authenticated dummy bootstrap\n')

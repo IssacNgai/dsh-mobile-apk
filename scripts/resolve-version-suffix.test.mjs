@@ -1,0 +1,50 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { existsSync, readFileSync } from 'node:fs'
+import { resolveVersionSuffix } from './resolve-version-suffix.mjs'
+
+const BASE = '0.14.5'
+
+test('defaults to the Gradle version with no suffix', () => {
+  assert.deepEqual(resolveVersionSuffix(BASE), { version: BASE, suffix: '' })
+  assert.deepEqual(resolveVersionSuffix(BASE, BASE), { version: BASE, suffix: '' })
+})
+
+test('derives a suffix from an explicit full version label', () => {
+  assert.deepEqual(resolveVersionSuffix(BASE, '0.14.5-preview'), { version: '0.14.5-preview', suffix: '-preview' })
+})
+
+test('applies an explicit suffix without duplicating the base version', () => {
+  assert.deepEqual(resolveVersionSuffix(BASE, '', '-source'), { version: '0.14.5-source', suffix: '-source' })
+  assert.deepEqual(resolveVersionSuffix(BASE, BASE, '-source'), { version: '0.14.5-source', suffix: '-source' })
+  assert.deepEqual(resolveVersionSuffix(BASE, '0.14.5-source', '-source'), { version: '0.14.5-source', suffix: '-source' })
+})
+
+test('rejects a requested version that disagrees with the Gradle authority', () => {
+  assert.throws(() => resolveVersionSuffix(BASE, '0.14.6'), /must equal Gradle base/)
+  assert.throws(() => resolveVersionSuffix(BASE, '0.14.5-other', '-source'), /does not equal base/)
+})
+
+test('rejects malformed suffixes and malformed Gradle versions', () => {
+  assert.throws(() => resolveVersionSuffix(BASE, '', 'source'), /must start with/)
+  assert.throws(() => resolveVersionSuffix(BASE, '', '-bad/path'), /must start with/)
+  assert.throws(() => resolveVersionSuffix('0.14'), /invalid Gradle base/)
+})
+
+test('release script treats Version as the final name and passes only its derived suffix to the shared build engine', () => {
+  const script = readFileSync(new URL('./build-release.ps1', import.meta.url), 'utf8')
+  const engine = readFileSync(new URL('./build-apk-engine.mjs', import.meta.url), 'utf8')
+  assert.match(script, /resolve-version-suffix\.mjs/)
+  assert.match(script, /"--suffix",\s*\$VersionSuffix/)
+  assert.doesNotMatch(script, /-PversionNameSuffix=/)
+  assert.match(engine, /`-PversionNameSuffix=\$\{suffix\}`/)
+})
+
+test('the app Gradle file remains the 0.14.5 and versionCode 47 authority', () => {
+  const candidates = [new URL('../app/build.gradle.kts', import.meta.url), new URL('../dsh-mobile-apk/app/build.gradle.kts', import.meta.url)]
+  const gradlePath = candidates.find((candidate) => existsSync(candidate))
+  assert.ok(gradlePath, 'app/build.gradle.kts must exist in the APK tree')
+  const gradle = readFileSync(gradlePath, 'utf8')
+  assert.match(gradle, /versionCode\s*=\s*47\b/)
+  assert.match(gradle, /versionName\s*=\s*"0\.14\.5"\s*\+\s*snapshotSuffix/)
+})

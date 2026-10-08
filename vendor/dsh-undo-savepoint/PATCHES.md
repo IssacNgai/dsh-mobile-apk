@@ -56,7 +56,7 @@ npm pack dsh-undo-savepoint@0.4.9 && tar -xzf dsh-undo-savepoint-0.4.9.tgz
 # 2) 覆盖本目录（保留 PATCHES.md；lib/ 整目录替换）
 # 3) 施加全部补丁
 node scripts/patches/apply-patches.mjs vendor --apply \
-  --only undo-E1,undo-E2,undo-E3,undo-E4,undo-E5,undo-E6,undo-E7,undo-E8,undo-safe-align-S1,undo-api-auth-U1
+  --only undo-E1,undo-E2,undo-E3,undo-E4,undo-E5,undo-E6,undo-E7,undo-E8,undo-safe-align-S1,undo-safe-transaction-S2,undo-api-auth-U1
 # 4) 门禁自验
 node scripts/patches/apply-patches.mjs vendor --check   # 退出 0
 ```

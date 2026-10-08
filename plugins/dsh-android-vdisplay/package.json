@@ -28,6 +28,7 @@
   "private": true,
   "scripts": {
     "build": "tsc -p . && tsc -p tsconfig.client.json --noEmit && node build-client.mjs",
+    "test": "npm run build && node --test test/*.test.mjs",
     "typecheck": "tsc -p . --noEmit && tsc -p tsconfig.client.json --noEmit"
   },
   "peerDependencies": {

@@ -58,13 +58,31 @@ internal object SnapshotTransaction {
    */
   private const val TAG_RELINK = "dsh-snapshot-relink"
 
-  enum class Phase { STAGED, SWAPPING, SWAPPED }
+  enum class Phase { STAGED, SWAPPING, SWAPPED, ONLINE_COMMITTED, UNKNOWN }
+  enum class Purpose { FACTORY, ONLINE_UPDATE, UNKNOWN }
+
+  /** Pure admission decisions used under EngineManager's shared transaction-state lock. */
+  internal fun canBeginFactoryTransaction(factoryBusy: Boolean, onlineBusy: Boolean): Boolean =
+    !factoryBusy && !onlineBusy
+
+  internal fun canBeginOnlineTransaction(
+    factoryBusy: Boolean,
+    onlineBusy: Boolean,
+    markerPresent: Boolean,
+    previousRuntimePresent: Boolean,
+    stageResiduePresent: Boolean = false,
+  ): Boolean = !factoryBusy && !onlineBusy && !markerPresent && !previousRuntimePresent && !stageResiduePresent
 
   data class Marker(
     val phase: Phase,
     val fingerprint: String,
     val startedAt: Long,
     val moved: List<String> = emptyList(),
+    /** Missing on existing marker files: their historical meaning is factory refresh. */
+    val purpose: Purpose = Purpose.FACTORY,
+    val priorFingerprint: String = "",
+    /** Embedded APK snapshot identity authorizing any online Hard sidecar. */
+    val baseFingerprint: String = "",
   )
 
   enum class Outcome { NONE, DISCARDED_STAGE, ROLLED_BACK, ROLLED_FORWARD, ROLLBACK_FAILED }
@@ -102,6 +120,8 @@ internal object SnapshotTransaction {
     val outcome: Outcome,
     val fingerprintToCommit: String? = null,
     val failures: List<String> = emptyList(),
+    val fingerprintToRestore: String? = null,
+    val onlineUpdateCommit: Boolean = false,
   )
 
   /**
@@ -198,11 +218,14 @@ internal object SnapshotTransaction {
       file.readText()
     } catch (_: Throwable) {
       // Unreadable marker: treat it as an interrupted swap (the conservative choice).
-      return Marker(Phase.SWAPPING, "", 0L)
+      return Marker(Phase.UNKNOWN, "", 0L, purpose = Purpose.UNKNOWN)
     }
     var phase: Phase? = null
     var fingerprint = ""
     var startedAt = 0L
+    var purpose = Purpose.FACTORY
+    var priorFingerprint = ""
+    var baseFingerprint = ""
     val moved = mutableListOf<String>()
     text.lineSequence().forEach { line ->
       val separator = line.indexOf('=')
@@ -215,12 +238,16 @@ internal object SnapshotTransaction {
         }
         "fingerprint" -> fingerprint = line.substring(separator + 1)
         "started" -> startedAt = line.substring(separator + 1).toLongOrNull() ?: 0L
+        "purpose" -> purpose = try { Purpose.valueOf(line.substring(separator + 1)) } catch (_: Throwable) { Purpose.UNKNOWN }
+        "priorFingerprint" -> priorFingerprint = line.substring(separator + 1)
+        "baseFingerprint" -> baseFingerprint = line.substring(separator + 1)
         "moved" -> moved += line.substring(separator + 1)
       }
     }
     // An unknown phase is an interrupted swap: rolling back is the only outcome
     // that cannot leave a half-activated runtime behind.
-    return Marker(phase ?: Phase.SWAPPING, fingerprint, startedAt, moved)
+    val parsedPhase = phase ?: Phase.UNKNOWN
+    return Marker(parsedPhase, fingerprint, startedAt, moved, purpose, priorFingerprint, baseFingerprint)
   }
 
   fun clearMarker(filesDir: File) {
@@ -474,9 +501,16 @@ internal object SnapshotTransaction {
      * （Windows 无建链权限）拿不到判红证据，必须让它们可被测试构造。
      */
     links: LinkPrimitives = PRODUCTION_LINKS,
+    purpose: Purpose = Purpose.FACTORY,
+    priorFingerprint: String = "",
+    baseFingerprint: String = "",
   ): List<String> {
     val stagedUsr = File(stagedRoot, "usr")
     if (!SnapshotFs.exists(stagedUsr)) throw IOException("staged runtime is missing usr/")
+    // An online archive may be the same full usr/ + home/ snapshot used for factory
+    // installation. Its staged home is evidence/input only; online updates never
+    // activate it because home contains user data. Keep it under this transaction's
+    // private stage until commit/rollback cleanup removes the owned stage root.
     // ── issue #271 ③：动第一棵树之前的**可写性预检** ──────────────────────────────
     //
     // 缺陷形态：`.snapshot-previous` 下留着历史孤儿（issue 现场是一份 9 天前的 `usr/lib`），
@@ -495,7 +529,7 @@ internal object SnapshotTransaction {
     //   · `mergeTree` 把 staged 里 live 缺的文件补进去（相对小）。
     // 其余（usr/home 顶层条目、profiles 换位）都是 rename，不占新空间。
     // 余量取 25% + 64MB：覆盖补入文件与文件系统元数据（小文件多时块开销可观）。
-    if (spaceCheck != null) {
+    if (spaceCheck != null && purpose == Purpose.FACTORY) {
       val liveProfiles = File(File(homeDir, ".dsh"), "profiles")
       val backupBytes = SnapshotFs.sizeOf(liveProfiles)
       val required = backupBytes + backupBytes / 4 + 64L * 1024L * 1024L
@@ -508,15 +542,15 @@ internal object SnapshotTransaction {
     requireDeletableResidue(previous, ownerProbe)
     SnapshotFs.deletePathStrict(previous)
     SnapshotFs.createDirectories(previous)
-    writeMarker(filesDir, Marker(Phase.SWAPPING, fingerprint, startedAt))
+    writeMarker(filesDir, Marker(Phase.SWAPPING, fingerprint, startedAt, purpose = purpose, priorFingerprint = priorFingerprint, baseFingerprint = baseFingerprint))
     val moved = mutableListOf<String>()
     // #214：profiles 合并期间的工厂语义纠正说明（返回给调用方写日志/诊断）。
     val notes = mutableListOf<String>()
 
-    replaceEntry(filesDir, moved, fingerprint, startedAt, "usr", stagedUsr, usrDir, File(previous, "usr"), onEntry, move)
+    replaceEntry(filesDir, moved, fingerprint, startedAt, "usr", stagedUsr, usrDir, File(previous, "usr"), onEntry, move, purpose, priorFingerprint, baseFingerprint)
 
     val stagedHome = File(stagedRoot, "home")
-    if (SnapshotFs.exists(stagedHome)) {
+    if (purpose == Purpose.FACTORY && SnapshotFs.exists(stagedHome)) {
       for (entry in stagedHome.listFiles() ?: emptyArray()) {
         if (entry.name == ".dsh") {
           val liveDsh = File(homeDir, ".dsh")
@@ -536,6 +570,12 @@ internal object SnapshotTransaction {
               // 0.14.0 #214：工厂对同 id 的 disabled 语义改为权威（旧规则「以 live 为基」使
               // 旧版遗留的 ui-layout disable 永不被纠正 → 根服务 layout 不 activate）。
               mergeProfiles(filesDir, moved, fingerprint, startedAt, child, liveChild, File(previousDsh, "profiles"), onEntry, notes, links)
+              continue
+            }
+            if (SnapshotFs.exists(liveChild) && child.name !in SnapshotUserData.factorySnapshotNames) {
+              // Unknown .dsh entries can belong to newer app versions or user extensions.
+              // Seed absent paths, but never let a factory archive erase an unclassified collision.
+              onEntry("保留未分类DSH数据 " + child.name)
               continue
             }
             replaceEntry(
@@ -560,7 +600,7 @@ internal object SnapshotTransaction {
         }
       }
     }
-    writeMarker(filesDir, Marker(Phase.SWAPPED, fingerprint, startedAt, moved))
+    writeMarker(filesDir, Marker(Phase.SWAPPED, fingerprint, startedAt, moved, purpose, priorFingerprint, baseFingerprint))
     return notes
   }
 
@@ -582,43 +622,10 @@ internal object SnapshotTransaction {
    * 崩溃窗口只可能留下不带 journal 的 `.copying` 残渣（下次刷新清掉），恢复路径信任的
    * previous 一律是完整备份；宁可本次刷新失败（marker 不被清、下次重试），绝不半份覆盖。
    */
-  /**
-   * 0.14.2（D11）：清理因人肉摘除条目而变空的 `- insert:` 包装行。
-   *
-   * 判据：一个 `- insert:` 行之后、到下一个同级或更浅的非空行之前，若已无任何更深缩进行，
-   * 它就是个空壳（YAML 解析成 null 条目，引擎 boot 期拿到 nil 即抛），必须连同前后的空行一起摘掉。
-   *
-   * 本函数不参与「摘哪一条」的判定，只做摘除后的收尾——把「选择摘谁」与「清理空壳」拆开正是
-   * D11 的实质：旧实现把两者耦合在同一个缩进启发式里，误判即整组连坐。
-   *
-   * @param lines 摘除完成后的清单行（会被就地修改）。
-   * @returns 清理空壳后的同一列表（便于链式书写）。
-   */
-  private fun dropEmptyInsertWrappers(lines: MutableList<String>): MutableList<String> {
-    val indent = { line: String -> line.indexOfFirst { !it.isWhitespace() } }
-    var index = 0
-    while (index < lines.size) {
-      if (lines[index].trim() != "- insert:") { index += 1; continue }
-      val wrapperIndent = indent(lines[index])
-      var hasChild = false
-      var probe = index + 1
-      while (probe < lines.size) {
-        val candidate = lines[probe]
-        if (candidate.isBlank()) { probe += 1; continue }
-        if (indent(candidate) <= wrapperIndent) break
-        hasChild = true
-        break
-      }
-      if (hasChild) { index += 1; continue }
-      // 空壳：连同其后紧邻的空行一起摘掉，再回头吃掉它前面的空行，避免留下连续空行。
-      var end = index + 1
-      while (end < lines.size && lines[end].isBlank()) end += 1
-      lines.subList(index, end).clear()
-      while (index > 0 && lines[index - 1].isBlank()) lines.removeAt(index - 1)
-      if (index > 0) index -= 1
-    }
-    return lines
-  }
+  // 0.14.5（S-1）合并：摘除后的 `- insert:` 空壳收尾**唯一实现**在
+  // [PluginMounts.dropEmptyInsertWrappers]（本文件原有一份逐字节等价副本，两处同源必然漂移）。
+  // D11 的实质——「选择摘哪一条」与「清理空壳」解耦——在调用点体现：本文件在**全部摘除完成之后**
+  // 一次性判定空壳，见 [reconcileRemovedProfilePlugins]。
 
   /**
    * 已摘除插件的**存量迁移**（0.14.1 D-1 的设备侧收尾）。
@@ -684,7 +691,7 @@ internal object SnapshotTransaction {
                 // 放大到「整组」：同组里我们自己的硬清单插件一起消失（实测反证：2 子组里摘
                 // host-web-compat 会连带删掉 shell-termux，而日志只说摘了 1 处）。
                 // 现在无条件只消费 [index, end) 这一段；是否残留 `- insert:` 空壳由
-                // [dropEmptyInsertWrappers] 在**全部摘除完成之后**按「组内还有没有子条目」统一判定。
+                // [PluginMounts.dropEmptyInsertWrappers] 在**全部摘除完成之后**按「组内还有没有子条目」统一判定。
                 index = end
                 continue
               }
@@ -693,7 +700,7 @@ internal object SnapshotTransaction {
             index += 1
           }
           if (dropped > 0) {
-            val tidied = dropEmptyInsertWrappers(kept)
+            val tidied = PluginMounts.dropEmptyInsertWrappers(kept)
             val text = tidied.joinToString("\n") + (if (tidied.isNotEmpty()) "\n" else "") +
               "# 0.14.1：已摘除 " + removed.mountId + "（升级迁移自动清理；本行由 SnapshotTransaction 写入）\n"
             patch.writeText(text)
@@ -1103,46 +1110,9 @@ internal object SnapshotTransaction {
       )
       return
     }
-    val user = try { org.json.JSONObject(liveText) } catch (_: Throwable) { return }
-    val factory = try { org.json.JSONObject(stagedText) } catch (_: Throwable) { return }
-    val factoryDeps = factory.optJSONObject("dependencies") ?: org.json.JSONObject()
-    if (factoryDeps.length() > 0) {
-      val deps = user.optJSONObject("dependencies") ?: org.json.JSONObject().also { user.put("dependencies", it) }
-      for (key in factoryDeps.keys()) if (!deps.has(key)) deps.put(key, factoryDeps.getString(key))
-    }
-    // bundles 并集（兼容两种键形态）：真实出厂清单写的是**嵌套** dsh.profile.bundles
-    // （scripts/lib/profile-seed.mjs:38-42；设备实测同一形态），而旧实现只读扁键
-    // "dsh.profile.bundles" ⇒ 真机恒不命中，bundles 并集静默失效（工厂新增 bundle 进不了 live）。
-    val factoryBundles = findBundles(factory)
-    if (factoryBundles != null && factoryBundles.length() > 0) {
-      val bundles = findBundles(user)
-        ?: createBundles(user, nested = nestedBundles(factory) || user.optJSONObject("dsh") != null)
-      val present = (0 until bundles.length()).map { bundles.optString(it) }.toHashSet()
-      for (i in 0 until factoryBundles.length()) {
-        val item = factoryBundles.optString(i)
-        if (item.isNotEmpty() && item !in present) bundles.put(item)
-      }
-    }
+    val merged = ProfilePackageManifest.merge(liveText, stagedText) ?: return
     // issue #274 ②：原子写 + 写后 JSON 可解析性校验（失败留 .pre-*，见 writeTextAtomic）。
-    writeTextAtomic(live, user.toString(2), "package.json") { validateJson(it, "package.json") }
-  }
-
-  /** 读 bundles：先历史扁键，再真实嵌套 dsh.profile.bundles。 */
-  private fun findBundles(root: org.json.JSONObject): org.json.JSONArray? =
-    root.optJSONArray("dsh.profile.bundles")
-      ?: root.optJSONObject("dsh")?.optJSONObject("profile")?.optJSONArray("bundles")
-
-  /** 该清单的 bundles 是否为嵌套形态（而非历史扁键）。 */
-  private fun nestedBundles(root: org.json.JSONObject): Boolean =
-    root.optJSONArray("dsh.profile.bundles") == null &&
-      root.optJSONObject("dsh")?.optJSONObject("profile")?.optJSONArray("bundles") != null
-
-  /** 按 [nested] 新建 bundles 数组（live 缺该键时用工厂/live 的实际形态，避免写进引擎不读的扁键）。 */
-  private fun createBundles(root: org.json.JSONObject, nested: Boolean): org.json.JSONArray {
-    if (!nested) return org.json.JSONArray().also { root.put("dsh.profile.bundles", it) }
-    val dsh = root.optJSONObject("dsh") ?: org.json.JSONObject().also { root.put("dsh", it) }
-    val profile = dsh.optJSONObject("profile") ?: org.json.JSONObject().also { dsh.put("profile", it) }
-    return org.json.JSONArray().also { profile.put("bundles", it) }
+    writeTextAtomic(live, merged, "package.json") { validateJson(it, "package.json") }
   }
 
   /**
@@ -1175,16 +1145,33 @@ internal object SnapshotTransaction {
     homeDir: File,
   ): Recovery {
     val marker = readMarker(filesDir) ?: return Recovery(Outcome.NONE)
+    if (marker.phase == Phase.UNKNOWN || marker.purpose == Purpose.UNKNOWN ||
+      (marker.phase == Phase.ONLINE_COMMITTED && marker.purpose != Purpose.ONLINE_UPDATE)) {
+      return Recovery(Outcome.ROLLBACK_FAILED, failures = listOf("transaction marker has unknown or incompatible phase/purpose; retained for recovery"))
+    }
     if (marker.phase == Phase.STAGED) {
       SnapshotFs.deletePath(stagedRoot)
       SnapshotFs.deletePath(previousRoot(filesDir))
       clearMarker(filesDir)
       return Recovery(Outcome.DISCARDED_STAGE)
     }
+    if (marker.phase == Phase.ONLINE_COMMITTED && marker.purpose == Purpose.ONLINE_UPDATE) {
+      return Recovery(Outcome.ROLLED_FORWARD, marker.fingerprint.ifEmpty { null }, onlineUpdateCommit = true)
+    }
     if (marker.phase == Phase.SWAPPED) {
+      if (marker.purpose == Purpose.ONLINE_UPDATE) {
+        val result = rollbackOnlineUpdate(filesDir, stagedRoot, usrDir, homeDir, marker)
+        if (!result.ok) return Recovery(Outcome.ROLLBACK_FAILED, failures = result.failures)
+        clearMarker(filesDir)
+        return Recovery(Outcome.ROLLED_BACK, fingerprintToRestore = marker.priorFingerprint)
+      }
       return Recovery(Outcome.ROLLED_FORWARD, marker.fingerprint.ifEmpty { null })
     }
-    val result = rollback(filesDir, stagedRoot, usrDir, homeDir, marker)
+    val result = if (marker.purpose == Purpose.ONLINE_UPDATE) {
+      rollbackOnlineUpdate(filesDir, stagedRoot, usrDir, homeDir, marker)
+    } else {
+      rollback(filesDir, stagedRoot, usrDir, homeDir, marker)
+    }
     if (!result.ok) {
       // 【D-3 / 审查 §7.7.5】回滚失败**不得无条件清 marker**。
       //
@@ -1195,7 +1182,10 @@ internal object SnapshotTransaction {
       return Recovery(Outcome.ROLLBACK_FAILED, null, result.failures)
     }
     clearMarker(filesDir)
-    return Recovery(Outcome.ROLLED_BACK)
+    return Recovery(
+      Outcome.ROLLED_BACK,
+      fingerprintToRestore = marker.priorFingerprint.takeIf { marker.purpose == Purpose.ONLINE_UPDATE },
+    )
   }
 
   /**
@@ -1248,6 +1238,31 @@ internal object SnapshotTransaction {
     }
   }
 
+  /** Online updates always replace an existing runtime, so its displaced usr is mandatory rollback evidence. */
+  fun rollbackOnlineUpdate(
+    filesDir: File,
+    stagedRoot: File,
+    usrDir: File,
+    homeDir: File,
+    marker: Marker,
+  ): RollbackResult {
+    if (marker.purpose != Purpose.ONLINE_UPDATE) return RollbackResult(false, listOf("marker purpose mismatch"))
+    val previousUsr = File(previousRoot(filesDir), "usr")
+    // The journal is written before the first rename. A cold kill in that tiny
+    // window leaves the complete old runtime live and no previous/usr yet; this
+    // is a safe no-op rollback, not missing recovery evidence.
+    if (marker.phase == Phase.SWAPPING && !SnapshotFs.exists(previousUsr) &&
+      File(usrDir, "bin/node").isFile) {
+      SnapshotFs.deletePath(stagedRoot)
+      SnapshotFs.deletePath(previousRoot(filesDir))
+      return RollbackResult(true, emptyList())
+    }
+    if (!SnapshotFs.exists(previousUsr) || !File(previousUsr, "bin/node").isFile) {
+      return RollbackResult(false, listOf("usr (online rollback source missing; live runtime retained)"))
+    }
+    return rollback(filesDir, stagedRoot, usrDir, homeDir, marker)
+  }
+
   private fun replaceEntry(
     filesDir: File,
     moved: MutableList<String>,
@@ -1259,13 +1274,16 @@ internal object SnapshotTransaction {
     previous: File,
     onEntry: (String) -> Unit,
     move: (File, File) -> Unit,
+    purpose: Purpose = Purpose.FACTORY,
+    priorFingerprint: String = "",
+    baseFingerprint: String = "",
   ) {
     SnapshotFs.createDirectories(live.parentFile ?: filesDir)
     SnapshotFs.createDirectories(previous.parentFile ?: filesDir)
     // Journal first: if the process dies between the two renames the recovery
     // path still knows this entry was in flight.
     moved += journalName
-    writeMarker(filesDir, Marker(Phase.SWAPPING, fingerprint, startedAt, moved.toList()))
+    writeMarker(filesDir, Marker(Phase.SWAPPING, fingerprint, startedAt, moved.toList(), purpose, priorFingerprint, baseFingerprint))
     if (SnapshotFs.exists(live)) {
       // issue #271：目标必须先清空。容错版 deletePath 可能正常返回而目录仍非空，
       // 随后 move 就抛 Directory not empty（半搬态的起点）——此处用严格版，删不净即抛。
@@ -1486,6 +1504,9 @@ internal object SnapshotTransaction {
     append("phase=").append(marker.phase.name).append('\n')
     append("fingerprint=").append(marker.fingerprint).append('\n')
     append("started=").append(marker.startedAt).append('\n')
+    if (marker.purpose != Purpose.FACTORY) append("purpose=").append(marker.purpose.name).append('\n')
+    if (marker.priorFingerprint.isNotEmpty()) append("priorFingerprint=").append(marker.priorFingerprint).append('\n')
+    if (marker.baseFingerprint.isNotEmpty()) append("baseFingerprint=").append(marker.baseFingerprint).append('\n')
     for (entry in marker.moved) append("moved=").append(entry).append('\n')
   }
 }

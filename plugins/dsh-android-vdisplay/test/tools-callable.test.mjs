@@ -31,7 +31,7 @@ function strictFace() {
       // 载荷形状必须与壳侧 `VdisplayController.status()` **逐字段对齐**（`enabled`/`ops`/
       // `transports`/`screens` 都在真回执里）。第一版夹具漏了 `enabled`，于是状态被判成
       // `vdisplay-disabled`——那不是产品缺陷，是夹具不忠实；夹具不忠实会让回归测试变成噪声。
-      enqueue: async (op) => ({
+      enqueue: async (op, args) => ({
         ok: true,
         data: {
           ok: true,
@@ -45,6 +45,7 @@ function strictFace() {
             width: 360, height: 640, densityDpi: 160, selectable: true, reason: 'DSH 创建的虚拟屏，可作为查看器目标。',
           }],
           guidance: op + ' ok',
+          ...(op === 'vdInput' ? { screenId: args?.target ?? 'virtual-1', verb: args?.verb } : {}),
         },
       }),
     },
@@ -55,7 +56,7 @@ function strictFace() {
         throw new TypeError("Cannot read properties of undefined (reading 'controlQueue')")
       }
       calls.push({ op, args, timeoutMs, auth })
-      return queue.enqueue(op)
+      return queue.enqueue(op, args)
     },
   }
   return { face, calls }
@@ -109,6 +110,74 @@ test('android_vdisplay_create 必须走通，且不得出现接收者丢失', as
   assert.ok(calls.length > 0, '必须真的经控制队列调用到壳侧')
   assert.equal(value.ok, true, '服务在场时必须成功: ' + text)
   assert.equal(value.displayId, 42)
+})
+
+function assertMatchesToolSchema(tool, value) {
+  const schema = tool.output.schema
+  assert.equal(schema.type, 'object')
+  assert.equal(schema.additionalProperties, false, 'output must reject undeclared fields')
+  for (const key of schema.required ?? []) assert.ok(Object.hasOwn(value, key), `missing required ${key}`)
+  for (const key of Object.keys(value)) {
+    assert.ok(Object.hasOwn(schema.properties, key), `unexpected output property ${key}`)
+    const expected = schema.properties[key].type
+    const actual = Array.isArray(value[key]) ? 'array' : value[key] === null ? 'null' : typeof value[key]
+    if (expected === 'integer') assert.ok(Number.isInteger(value[key]), `${key} must be integer`)
+    else assert.equal(actual, expected, `${key} must be ${expected}`)
+  }
+}
+
+test('android_vdisplay_input success receipt declares and validates state and screen identity', async () => {
+  const tools = loadTools(strictFace().face)
+  const input = tools.find((t) => t.name === 'android_vdisplay_input')
+  const value = await input.execute({ verb: 'tap', x: 12, y: 34, screenId: 'virtual-1' }, { agent: { session: 't' } })
+  assert.deepEqual(value, {
+    ok: true, code: 'vdisplay-ok', guidance: 'vdInput ok', state: 'active',
+    displayId: 42, screenId: 'virtual-1', verb: 'tap',
+  })
+  assertMatchesToolSchema(input, value)
+})
+
+test('android_vdisplay_input rejection and control failure both satisfy the strict output schema', async () => {
+  const tools = loadTools(strictFace().face)
+  const input = tools.find((t) => t.name === 'android_vdisplay_input')
+  const rejected = await input.execute({ verb: 'tap', x: -1, y: 3 }, { agent: { session: 't' } })
+  assert.equal(rejected.ok, false)
+  assertMatchesToolSchema(input, rejected)
+
+  const brokenFace = { async controlExec() { throw new Error('offline') } }
+  const brokenInput = loadTools(brokenFace).find((t) => t.name === 'android_vdisplay_input')
+  const failed = await brokenInput.execute({ verb: 'text', text: 'hello' }, { agent: { session: 't' } })
+  assert.equal(failed.ok, false)
+  assert.equal(failed.verb, 'text')
+  assertMatchesToolSchema(brokenInput, failed)
+})
+
+test('android_vdisplay_input preserves the stable scope denial code from bridge service', async () => {
+  const deniedFace = {
+    async controlExec(op) {
+      if (op === 'vdInfo') return { ok: true, data: { screens: [{ alias: 'virtual-1', kind: 'virtual', displayId: 42 }] } }
+      return { ok: false, code: 'screen-out-of-scope', error: 'screen-out-of-scope: user scope is real-only' }
+    },
+  }
+  const input = loadTools(deniedFace).find((t) => t.name === 'android_vdisplay_input')
+  const value = await input.execute({ verb: 'tap', x: 1, y: 2, screenId: 'virtual-1' }, { agent: { session: 't' } })
+  assert.equal(value.ok, false)
+  assert.equal(value.code, 'screen-out-of-scope')
+  assertMatchesToolSchema(input, value)
+})
+
+test('native vdInput execution checks scope before Shizuku and honors the explicit display target', async () => {
+  const source = (await import('node:fs')).readFileSync(fileURLToPath(KOTLIN_SOURCE), 'utf8')
+  const start = source.indexOf('fun input(context: Context, verb: String, args: JSONObject, target: String? = null)')
+  const end = source.indexOf('\n  /**', start + 1)
+  assert.ok(start >= 0 && end > start, 'VdisplayController.input source block must exist')
+  const body = source.slice(start, end)
+  assert.match(body, /if \(target != null\) recordOf\(target\) else selectedRecord\(\)/,
+    'explicit target must not be replaced by selectedRecord')
+  assert.ok(body.indexOf('scope.inputDenial(record.alias)') < body.indexOf('ShizukuTransport.runController'),
+    'scope refusal must happen before any Shizuku input dispatch')
+  assert.match(body, /\.put\("code", denial\)\.put\("reason", denial\)/,
+    'native refusal must carry the stable machine-readable denial code')
 })
 
 test('android_vdisplay_destroy 同样必须走通（同一缺陷类）', async () => {

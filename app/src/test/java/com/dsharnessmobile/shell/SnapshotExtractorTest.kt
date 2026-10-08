@@ -130,4 +130,28 @@ class SnapshotExtractorTest {
     }
   }
 
+  @Test
+  fun malformedHardArchiveCanFailAfterStagingWritesWithoutChangingLiveRuntime() {
+    val root = Files.createTempDirectory("snapshot-extractor-hard-failure-test").toFile()
+    try {
+      val live = File(root, "files").apply { mkdirs() }
+      val liveNode = File(live, "usr/bin/node").apply { parentFile!!.mkdirs(); writeText("known-good") }
+      val stage = File(live, ".snapshot-stage").apply { mkdirs() }
+      // A valid tar stream with an impossible file/child hierarchy: entry one writes to stage,
+      // entry two then fails while trying to create a directory below that regular file.
+      val malformed = archive { tar ->
+        writeEntry(tar, "usr/blocked", "file".toByteArray())
+        writeEntry(tar, "usr/blocked/child", "cannot-land".toByteArray())
+      }
+
+      val failure = runCatching { SnapshotExtractor.extract(malformed, 0L, stage, { _, _ -> }, runtimeRoot = live) }.exceptionOrNull()
+
+      assertTrue("broken hard archive must fail extraction", failure != null)
+      assertEquals("staging proves extraction began before failing", "file", File(stage, "usr/blocked").readText())
+      assertEquals("failed hard extraction must leave the live runtime untouched", "known-good", liveNode.readText())
+    } finally {
+      SnapshotFs.deletePath(root)
+    }
+  }
+
 }

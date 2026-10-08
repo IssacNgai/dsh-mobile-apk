@@ -22,6 +22,8 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { ENV_MARKER as PTC_ENV_MARKER, LAUNCH_MARKER as PTC_LAUNCH_MARKER, assertChildClearing, patchEnvironment, patchRuntimeIndex, planPatch } from './ptc-android-native-A1.mjs'
 import { PI_STREAMING_FILES, planPiStreaming } from './pi-upstream-streaming-020.mjs'
+import { MIMO_PI_FILE, planMimoThinking } from './mimo-thinking-toggle-056.mjs'
+import { CLIENT_SCAN_MARKER, TYPERT_SCAN_MARKER, planClientRegistryScan, planTypertRegistryScan } from './data/registry-scan-c4.mjs'
 import { resolveEnginePatchFile } from './resolve-engine-patch-target.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -44,6 +46,28 @@ function loadImpl(target, vendorRoot) {
 }
 function saveImpl(target, vendorRoot) {
   writeFileSync(join(vendorRoot, target), IMPL_state[target])
+}
+
+function safeModeTransactionStart(source) {
+  const selector = source.indexOf('async function safeModeOwnershipManifest(filesRoot)')
+  if (selector < 0) return -1
+  let start = source.lastIndexOf('\n', selector - 1) + 1
+  while (start > 0) {
+    const previousEnd = start - 1
+    const previousStart = source.lastIndexOf('\n', previousEnd - 1) + 1
+    const previousLine = source.slice(previousStart, previousEnd).replace(/\r$/, '')
+    if (!previousLine.startsWith('// dsh-mobile safe mode transaction (S2)')) break
+    start = previousStart
+  }
+  return start
+}
+
+function safeModeTransactionIsLf(source) {
+  const start = safeModeTransactionStart(source)
+  const end = source.indexOf('// ── 跨机一致性预检', start)
+  return start >= 0 && end > start && !source.slice(start, end).includes('\r') &&
+    !source.includes("import { join, dirname, basename, resolve, relative, sep, isAbsolute } from 'node:path';\r\n") &&
+    !source.includes("    safeModeDefaultWebStore: profileName === 'web' && overrides.autoDir === undefined && !hasConfiguredAutoDir(),\r\n")
 }
 
 /* ── H-2（0.14.2-fx-2）：G3 的归属判据真源 ────────────────────────────────────────
@@ -118,7 +142,6 @@ const F7_LEGACY_INLINE = 'const claim = await open(currentPath, "wx");'
 
 const IMPLS = {
 
-
   // Raw npm pins do not include pnpm patchedDependencies; retain the official six-provider patch.
   'pi-upstream-streaming-020': {
     file: 'usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@earendil-works/pi-ai/dist/api/openai-completions.js',
@@ -137,6 +160,23 @@ const IMPLS = {
         ? s : loadImpl(runtime + '/' + file, CURRENT_STAGE_ROOT))
       for (const file of plan) if (file.file !== 'dist/api/openai-completions.js') IMPL_state[runtime + '/' + file.file] = file.after
       return plan.find(file => file.file === 'dist/api/openai-completions.js').after
+    },
+  },
+
+  'mimo-thinking-toggle-056': {
+    file: 'usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-llm-pi-ai/lib/index.js',
+    additionalFiles: [MIMO_PI_FILE],
+    scope: 'engine',
+    check: (s) => {
+      const plan = planMimoThinking(target => target === 'usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-llm-pi-ai/lib/index.js'
+        ? s : loadImpl(target, CURRENT_STAGE_ROOT))
+      return plan.every(file => file.before === file.after)
+    },
+    apply: (s) => {
+      const target = 'usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-llm-pi-ai/lib/index.js'
+      const plan = planMimoThinking(file => file === target ? s : loadImpl(file, CURRENT_STAGE_ROOT))
+      for (const file of plan) if (file.file !== target) IMPL_state[file.file] = file.after
+      return plan.find(file => file.file === target).after
     },
   },
 
@@ -408,18 +448,129 @@ const IMPLS = {
   // 不变量：safe on -> off 后 patch 逐字节等于进入前（off 仍是整份 copyFile 还原，未改）。
   'undo-safe-align-S1': {
     file: 'dsh-undo-savepoint/lib/core.mjs',
-    check: (s) => s.includes('dsh-mobile safe keeps shipped plugins (S1)'),
+    check: (s) => s.includes('dsh-mobile safe ownership identity v2') &&
+      /entry\.id === id && entry\.name === name/.test(s) &&
+      !/entry\.id == null \|\| entry\.id === id/.test(s),
     apply: (s) => {
-      if (s.includes('dsh-mobile safe keeps shipped plugins (S1)')) return s
+      if (s.includes('dsh-mobile safe ownership identity v2') &&
+        /entry\.id === id && entry\.name === name/.test(s) &&
+        !/entry\.id == null \|\| entry\.id === id/.test(s)) return s
       // 上游文件是 CRLF：锚点用正则匹配（\r?\n），否则跨行锚点永远失配（实测踩到）。
       const MINIMAL_RE = /    const minimal = `# dsh-undo-savepoint SAFE MODE[\s\S]*?`;\r?\n    await fs\.writeFile\(patch, minimal, 'utf8'\);/;
-      if (!MINIMAL_RE.test(s)) throw new Error('undo-safe-align 锚点未命中：minimal 覆写段已变（上游改了 safe 生成逻辑，请人工核对）')
+      if (!MINIMAL_RE.test(s)) {
+        // Some vendor revisions already contain the S1 filter helper without its marker. Upgrade
+        // that exact helper region; do not bless it based on a name-only substring.
+        const helperStart = s.indexOf('/* dsh-mobile safe ownership identity v2:')
+        const helperEnd = helperStart >= 0 ? s.indexOf('function safeModeSha256(bytes) {', helperStart) : -1
+        if (helperStart < 0 || helperEnd < 0) throw new Error('undo-safe-align 锚点未命中：minimal 覆写段与既有 filter helper 均缺失')
+        const helper = readFileSync(join(HERE, 'data', 'undo-safe-filter-helper-snippet.mjs'), 'utf8')
+          .replace(/\n$/, '').replace(/\n/g, s.includes('\r\n') ? '\r\n' : '\n') + (s.includes('\r\n') ? '\r\n' : '\n')
+        return s.slice(0, helperStart) + helper + s.slice(helperEnd)
+      }
       // 注入片段从独立文件读入（LF），避免在补丁源码里嵌套转义：
       // 直接内联会让 \n/\s 被外层字符串先吃掉（实测踩到两处：字面换行与 \s 变 s）。
       const MINIMAL_NEW = readFileSync(join(HERE, 'data', 'undo-safe-align-snippet.mjs'), 'utf8').replace(/\n$/, '')
       s = s.replace(MINIMAL_RE, MINIMAL_NEW)
-      if (!s.includes('dsh-mobile safe keeps shipped plugins (S1)')) throw new Error('undo-safe-align 复核失败——不写回')
+      if (!s.includes('dsh-mobile safe ownership identity v2')) throw new Error('undo-safe-align 复核失败——不写回')
       return s
+    },
+  },
+
+  // ── undo-safe-transaction-S2：备份/marker 先提交，配置文件逐项原子替换 ──
+  'undo-safe-transaction-S2': {
+    file: 'dsh-undo-savepoint/lib/core.mjs',
+    check: (s) => s.includes('dsh-mobile safe mode transaction (S2)') &&
+      safeModeTransactionIsLf(s) &&
+      s.includes('dsh-mobile safe mode transaction (S2) with CAS recovery failover, web-store resolver and factory-bundle filter (S5)') &&
+      s.includes('async function safeModeResolveWebStore(cfg)') &&
+      s.indexOf('function safeModeRecoveryObjectName(sha)') < s.indexOf('async function safeModeRecoveryPath(autoDir, sha, create = false)') &&
+      s.indexOf('async function safeModeRecoveryPath(autoDir, sha, create = false)') < s.indexOf('async function safeModeResolveWebStore(cfg)') &&
+      s.includes('safeModeDefaultWebStore: profileName === \'web\'') &&
+      s.includes('function hasConfiguredAutoDir()') &&
+      s.includes('homeExisted: homePatchExists') &&
+      s.includes('Both current and legacy Safe Mode markers exist') &&
+      s.includes('Safe-mode state is not a regular file') &&
+      s.includes('Safe-mode state belongs to profile') &&
+      s.includes('safeModeLoadBackup(cfg, primary, expectedSha)') &&
+      s.includes('safeModeEnsureRecovery(cfg, bytes, sha, atomicWrite)') &&
+      s.includes('async function safeModeRecoveryPath(autoDir, sha, create = false)') &&
+      s.includes('function safeModeRecoveryObjectName(sha)') &&
+      s.includes('Missing primary files remain valid recovery candidates') &&
+      s.includes('constants as fsConstants') &&
+      s.includes('relative, sep, isAbsolute } from \'node:path\'') &&
+      s.includes('dsh-mobile safe ownership identity v2') &&
+      s.includes('safeModeSelectFactoryBundles(cfg, pkg, pkgRaw, hardManifest.factoryBundles)') &&
+      s.includes('async function safeModeBundlePatchSha(packageRoot, declared)') &&
+      s.includes('safeModeFilterInserts(patchBytes.toString(\'utf8\'), hardManifest.entries)') &&
+      s.includes('value.schema === 2') && s.includes('value.profileEntries') &&
+      s.includes('safeModeOwnershipManifest(filesRoot)') &&
+      s.includes('snapshot transaction marker is unknown or incomplete') &&
+      s.includes("const purpose = marker.purpose || 'FACTORY'"),
+    apply: (s) => {
+      if (s.includes('dsh-mobile safe mode transaction (S2)') &&
+        safeModeTransactionIsLf(s) &&
+        s.includes('dsh-mobile safe mode transaction (S2) with CAS recovery failover, web-store resolver and factory-bundle filter (S5)') &&
+        s.includes('async function safeModeResolveWebStore(cfg)') &&
+        s.indexOf('function safeModeRecoveryObjectName(sha)') < s.indexOf('async function safeModeRecoveryPath(autoDir, sha, create = false)') &&
+        s.indexOf('async function safeModeRecoveryPath(autoDir, sha, create = false)') < s.indexOf('async function safeModeResolveWebStore(cfg)') &&
+        s.includes('safeModeDefaultWebStore: profileName === \'web\'') &&
+        s.includes('function hasConfiguredAutoDir()') &&
+        s.includes('homeExisted: homePatchExists') &&
+        s.includes('Both current and legacy Safe Mode markers exist') &&
+        s.includes('Safe-mode state is not a regular file') &&
+        s.includes('Safe-mode state belongs to profile') &&
+        s.includes('safeModeLoadBackup(cfg, primary, expectedSha)') &&
+        s.includes('safeModeEnsureRecovery(cfg, bytes, sha, atomicWrite)') &&
+        s.includes('async function safeModeRecoveryPath(autoDir, sha, create = false)') &&
+        s.includes('function safeModeRecoveryObjectName(sha)') &&
+        s.includes('Missing primary files remain valid recovery candidates') &&
+        s.includes('constants as fsConstants') &&
+        s.includes('relative, sep, isAbsolute } from \'node:path\'') &&
+        s.includes('dsh-mobile safe ownership identity v2') &&
+        s.includes('safeModeSelectFactoryBundles(cfg, pkg, pkgRaw, hardManifest.factoryBundles)') &&
+        s.includes('async function safeModeBundlePatchSha(packageRoot, declared)') &&
+        s.includes('safeModeFilterInserts(patchBytes.toString(\'utf8\'), hardManifest.entries)') &&
+        s.includes('value.schema === 2') && s.includes('value.profileEntries') &&
+        s.includes('safeModeOwnershipManifest(filesRoot)') &&
+        s.includes('snapshot transaction marker is unknown or incomplete') &&
+        s.includes("const purpose = marker.purpose || 'FACTORY'")) return s
+      const safeStart = s.indexOf('async function safeModeSet(cfg, on')
+      const selectorStart = s.indexOf('async function safeModeOwnershipManifest(filesRoot)')
+      const helperStart = s.indexOf('function safeModeSha256(bytes) {')
+      const start = selectorStart >= 0 ? safeModeTransactionStart(s) : helperStart >= 0 ? helperStart : safeStart
+      const end = s.indexOf('// ── 跨机一致性预检', start)
+      if (start < 0 || end < 0 || safeStart < 0) {
+        throw new Error('undo-safe-transaction 锚点缺失：safeModeSet / preflight 边界已变')
+      }
+      const transaction = readFileSync(join(HERE, 'data', 'undo-safe-transaction-snippet.mjs'), 'utf8')
+      let next = s.slice(0, start) + transaction + '\n' + s.slice(end)
+      const defaultDirHelper = `function hasConfiguredAutoDir() {
+  try {
+    const value = JSON.parse(readFileSync(SETTINGS_FILE, 'utf8').replace(/^\\uFEFF/, ''));
+    return Object.prototype.hasOwnProperty.call(value, 'autoDir');
+  } catch { return false; }
+}
+`
+      const autoHelperStart = next.indexOf('function hasConfiguredAutoDir() {')
+      if (autoHelperStart >= 0) {
+        const autoHelperEnd = next.indexOf('\n}', autoHelperStart)
+        if (autoHelperEnd > autoHelperStart) next = next.slice(0, autoHelperStart) + defaultDirHelper.trimEnd() + next.slice(autoHelperEnd + 2)
+      } else {
+        next = next.replace(/function buildConfig\(overrides = \{\}\) \{/, defaultDirHelper + 'function buildConfig(overrides = {}) {')
+      }
+      const safeModeDefaultLine = `    safeModeDefaultWebStore: profileName === 'web' && overrides.autoDir === undefined && !hasConfiguredAutoDir(),\n`
+      if (!next.includes('safeModeDefaultWebStore: profileName === \'web\'')) next = next.replace(/(    profileName,\r?\n)/, `$1${safeModeDefaultLine}`)
+      else next = next.replace(/    safeModeDefaultWebStore: profileName === 'web' && overrides.autoDir === undefined && !hasConfiguredAutoDir\(\),\r?\n/, safeModeDefaultLine)
+      next = next.replace("import { promises as fs, existsSync, readFileSync } from 'node:fs';",
+        "import { promises as fs, existsSync, readFileSync, constants as fsConstants } from 'node:fs';")
+      next = next.replace(/import \{ join, dirname, basename, resolve, isAbsolute \} from 'node:path';\r?\n/,
+        "import { join, dirname, basename, resolve, relative, sep, isAbsolute } from 'node:path';\n")
+      next = next.replace(/import \{ join, dirname, basename, resolve, relative, sep, isAbsolute \} from 'node:path';\r?\n/,
+        "import { join, dirname, basename, resolve, relative, sep, isAbsolute } from 'node:path';\n")
+      if (!next.includes('dsh-mobile safe mode transaction (S2)')) {
+        throw new Error('undo-safe-transaction 复核失败——不写回')
+      }
+      return next
     },
   },
 
@@ -837,15 +988,37 @@ const IMPLS = {
   // 历史：0.13.3 曾以「上游 0.1.2-rc.1 已原生覆盖 rename 回退」为由退役 fs-local-index.js，
   // 但该结论对当前的 createIfAbsent 站点不成立（0.1.5-rc.1 实测：全文仅此一处 link 调用，
   // 且无任何 EACCES/EPERM/ENOTSUP 回退）——本补丁即补回该覆盖。
-  // 不变量：EACCES/EPERM/ENOTSUP 时改用 O_EXCL 占位 + rename 等价实现 no-replace
+  // 不变量：Android private dir 的 EACCES 与 shared-storage/FUSE 的 ENOSYS，以及 EPERM/ENOTSUP，
+  // 改用 O_EXCL 占位 + rename 等价实现 no-replace
   // （直接照抄 else 分支的裸 rename 会静默覆盖已存在目标，丢掉 link 的独占语义）。
   'fs-local-link-F8': {
     file: 'usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-fs-local/lib/index.js',
     scope: 'engine',
-    check: (s) => s.includes('dsh-mobile exclusive create (F8)')
-      && s.includes('dsh-mobile link->rename fallback (F8)')
-      && s.includes('dshMobilePublishExclusive('),
+    check: (s) => {
+      const markerAt = s.indexOf('dsh-mobile link->rename fallback (F8)');
+      const conditionAt = markerAt < 0 ? -1 : s.indexOf('if (!(error instanceof Error', markerAt);
+      const conditionLine = conditionAt < 0 ? '' : s.slice(conditionAt, s.indexOf('\n', conditionAt));
+      return s.includes('dsh-mobile exclusive create (F8)')
+        && markerAt >= 0
+        && s.includes('dshMobilePublishExclusive(')
+        && conditionLine.includes('error.code === \"EACCES\" || error.code === \"EPERM\" || error.code === \"ENOTSUP\" || error.code === \"ENOSYS\"');
+    },
     apply: (s) => {
+      // Android private dirs reject hard links with EACCES; shared-storage/FUSE may return ENOSYS.
+      // Upgrade only the predicate in the F8 site's catch line; unrelated ENOSYS text is irrelevant.
+      const markerAt = s.indexOf('dsh-mobile link->rename fallback (F8)');
+      if (markerAt >= 0) {
+        const conditionAt = s.indexOf('if (!(error instanceof Error', markerAt);
+        const conditionEnd = conditionAt < 0 ? -1 : s.indexOf('\n', conditionAt);
+        if (conditionAt < 0 || conditionEnd < 0) throw new Error('F8 upgrade predicate missing');
+        const conditionLine = s.slice(conditionAt, conditionEnd);
+        const oldPredicate = 'error.code === \"EACCES\" || error.code === \"EPERM\" || error.code === \"ENOTSUP\"';
+        const newPredicate = oldPredicate + ' || error.code === \"ENOSYS\"';
+        if (!conditionLine.includes(newPredicate)) {
+          if (!conditionLine.includes(oldPredicate)) throw new Error('F8 upgrade predicate missing');
+          s = s.slice(0, conditionAt) + conditionLine.replace(oldPredicate, newPredicate) + s.slice(conditionEnd);
+        }
+      }
       if (s.includes('dsh-mobile exclusive create (F8)')
         && s.includes('dsh-mobile link->rename fallback (F8)')
         && s.includes('dshMobilePublishExclusive(')) return s
@@ -862,8 +1035,8 @@ const IMPLS = {
         '\t\tif (createIfAbsent !== void 0) try {',
         '\t\t\tawait linkFile(tempPath, absolutePath);',
         '\t\t} catch (error) {',
-        '\t\t\t/* dsh-mobile link->rename fallback (F8): Android app-private dirs reject link(2) (EACCES). */',
-        '\t\t\tif (!(error instanceof Error && "code" in error && (error.code === "EACCES" || error.code === "EPERM" || error.code === "ENOTSUP"))) {',
+        '\t\t\t/* dsh-mobile link->rename fallback (F8): Android private EACCES and shared-storage/FUSE ENOSYS. */',
+        '\t\t\tif (!(error instanceof Error && "code" in error && (error.code === "EACCES" || error.code === "EPERM" || error.code === "ENOTSUP" || error.code === "ENOSYS"))) {',
         '\t\t\t\tawait throwGuardedCreateFailure(error, absolutePath, createIfAbsent.displayPath, inspectPublicationTarget);',
         '\t\t\t} else {',
         '\t\t\t\tawait dshMobilePublishExclusive(tempPath, absolutePath, createIfAbsent.displayPath, inspectPublicationTarget, internals);',
@@ -881,8 +1054,8 @@ const IMPLS = {
       const HELPER = [
         '',
         '/**',
-        ' * dsh-mobile exclusive create (F8): Android app-private directories reject link(2) with EACCES,',
-        ' * so the createIfAbsent publication cannot use the hard-link no-replace primitive at all.',
+        ' * dsh-mobile exclusive create (F8): Android private directories reject link(2) with EACCES,',
+        ' * and shared-storage/FUSE may reject it with ENOSYS; createIfAbsent cannot rely on hard links.',
         ' * Re-implement it with an O_EXCL placeholder plus a rename, which keeps the semantics the hard',
         ' * link provided: the loser of a concurrent create gets EEXIST and reports the same',
         ' * "cannot overwrite existing" refusal, and a failed rename releases the placeholder so a',
@@ -1744,8 +1917,8 @@ const IMPLS = {
   //      实测），引擎树至少 5 处 worker；worker 临终打 `TOTAL calls=0 totalMs=0`，而解析取**最后一条**
   //      TOTAL ⇒ 变成「非 -1 但为 0」——门禁 C6 只查 != -1，抓不到。且 NODE_OPTIONS 会被 agent 的全部
   //      node 子进程继承、preload 缺 COMBO_LIB 时直接 exit(2) ⇒ 打坏用户工具链。
-  // 本补丁（方案 d）：在**产品内**的 compose() 返回处打印探针行——正好落在 LISTEN 之后、首个页面
-  // 请求路径上，即 check-boot-budget C2 要测的那个同步块。不新增快照成员（避开 check-snapshot-file-modes
+  // 本补丁（方案 d）：在**产品内**的 compose() 返回处打印探针行。C3 启动收敛后，首个完整图在
+  // Loader settle barrier 后、connection ready 前发布；运行期 compose 仍在原调用点同步记录。不新增快照成员（避开 check-snapshot-file-modes
   // 时序与「测量脚本进产品树」争议）；壳侧解析器零改动。
   // 关键三件事：
   //   - **只主线程打印**：非主线程一律不安装探针。worker 的 calls=0 TOTAL 绝不能成为壳侧解析到的
@@ -1757,33 +1930,107 @@ const IMPLS = {
     scope: 'engine',
     check: (s) => s.includes('dsh-mobile combo probe (P1)')
       && s.includes('dshMobileComboProbeEmit')
+      && s.includes('dshMobileComboProbeStartupFlush')
+      && s.includes('dshMobileComboProbeEmptyGraph')
       && s.includes('import { isMainThread } from "node:worker_threads";')
       // 主线程门：探针块必须带 isMainThread 分支（worker 的 calls=0 不得冒充真读数）。
       && s.includes('if (!isMainThread) {')
       && s.includes('} else {'),
     apply: (s) => {
-      if (s.includes('dsh-mobile combo probe (P1)') && s.includes('dshMobileComboProbeEmit')) return s
+      if (s.includes('dsh-mobile combo probe (P1)') && s.includes('dshMobileComboProbeEmit')
+        && s.includes('dshMobileComboProbeStartupFlush') && s.includes('dshMobileComboProbeEmptyGraph')) return s
+      const upgradingProbe = s.includes('dsh-mobile combo probe (P1)') && s.includes('dshMobileComboProbeEmit')
+      const CONSTRUCTOR_ANCHOR = [
+        '\t\tfor (const entry of ctx.loader.entries()) this.dirty.add(entry.options.name);',
+        '\t\tthis.composed = this.compose();',
+        '\t\tconst failures = [];',
+        '\t\tthis.flush((err) => failures.push(err));',
+      ].join('\n')
+      const CONSTRUCTOR_REPLACEMENT = [
+        '\t\tfor (const entry of ctx.loader.entries()) this.dirty.add(entry.options.name);',
+        '\t\tthis.composed = dshMobileComboProbeEmptyGraph();',
+        '\t\tconst failures = [];',
+        '\t\tthis.flush((err) => failures.push(err));',
+      ].join('\n')
+      if (!s.includes(CONSTRUCTOR_ANCHOR)) throw new Error('combo-probe C3 锚点未命中：空图初始化（请核对 dsh-client-modules 构造器）')
+      s = s.replace(CONSTRUCTOR_ANCHOR, CONSTRUCTOR_REPLACEMENT)
       // ① import：锚点选 node:crypto 行——combo 家族里 A3/A5/C3 撤销后，这行只剩探针自己会碰。
       const IMPORT_ANCHOR = 'import { createHash } from "node:crypto";'
       const IMPORTS = [
         IMPORT_ANCHOR,
         '/* dsh-mobile combo probe (P1): the compose probe is part of the product, so the shell parses',
         ' * the real reading from engine.log instead of a measurement preload that never lands. */',
-        'import { monitorEventLoopDelay } from "node:perf_hooks";',
         'import { isMainThread } from "node:worker_threads";',
       ].join('\n')
-      if (!s.includes(IMPORT_ANCHOR)) throw new Error('combo-probe 锚点未命中：node:crypto import 行（引擎升级后请人工核对 dsh-client-modules）')
-      s = s.replace(IMPORT_ANCHOR, IMPORTS)
+      if (!s.includes('import { isMainThread } from "node:worker_threads";')) {
+        if (!s.includes(IMPORT_ANCHOR)) throw new Error('combo-probe 锚点未命中：node:crypto import 行（引擎升级后请人工核对 dsh-client-modules）')
+        s = s.replace(IMPORT_ANCHOR, IMPORTS)
+      }
       // ② 探针块：装在类定义之后、export 之前（wrap prototype.compose —— 打印点即 compose() 返回处）。
       const EXPORT_ANCHOR = 'export { ClientModuleRegistry, ClientModuleRegistry as default, bootInjections, orderByModuleGraph, stripClientSuffix };'
       const BLOCK = [
         '/* dsh-mobile combo probe (P1): TOTAL/compose probe lines printed from inside the product at',
-        ' * every composition return. The first composition happens after listen, on the first page',
-        ' * request path, which is exactly the synchronous block check-boot-budget C2 measures. */',
+        ' * every composition return. Startup coalesces loader activations at the settle barrier; later',
+        ' * runtime/HMR compositions remain synchronous at their original call sites. */',
         'const DSH_MOBILE_COMBO_PROBE_STATS = { calls: 0, totalMs: 0, firstAt: null, singleRequests: 0 };',
         'const dshMobileComboProbeInstances = /* @__PURE__ */ new Set();',
+        'const dshMobileComboProbePhaseNames = new Set(["constructor-flush", "loader-settle-wait", "deferred-startup-flush", "loader-settle-to-first-compose-start"]);',
+        'const dshMobileComboProbePhases = new Map();',
+        'const dshMobileComboProbePhaseWindowMs = 250;',
+        'const dshMobileComboProbePhaseState = { loaderSettledAt: null, firstPostSettleComposeAt: null };',
         'const dshMobileComboProbeT0 = performance.now();',
-        'let dshMobileComboProbeMonitor;',
+        '/* C3: preserve the exact empty graph shape/hash without composing an empty table. */',
+        'function dshMobileComboProbeEmptyGraph() {',
+        '\tconst entries = [];',
+        '\tconst batches = [];',
+        '\treturn { rev: shortHash(JSON.stringify({ entries, batches })), entries, batches };',
+        '}',
+        '/**',
+        ' * C4 event-loop sampler. The perf_hooks event-loop-delay monitor cannot see a synchronous',
+        ' * block that begins in the same tick as enable(): its histogram measures only its own timer',
+        ' * lateness, and a timer that has not fired yet records nothing (device: a 2.0s startup block',
+        ' * read as 11ms while an independent interval watcher saw the whole 2.0s). This sampler anchors',
+        ' * a wall-clock baseline at arm time instead, so the first observed gap spans everything since',
+        ' * arming, including a block already in progress. The window freezes at the sample cap.',
+        ' */',
+        'function dshMobileComboProbeLoopHistogram() {',
+        '\tconst gaps = [];',
+        '\treturn {',
+        '\t\tsamples: 0,',
+        '\t\tadd(gap) { gaps.push(gap); this.samples += 1; },',
+        '\t\tpercentile(p) {',
+        '\t\t\tif (gaps.length === 0) return -1;',
+        '\t\t\tconst sorted = [...gaps].sort((a, b) => a - b);',
+        '\t\t\tconst idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil((p / 100) * sorted.length) - 1));',
+        '\t\t\treturn Number(sorted[idx].toFixed(1));',
+        '\t\t},',
+        '\t};',
+        '}',
+        'let dshMobileComboProbeLoopStats;',
+        'let dshMobileComboProbeLoopTimer;',
+        'const dshMobileComboProbeLoopResolutionMs = 10;',
+        'const dshMobileComboProbeLoopMaxSamples = 8192;',
+        '/** Arm the sampler once; it must never throw into composition (C4 then reports -1/-1). */',
+        'function dshMobileComboProbeArmLoopSampler() {',
+        '\tif (dshMobileComboProbeLoopTimer !== void 0) return;',
+        '\ttry {',
+        '\t\tconst stats = dshMobileComboProbeLoopHistogram();',
+        '\t\tdshMobileComboProbeLoopStats = stats;',
+        '\t\tlet last = performance.now();',
+        '\t\tconst tick = () => {',
+        '\t\t\tconst now = performance.now();',
+        '\t\t\tconst gap = now - last;',
+        '\t\t\tlast = now;',
+        '\t\t\tif (gap > 0 && stats.samples < dshMobileComboProbeLoopMaxSamples) stats.add(gap);',
+        '\t\t};',
+        '\t\tdshMobileComboProbeLoopTimer = setInterval(tick, dshMobileComboProbeLoopResolutionMs);',
+        '\t\tdshMobileComboProbeLoopTimer.unref?.();',
+        '\t} catch {',
+        '\t\tdshMobileComboProbeLoopStats = void 0;',
+        '\t\tdshMobileComboProbeLoopTimer = void 0;',
+        '\t}',
+        '}',
+        'let dshMobileComboProbePhaseTimer;',
         '/** A3 cache stats are published by combo-cache-A3; a missing block must not drop the field. */',
         'function dshMobileComboProbeCacheLine() {',
         '\tconst stats = globalThis.__dshMobileComboCacheStats;',
@@ -1795,15 +2042,47 @@ const IMPLS = {
         '\tconst value = globalThis.__dshMobileComboLazyStats?.singleBuilds;',
         '\treturn typeof value === "number" && Number.isFinite(value) ? value : -1;',
         '}',
-        '/** C4 event-loop reading; without a monitor both fields still print, as -1 (never omitted). */',
+        '/** C4 event-loop reading; without a sampler both fields still print, as -1 (never omitted). */',
         'function dshMobileComboProbeLoopLine() {',
-        '\tconst monitor = dshMobileComboProbeMonitor;',
-        '\tif (monitor === void 0) return "loopP99Ms=-1 loopSamples=-1";',
-        '\tconst p99 = monitor.count === 0 ? -1 : (monitor.percentile(99) / 1e6).toFixed(1);',
-        '\treturn `loopP99Ms=${p99} loopSamples=${monitor.count}`;',
+        '\tconst stats = dshMobileComboProbeLoopStats;',
+        '\tif (stats === void 0 || stats.samples === 0) return "loopP99Ms=-1 loopSamples=-1";',
+        '\tconst p99 = stats.percentile(99);',
+        '\treturn `loopP99Ms=${p99 < 0 ? -1 : p99} loopSamples=${stats.samples}`;',
         '}',
         '/**',
-        '* Print the two probe lines for one composition. Field set and order are the contract shared',
+        '* Phase names are a fixed allowlist, so this map has a hard four-row bound. A phase window',
+        '* closes 250 ms after its first event; later events aggregate into it without resetting the',
+        '* deadline. Repeated startup activity therefore cannot grow a queue or postpone publication.',
+        '* Durations are wall-clock milliseconds; forwardedCallbacks is distinct from observations.',
+        '*/',
+        'function dshMobileComboProbeSchedulePhases() {',
+        '\tif (dshMobileComboProbePhaseTimer !== void 0) return;',
+        '\tdshMobileComboProbePhaseTimer = setTimeout(() => {',
+        '\t\tdshMobileComboProbePhaseTimer = void 0;',
+        '\t\tfor (const phase of dshMobileComboProbePhases.values()) {',
+        '\t\t\tconsole.log(`[perf] phase name=${phase.name} startMs=${phase.startMs.toFixed(1)} durTotalMs=${phase.durTotalMs.toFixed(1)} durMaxMs=${phase.durMaxMs.toFixed(1)} observations=${phase.observations} forwardedCallbacks=${phase.forwardedCallbacks}`);',
+        '\t\t}',
+        '\t\tdshMobileComboProbePhases.clear();',
+        '\t}, dshMobileComboProbePhaseWindowMs);',
+        '\tdshMobileComboProbePhaseTimer.unref?.();',
+        '}',
+        '/** Keep startup timings bounded and separate from C4/TOTAL sampling. */',
+        'function dshMobileComboProbeRecordPhase(name, started, duration, forwardedCallbacks = 0) {',
+        '\tif (!dshMobileComboProbePhaseNames.has(name) || !Number.isFinite(started) || !Number.isFinite(duration) || !Number.isFinite(forwardedCallbacks)) return;',
+        '\tconst startMs = Math.max(0, started - dshMobileComboProbeT0);',
+        '\tconst durationMs = Math.max(0, duration);',
+        '\tconst callbacks = Math.max(0, Math.floor(forwardedCallbacks));',
+        '\tlet phase = dshMobileComboProbePhases.get(name);',
+        '\tif (phase === void 0) { phase = { name, startMs, durTotalMs: 0, durMaxMs: 0, observations: 0, forwardedCallbacks: 0 }; dshMobileComboProbePhases.set(name, phase); }',
+        '\tphase.startMs = Math.min(phase.startMs, startMs);',
+        '\tphase.durTotalMs += durationMs;',
+        '\tphase.durMaxMs = Math.max(phase.durMaxMs, durationMs);',
+        '\tphase.observations += 1;',
+        '\tphase.forwardedCallbacks += callbacks;',
+        '\tdshMobileComboProbeSchedulePhases();',
+        '}',
+        '/**',
+        '* Print the compose and TOTAL lines immediately. Their field set and order are the contract shared',
         '* with scripts/perf/count-compose.mjs, scripts/check-boot-budget.mjs and the shell parser: the',
         '* TOTAL line always carries calls/totalMs/instances/firstAt/singles/loopP99Ms/loopSamples and',
         '* the cache line.',
@@ -1843,9 +2122,57 @@ const IMPLS = {
         '\t\tdshMobileComboProbeInstances.add(this);',
         '\t\tconst result = dshMobileComboProbeOriginal.apply(this, args);',
         '\t\tconst duration = performance.now() - started;',
+        '\t\tif (dshMobileComboProbePhaseState.loaderSettledAt !== null && dshMobileComboProbePhaseState.firstPostSettleComposeAt === null) {',
+        '\t\t\tdshMobileComboProbePhaseState.firstPostSettleComposeAt = started;',
+        '\t\t\tdshMobileComboProbeRecordPhase("loader-settle-to-first-compose-start", dshMobileComboProbePhaseState.loaderSettledAt, started - dshMobileComboProbePhaseState.loaderSettledAt);',
+        '\t\t}',
         '\t\tDSH_MOBILE_COMBO_PROBE_STATS.totalMs += duration;',
         '\t\tdshMobileComboProbeEmit(started - dshMobileComboProbeT0, duration, this.table?.size ?? -1);',
         '\t\treturn result;',
+        '\t};',
+        '\t/* dshMobileComboProbeStartupFlush: aggregate loader activations until the shared',
+        '\t * loader settle barrier. The constructor flush stays synchronous; only later dirty',
+        '\t * microtask flushes are held. The settle continuation is registered before the Web',
+        '\t * carrier readiness continuation (modules precede connection in the bundle roster). */',
+        '\tconst dshMobileComboProbeOriginalFlush = dshMobileComboProbeProto.flush;',
+        '\tconst dshMobileComboProbeMeasuredFlush = (receiver, onError, phaseName, forwardedCallbacks = 0) => {',
+        '\t\tconst started = performance.now();',
+        '\t\ttry { return dshMobileComboProbeOriginalFlush.call(receiver, onError); }',
+        '\t\tfinally { dshMobileComboProbeRecordPhase(phaseName, started, performance.now() - started, forwardedCallbacks); }',
+        '\t};',
+        '\tconst dshMobileComboProbeStartupStates = new WeakMap();',
+        '\tdshMobileComboProbeProto.flush = function (onError) {',
+        '\t\tlet state = dshMobileComboProbeStartupStates.get(this);',
+        '\t\tif (state === void 0) {',
+        '\t\t\tstate = { settled: false, callbacks: [] };',
+        '\t\t\tdshMobileComboProbeStartupStates.set(this, state);',
+        '\t\t\tlet wait;',
+        '\t\t\tconst waitStarted = performance.now();',
+        '\t\t\ttry { wait = this.ctx?.loader?.await?.(); } catch { wait = void 0; }',
+        '\t\t\tif (wait && typeof wait.then === "function") {',
+        '\t\t\t\tPromise.resolve(wait).then(() => {',
+        '\t\t\t\t\tconst settledAt = performance.now();',
+        '\t\t\t\t\tdshMobileComboProbePhaseState.loaderSettledAt = settledAt;',
+        '\t\t\t\t\tdshMobileComboProbeRecordPhase("loader-settle-wait", waitStarted, settledAt - waitStarted);',
+        '\t\t\t\t\tstate.settled = true;',
+        '\t\t\t\t\tif (state.callbacks.length > 0) { const callbacks = state.callbacks.splice(0); dshMobileComboProbeMeasuredFlush(this, err => { for (const callback of callbacks) callback(err); }, "deferred-startup-flush", callbacks.length); }',
+        '\t\t\t\t}, () => {',
+        '\t\t\t\t\tconst settledAt = performance.now();',
+        '\t\t\t\t\tdshMobileComboProbePhaseState.loaderSettledAt = settledAt;',
+        '\t\t\t\t\tdshMobileComboProbeRecordPhase("loader-settle-wait", waitStarted, settledAt - waitStarted);',
+        '\t\t\t\t\tstate.settled = true;',
+        '\t\t\t\t\tif (state.callbacks.length > 0) { const callbacks = state.callbacks.splice(0); dshMobileComboProbeMeasuredFlush(this, err => { for (const callback of callbacks) callback(err); }, "deferred-startup-flush", callbacks.length); }',
+        '\t\t\t\t});',
+        '\t\t\t} else {',
+        '\t\t\t\tstate.settled = true;',
+        '\t\t\t\tconst settledAt = performance.now();',
+        '\t\t\t\tdshMobileComboProbePhaseState.loaderSettledAt = settledAt;',
+        '\t\t\t\tdshMobileComboProbeRecordPhase("loader-settle-wait", waitStarted, settledAt - waitStarted);',
+        '\t\t\t}',
+        '\t\t\treturn dshMobileComboProbeMeasuredFlush(this, onError, "constructor-flush");',
+        '\t\t}',
+        '\t\tif (!state.settled) { if (onError) state.callbacks.push(onError); return; }',
+        '\t\treturn dshMobileComboProbeOriginalFlush.call(this, onError);',
         '\t};',
         '\t/* C5 positive control also lives in the product: a served single-row URL prints the line that',
         '\t * proves the lazy counter moved. Without it, “singles stayed 0” cannot be told apart from',
@@ -1858,18 +2185,21 @@ const IMPLS = {
         '\t\t\treturn result;',
         '\t\t};',
         '\t}',
-        '\ttry {',
-        '\t\tdshMobileComboProbeMonitor = monitorEventLoopDelay({ resolution: 10 });',
-        '\t\tdshMobileComboProbeMonitor.enable();',
-        '\t} catch {',
-        '\t\t/* The probe must never break composition; C4 then reads -1 for both loop fields. */',
-        '\t\tdshMobileComboProbeMonitor = void 0;',
-        '\t}',
+        '\t/* Arm at module load: the cold-start block begins in this very tick, so the sampler must',
+        '\t * anchor its baseline here; deferring the arm would place the baseline after the block. */',
+        '\tdshMobileComboProbeArmLoopSampler();',
         '}',
         EXPORT_ANCHOR,
       ].join('\n')
-      if (!s.includes(EXPORT_ANCHOR)) throw new Error('combo-probe 锚点未命中：模块 export 行（引擎升级后请人工核对 dsh-client-modules）')
-      s = s.replace(EXPORT_ANCHOR, BLOCK)
+      if (upgradingProbe) {
+        const exportAt = s.indexOf(EXPORT_ANCHOR)
+        const blockAt = s.lastIndexOf('/* dsh-mobile combo probe (P1):', exportAt)
+        if (exportAt < 0 || blockAt < 0) throw new Error('combo-probe 升级锚点未命中：旧探针块（引擎升级后请人工核对 dsh-client-modules）')
+        s = s.slice(0, blockAt) + BLOCK
+      } else {
+        if (!s.includes(EXPORT_ANCHOR)) throw new Error('combo-probe 锚点未命中：模块 export 行（引擎升级后请人工核对 dsh-client-modules）')
+        s = s.replace(EXPORT_ANCHOR, BLOCK)
+      }
       if (!s.includes('dsh-mobile combo probe (P1)')
         || !s.includes('dshMobileComboProbeEmit')
         || !s.includes('import { isMainThread } from "node:worker_threads";')
@@ -1886,6 +2216,19 @@ const IMPLS = {
   // 回收——设备上 09-12 23:07 之后零新增条目，而 09-14 三次快照刷新换过引擎树，换掉的模块每次冷启
   // 都重新编译。修法：入口 bin.js 周期 flush（40 s 首刷 + 5 min）并在 exit 兜底；不注册信号处理，
   // 不改变任何命令的退出语义。flush 是同步调用，失败按 Node 契约静默忽略。
+  'client-registry-scan-C4': {
+    file: 'usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-modules/lib/index.js',
+    scope: 'engine',
+    check: (s) => s.includes(CLIENT_SCAN_MARKER) && s.includes('batchEntries().get(entryName)') && s.includes('located.manifest ??'),
+    apply: planClientRegistryScan,
+  },
+  'typert-registry-scan-C4': {
+    file: 'usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-typert-loader/lib/index.js',
+    scope: 'engine',
+    check: (s) => s.includes(TYPERT_SCAN_MARKER) && s.includes('processOne(entryName, batchNames())') && s.includes('!qualifies(entryName) || registered.has(entryName)'),
+    apply: planTypertRegistryScan,
+  },
+
   'perf-compile-cache-flush-N2': {
     file: 'usr/lib/node_modules/@deepseek-ai/dsh/lib/bin.js',
     scope: 'engine',

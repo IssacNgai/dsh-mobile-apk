@@ -759,8 +759,12 @@ export class AndroidPrivilegeService {
    * 命令无目标屏）零额外往返——不为一条本来就不该拦的命令多打一次 vdInfo。
    */
   private async adbCommandScopeDenied(command: string): Promise<string | null> {
-    const base = realScreenAdbCommandDenied(this.screenScope(), command)
+    const scope = this.screenScope()
+    const base = realScreenAdbCommandDenied(scope, command)
     if (base === null) return null
+    // real-only targets must never be upgraded by the virtual registry; unlike virtual-only,
+    // an explicit nonzero/unknown display is itself sufficient reason to deny.
+    if (scope === 'real-only') return base
     if (adbCommandDisplayTokens(command).length === 0) return base
     // 块G F2 + F6：两个 id 空间都核对——DisplayManager displayId（F2）与 SurfaceFlinger token（F6）。
     //
@@ -1027,6 +1031,43 @@ export class AndroidPrivilegeService {
         guidance: '改用坐标操作：① 真实屏 → android_screenshot 拿分辨率锚点，再 android_ui_click 传 nx/ny（0-1 归一化）；' +
           '② 虚拟屏 → android_vdisplay_input（tap/swipe/keyevent/text，坐标基于该屏自身像素，经 input -d 注入，真实屏不受影响）。' +
           '若确实需要语义树/ref 动作，请由用户在系统设置里开启「DeepCode 设备控制」无障碍服务。',
+      }
+    }
+    // vdInput writes screen content through Shizuku's `input -d` path, outside REAL_SCREEN_CONTROL_OPS.
+    // Resolve and check its actual virtual display here as defense in depth; the native input executor
+    // repeats the check immediately before dispatch so direct ControlCarrier callers cannot bypass it.
+    if (op === 'vdInput') {
+      let target = typeof args.target === 'string' && args.target !== '' ? args.target : undefined
+      let virtualDisplayId: number | undefined
+      if (target !== undefined && !isVirtualScreenId(target)) {
+        return { ok: false, code: 'screen-not-found', error: 'screen-not-found: vdInput 只接受已登记的 virtual-N 目标。', screenId: target }
+      }
+      if (target === undefined) {
+        const status = await this.controlQueue.enqueue('vdInfo', {}, 4000)
+        if (!status.ok) return { ok: false, code: 'screen-not-ready', error: 'screen-not-ready: 无法读取虚拟屏注册表。' }
+        const data = (status.data ?? {}) as {
+          selected?: unknown
+          screens?: Array<{ alias?: string; displayId?: number; kind?: string }>
+        }
+        const selected = typeof data.selected === 'string' ? data.selected : undefined
+        const hit = (data.screens ?? []).find((screen) => screen.alias === selected && screen.kind === 'virtual')
+        if (!selected || !hit || typeof hit.displayId !== 'number' || !Number.isInteger(hit.displayId) || hit.displayId <= 0) {
+          return { ok: false, code: 'screen-not-ready', error: 'screen-not-ready: 没有已选中的已登记虚拟屏。' }
+        }
+        target = selected
+        virtualDisplayId = hit.displayId
+      }
+      const decision = virtualDisplayId === undefined
+        ? await this.screenAccessResolved(target)
+        : decideScreenAccess(this.screenScope(), target, { virtualDisplayId })
+      if (!decision.ok) {
+        return {
+          ok: false,
+          code: decision.reason,
+          error: decision.reason + ': ' + decision.guidance,
+          screenId: decision.screenId,
+          guidance: decision.guidance,
+        }
       }
     }
     // review C11 范围复查下沉到执行点：manage 工具层之外（其它插件/直连调用）不得绕过。

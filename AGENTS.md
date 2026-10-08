@@ -13,7 +13,7 @@ DeepSeek Harness 的**安卓壳应用**（包名 `com.dsharnessmobile.shell`）�
 
 **关键约束：AI 可见的能力全部来自插件**，壳侧不直接注册工具。
 
-**运行时**：内嵌 Termux 快照（`assets/snapshot.tar.xz` → `files/usr` + `files/home`）；引擎 `@deepseek-ai/dsh` 0.1.7-rc.2 监听 `127.0.0.1:3080`；WebView 加载引擎 Web UI。
+**运行时**：内嵌 Termux 快照（`assets/snapshot.tar.xz` → `files/usr` + `files/home`）；当前快照中的 `@deepseek-ai/dsh` 为 **0.2.0-rc.2**（以快照内 `package.json` 与 `scripts/snapshot-config/engine-overlay.json` 为准），监听 `127.0.0.1:3080`；WebView 加载引擎 Web UI。
 
 **构建链**：minSdk 26 / targetSdk 34 / compileSdk 36；Kotlin 2.0.21；AGP 8.8.2；Java 17。
 
@@ -60,7 +60,7 @@ adb -s <serial> install -r -t out\v<版本>\dsh-mobile-apk-v<版本>-arm64.apk
 **什么时候可以用热推 —— 它是免打包通道，不是绕过验收的通道**：
 
 - **适用**：改动**完全落在快照内 runtime**（`@dsh-android` 插件的 `lib/**`、`client.js`、引擎树 JS）。这类改动的生效链是
-  「本地 `npm run build` → 推进设备快照树 → 引擎重读」，与 APK 打包无关 ⇒ 热推后跑三层验收，**结论对最终 APK 成立**。
+  「本地 `npm run build` → 推进设备快照树 → 引擎重读」，与 APK 打包无关；三层结果只覆盖热推后的设备树。最终 APK 须核对同一源码/构建产物并重新装机验收。
 - **不适用（必须走 `build-apk-013.ps1` 全链）**：壳侧 Kotlin（`.kt` 要编译进 dex）、签名/权限/清单、assets 与 `snapshot.tar.xz` 本身，
   以及任何**面向发布的最终产物**。改了这些还热推 = 验的是旧壳，属假绿。
 - **仍须三层验收**：热推只省掉「打包 + 装机 + 快照重解压」这段等待，**不省任何一层判据**（§2.1）。代码层、CDP 层、ADB 用户层一个不能少。
@@ -104,6 +104,7 @@ adb -s <serial> install -r -t out\v<版本>\dsh-mobile-apk-v<版本>-arm64.apk
 | 运行顺序 / 嵌套 / 耦合 / 流程图（排查入口） | `docs/AGENTS/EXECUTION-MAP.md` |
 | 模拟器验收规范（代码/CDP/adb 三层 + 真实任务） | `docs/AGENTS/emulator-test-protocol.md` |
 | **版本历史（全量）** | `docs/AGENTS/changelog-archive.md` |
+| Hard / Soft / Data 持久化路径、SharedPreferences keys、恢复来源 | `docs/AGENTS/PERSISTENT-DATA.md` |
 
 ---
 
@@ -172,7 +173,7 @@ adb -s <serial> install -r -t out\v<版本>\dsh-mobile-apk-v<版本>-arm64.apk
 
 | 套件 | 守什么 |
 |---|---|
-| `scripts/verify-screen-scope-matrix.mjs` | 屏幕范围/通道/落点的设备级验收：跨面一致性（引擎面 vs 壳侧面 vs 设备事实）+ 拉起落点回读 + 双屏像素对照 + `real-only` 反证。判据全落在设备事实上；**证据不足判 `INCONCLUSIVE`（exit 2），不得当通过**。`--self-test` 自带 6 例判别力 |
+| `scripts/verify-screen-scope-matrix.mjs` | 屏幕范围/通道/落点的设备级验收：跨面一致性（引擎面 vs 壳侧面 vs 设备事实）+ 拉起落点回读（目标屏必须出现本轮新 ActivityRecord，存量 Activity 不算落点证明）+ 双屏像素对照 + `real-only` 反证。权限档位拦截归环境阻塞；**证据不足判 `INCONCLUSIVE`（exit 2），不得当通过**。 |
 
 ---
 

@@ -65,7 +65,8 @@ export interface ScreenAccessOptions {
  *   - `webSnapshot` / `webAction`：目标是**壳自有 WebView**（DSH 自己的 Web UI），不带也不认
  *     `screenId`，与设备屏无关。按 op 名归为「设备屏内容 op」会让 `android_web_dump` 在
  *     virtual-only 下被整体误拒（块G F4b 同源论断：过度拦截与「范围门禁自相矛盾」是同一类缺陷）。
- * browser\* 操作隔离 BrowserHost（第二 WebView），vd\* 是虚拟屏管理/元数据——都不在此列。
+ * browser\* 操作隔离 BrowserHost（第二 WebView），vd\* 管理面不在此列；其中写屏内容的
+ * `vdInput` 由 `controlExec` 单独按虚拟目标校验，并由壳侧 `VdisplayController.input` 再次复核。
  */
 export const REAL_SCREEN_CONTROL_OPS: readonly string[] = [
   'snapshot', 'click', 'longClick', 'setText', 'scroll', 'global', 'screenshot', 'nodeText',
@@ -498,14 +499,35 @@ export function screenTokensFromSfDump(sfDump: string): Array<{ alias: string; t
 /**
  * Raw shell 面的屏幕范围判定（**引擎侧第一道**；壳侧 `ShellOps.scopeDenied` 是执行点的第二道）。
  *
- * @returns 拒绝文案（范围不含 real 且命令未能在 virtual-only 下自证目标屏）；null = 放行。
+ * @returns 拒绝文案（目标显示超出当前范围或无法认证）；null = 放行。
  */
 export function realScreenAdbCommandDenied(
   scope: UserScreenScope,
   command: string,
   options: ScreenAccessOptions = {},
 ): string | null {
-  if (scope === 'all' || scope === 'real-only') return null
+  if (scope === 'all') return null
+  if (scope === 'real-only') {
+    const parsed = splitCommandSegments(command)
+    if (parsed.unparsed) return realOnlyScreenScopeMessage()
+    for (const segment of parsed.segments) {
+      const bare = stripQuotedText(segment)
+      const options = displayOptionsIn(bare)
+      const families = SCREEN_COMMAND_FAMILIES.filter(
+        (family) => family.pattern.test(stripDisplayOptions(bare)),
+      )
+      for (const family of families) {
+        // Commands without a display selector use Android's physical default display (0).
+        // If a family has no documented selector, any display-looking option is ambiguous.
+        const relevant = options.filter((option) => family.targetFlags.includes(option.flag))
+        if (family.targetFlags.length === 0 && options.length > 0) return realOnlyScreenScopeMessage()
+        if (relevant.some((option) => option.value !== String(REAL_DISPLAY_ID))) {
+          return realOnlyScreenScopeMessage()
+        }
+      }
+    }
+    return null
+  }
   const verdict = screenCommandVerdict(command, ownedTargetPredicate(options))
   if (verdict === 'allow') return null
   const head = '用户当前开放屏幕范围为 virtual-only，不允许读取或操作真实屏内容'
@@ -522,6 +544,11 @@ export function realScreenAdbCommandDenied(
   return head + '命令里显式指定的目标屏若确为**已注册虚拟屏**（DisplayManager displayId 或该屏的 '
     + 'SurfaceFlinger token）即可放行；本条命令的目标屏未能与壳侧注册表核对上，故拒绝。'
     + '请确认虚拟屏仍在活跃状态（android_vdisplay_create / vdInfo），或由用户在设置中修改范围后重试。'
+}
+
+function realOnlyScreenScopeMessage(): string {
+  return '用户当前开放屏幕范围为 real-only；屏幕命令只能作用于物理屏 display 0。'
+    + '虚拟屏或无法确认的显式显示目标已拒绝。非屏幕 shell 命令仍按原策略执行。'
 }
 
 /** Normalize only the three product settings values; corrupt data fails closed. */

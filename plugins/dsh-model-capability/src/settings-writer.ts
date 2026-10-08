@@ -139,24 +139,29 @@ export function planModelPatch(rawModels: unknown, patches: ModelPatch[], stamps
     const next: Record<string, unknown> = { ...entry }
     const tag = patch.source ? ` (${patch.source})` : ''
     const source = patch.source ?? ''
+    let changed = false
 
     if (patch.reasoningEfforts && canWrite(stamps, patch.id, 'reasoningEfforts', next.reasoningEfforts, patch.reasoningEfforts)) {
       next.reasoningEfforts = patch.reasoningEfforts
+      changed = true
       changes.push(`${patch.id}: 补 reasoningEfforts=${Object.keys(patch.reasoningEfforts).join('/')}${tag}`)
       written.push({ id: patch.id, field: 'reasoningEfforts', value: patch.reasoningEfforts })
     }
     if (patch.input && patch.input.length > 0 && canWrite(stamps, patch.id, 'input', next.input, patch.input)) {
       next.input = patch.input
+      changed = true
       changes.push(`${patch.id}: 补 input=${patch.input.join('/')}${tag}`)
       written.push({ id: patch.id, field: 'input', value: patch.input })
     }
     if (typeof patch.contextWindow === 'number' && canWrite(stamps, patch.id, 'contextWindow', next.contextWindow, patch.contextWindow)) {
       next.contextWindow = patch.contextWindow
+      changed = true
       changes.push(`${patch.id}: 补 contextWindow=${patch.contextWindow}${tag}`)
       written.push({ id: patch.id, field: 'contextWindow', value: patch.contextWindow })
     }
     if (typeof patch.maxTokens === 'number' && canWrite(stamps, patch.id, 'maxTokens', next.maxTokens, patch.maxTokens)) {
       next.maxTokens = patch.maxTokens
+      changed = true
       changes.push(`${patch.id}: 补 maxTokens=${patch.maxTokens}${tag}`)
       written.push({ id: patch.id, field: 'maxTokens', value: patch.maxTokens })
     }
@@ -173,12 +178,17 @@ export function planModelPatch(rawModels: unknown, patches: ModelPatch[], stamps
       }
       if (added.length > 0) {
         next.compat = existingCompat
+        changed = true
         changes.push(`${patch.id}: 补 compat.${added.join(',')}${tag}`)
         for (const [field, value] of addedEntries) written.push({ id: patch.id, field, value })
       }
     }
 
-    if (changes.length > 0 || next !== entry) models[index] = next
+    // Commit only this patch's actual field writes. Comparing object identity is
+    // always true here because `next` is a fresh shallow copy; using the global
+    // `changes` list also lets an earlier model patch rewrite a later no-op entry.
+    // Both cases can silently normalize user-authored string model entries.
+    if (changed) models[index] = next
   }
 
   return { models, changes, skipped, written }

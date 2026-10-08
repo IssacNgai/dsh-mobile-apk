@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// verify-auto-undo.mjs —— 自动回滚（UndoGate → 急救 CLI restore-last-good）的设备验收。
+// verify-auto-undo.mjs —— 自动回滚（UndoGate → 壳侧已知良好快照 ID）的设备验收。
 //
 // 用户口径（2026-09-21）：「不能让有问题的回滚进入新版本。测试流程就是手动注入坏插件，重启引擎
 // 看看有没有被清除」，并追加验收第二条：「要测试是不是能正常剔除坏插件**且不损坏我们自己注册的任何好插件**」。
@@ -363,7 +363,7 @@ async function goodThenBadPhase() {
  * P5 跨版本护栏：把「已知良好记录」的安装指纹篡改成**另一次安装**的指纹，然后重现坏插件故障。
  *
  * 期望：**不回滚**（探针出现 `aborted no-known-good-for-this-install` 且本轮没有新的 `executed ok`）。
- * 反面（旧实现）：CLI 的 restore-last-good 会把上一次安装/崩溃启动时的配置写回 ⇒ 新版本自带的
+ * 反例（已移除的壳侧自动 fallback）：CLI 的 restore-last-good 会把上一次安装/崩溃启动时的配置写回 ⇒ 新版本自带的
  * 补丁与挂载项被静默删掉，用户看到「升级后功能反而没了」，而且 APK 还是新的（新代码 + 旧配置混合态）。
  *
  * 注意顺序：先杀引擎再篡改——否则下一拍 HEALTHY 会把记录按当前指纹重写，篡改活不过 5 秒。
@@ -498,11 +498,31 @@ async function main() {
     !mountsBad && byteIdentical
       ? `cordis.patch.yml 与基线**逐字节相同**（sha ${String(patchSha2).slice(0, 12)}）⇒ 其余条目与注释一字未动`
       : (mountsBad ? '坏插件仍被 cordis.patch.yml 挂载' : `已拔除但清单与基线不一致：${String(patchSha2).slice(0, 12)} vs ${String(patchSha0).slice(0, 12)}`))
-  // 清单式回滚的两份清单必须真的落地（否则「硬清单保护」只是纸面）
+  // 清单式回滚的两份清单必须真的落地（否则「硬清单保护」只是纸面）。
+  // 判据必须**按各自 schema**核对：两份清单由不同序列化器写出，键集合不同，
+  // 用同一个键名判两者是错的（2026-10-08 实测：本判据在本机稳态下恒假）。
+  //   硬清单 .plugin-hard-manifest.json  <- PluginMounts.cacheHard()
+  //     顶层键：schema, complete, fingerprint, entries, profileEntries（**无** names）
+  //   软清单 .plugin-soft-manifest.json  <- PluginMounts 软清单写出器
+  //     顶层键：names, digest, at, lastProbeDigest, lastProbeBoot, lastProbeAt
+  // 注意：只有 writeOnlineHardManifest() 写的 *online* 硬清单（.plugin-hard-manifest-online-<archive>.json）
+  // 才额外带 names；本判据读的是**常驻**那份，故 names 不是它的判据。
   const hard = runAs(`cat ${FILES}/.plugin-hard-manifest.json 2>/dev/null`)
   const soft = runAs(`cat ${FILES}/.plugin-soft-manifest.json 2>/dev/null`)
-  record('P4 两份清单在场（硬/软）', hard.includes('names') && soft.includes('names') ? 'PASS' : 'FAIL',
-    `硬清单片段=${hard.slice(0, 120).replace(/\n/g, ' ')}`)
+  const hardOk = (() => {
+    try {
+      const j = JSON.parse(hard)
+      return j && j.schema === 2 && j.complete === true && Array.isArray(j.entries) && Array.isArray(j.profileEntries)
+    } catch { return false }
+  })()
+  const softOk = (() => {
+    try {
+      const j = JSON.parse(soft)
+      return j && Array.isArray(j.names)
+    } catch { return false }
+  })()
+  record('P4 两份清单在场（硬/软）', hardOk && softOk ? 'PASS' : 'FAIL',
+    `硬清单 schema/entries/profileEntries=${hardOk}；软清单 names=${softOk}；硬清单片段=${hard.slice(0, 120).replace(/\n/g, ' ')}`)
 
   const man1 = manifestMap(runAs(`cd ${NM} && find . -type f | sort | xargs sha256sum`))
   const diff = manifestDiff(man0, man1)

@@ -58,7 +58,7 @@
 - `scope: vendor` 打 vendor 固化插件（dshmarketplace-plugin B/D + **U2 exact-route browser-session 鉴权**；dsh-undo-savepoint E1-E8 + **S1 safe 保留自有插件** + **U1 `/api/undo` connection/token 鉴权与 no-store**），在 `build-apk-013.ps1` 阶段施加；对应行为回归在 `scripts/patches/tests/{undo-route-auth,market-route-auth}.test.mjs`。
   - **2026-09-26 追版**：两个插件都追到上游新版（marketplace 0.1.5→0.1.7、undo 0.3.8→0.4.9）。已退役：marketplace A（上游 0.1.7 原生修 next 兜底）、marketplace C（上游 0.1.7 用 `installCheck==="passed"` 过滤掉不可安装条目）；新增 undo S1（safe 生成对齐壳侧 `SafeMode.kt`：只摘第三方、保留 `@dsh-android/*` 与全部 `disable` 行——上游原实现整份覆写会重开无鉴权的 `client-hmr` SSE）。详见各 vendor 的 `PATCHES.md` 与 `registry.json` 的 `retired` 段。undo 0.4.9 另有安全收益：`settings.yaml` 纳入脱敏（0.3.8 时代在快照范围内却不脱敏 ⇒ 明文进包）。
 - `scripts/check-api-route-auth.mjs` 与 `api-route-auth-policy.json` 不属于运行时 asset：它们扫描所有 mobile-owned WebServer registration source，要求 protected guard 或窄公开白名单，并在本地/云端/CI/发布链接线。file-incoming 的 queue、claim、content、complete、clean 五个 exact route 均属于 protected 面；content 只接受进程内 ticket，不能返回源绝对路径。
-- `scope: engine` 打引擎树内上游包（全量以 §7.1 表为准，条数与清单现数 `scripts/patches/registry.json`：narb-android-N1 / attach-durable-F2 / **fs-local-link-F8** / flock-android-F3 / atomic-stale-lock-F4 / spj-migration-link-F5 / publish-exclusive-F7 / reference-drill-F6 / pi-toolcall-G2 / perf-compile-cache-flush-N2 / combo-probe-P1 / boot-third-party-isolation-G3 / arkweb-resource-protocol-H1 / external-draft-conversation-seam-J1 / terminal-inspector-android-D1 / fs-local-digest-guard-B / ptc-argv-L1 / file-upload-restart-R1），在 `build-snapshot-013.mjs` 0f 步施加并逐个复查 marker（N1/G3 的 0.14.2 重锚见 §7.4；同批撤销 6 条已不在册：N1/G1/A3/A4/A5/C3，A4 退役理由见 §7.4）。
+- `scope: engine` 打引擎树内上游包（全量以 §7.1 表为准，条数与清单现数 `scripts/patches/registry.json`：narb-android-N1 / attach-durable-F2 / **fs-local-link-F8** / flock-android-F3 / atomic-stale-lock-F4 / spj-migration-link-F5 / publish-exclusive-F7 / reference-drill-F6 / pi-toolcall-G2 / perf-compile-cache-flush-N2 / combo-probe-P1 / client-registry-scan-C4 / typert-registry-scan-C4 / boot-third-party-isolation-G3 / arkweb-resource-protocol-H1 / external-draft-conversation-seam-J1 / terminal-inspector-android-D1 / fs-local-digest-guard-B / ptc-argv-L1 / file-upload-restart-R1），在 `build-snapshot-013.mjs` 0f 步施加并逐个复查 marker（N1/G3 的 0.14.2 重锚见 §7.4；同批撤销 6 条已不在册：N1/G1/A3/A4/A5/C3，A4 退役理由见 §7.4）。
 
 **与本节 assets/patched/ 的分界**：同一份引擎文件的修复若能在构建期落地（随发行快照固化），优先走 `scope: engine`；运行时 asset 只承担「必须每次启动前覆盖」或「与引擎版本无关的壳侧定制」（见 §3-2）。已退役：pi-drift-F1（上游 0.1.5 原生 strict/deferred 校验）。**assets/patched/ 是设备端运行时补丁**——壳在每次引擎启动前对快照内上游引擎包做覆盖。两者层不同、目标不同、幂等机制不同（构建期 = registry 幂等标记；运行时 = 内容指纹），勿混用；构建期补丁登记见协调仓 scripts/patches/README.md 与 registry.json。
 
@@ -104,9 +104,12 @@
 | `external-draft-conversation-seam-J1` | `dsh-client-ui-conversation/lib/client.js` | 外部文件草稿：向 ConversationController 补受控 `addFiles(sessionId, files)` seam，复用既有 `createDrafts` / InputHub `shell.addAttachments` / refusal release——不创建第二条上传路径、不自动发送、路径不进页面/模型。回归 `node scripts/patches/tests/external-draft-conversation-seam.test.mjs` |
 | `perf-compile-cache-flush-N2` | `dsh/lib/bin.js` | 启动性能：Node 只在正常退出写 `NODE_COMPILE_CACHE`，而壳侧停引擎是有界宽限的 SIGTERM→SIGKILL、系统可整进程回收 → 换树后的新条目永远写不进去（设备实测 09-12 23:07 后零新增）。入口周期 flush（40s 首刷 + 5min）+ `exit` 兜底；不注册信号处理，不改任何命令退出语义。回归 `node scripts/patches/tests/compile-cache-flush-n2.test.mjs` |
 | `narb-android-N1` | `node-addon-require-builtin/lib/index.js` | Android 无预编译 `node-addon-require-builtin` 绑定（npm 无 `-android-x64` 产物，上游 support-matrix 明写 has no published platform package）：0.1.7-rc.1 的 `dsh-app-boot` 新增该依赖（0.1.5 夹具零命中），real 设备 `boot-fail.log` 连记 4 轮 `host preparation failed / No usable native binding found for node-addon-require-builtin-android-x64` ⇒ 引擎 boot 期硬崩。修法：`createEntryApi` 顶层调用包 try/catch（失败即 `api = undefined` + 一次性告警），三个导出函数在 `api` 缺席时回落 `require(moduleId)`——壳侧本就以 `--expose-internals` 起 node（EngineManager.kt:1036 argv 第二项），该 flag 恰好暴露 rc.1 `internalModules()` 需要的五个 `internal/modules/*`，与内置模块同一实现，不是「假装成功」。行为回归 `node scripts/patches/tests/narb-native-fallback-n1.test.mjs`（11 项，含 `--expose-internals` 子进程真跑回落） |
-| `combo-probe-P1` | `dsh-client-modules/lib/index.js` | 把 compose 探针送进产品内，收口 `t_compose_total` 恒 -1（42/42 恒 -1）。在 `compose()` 返回处打印 `[perf] compose #N at=… dur=…` 与 `[perf] TOTAL calls=… totalMs=…`（字段恒在场，无值写 -1）；只主线程安装（worker 的 calls=0 TOTAL 不得冒充真读数）；不新增快照成员、壳侧解析器零改动。`provenance` 见 `scripts/patches/registry.json` 的 `combo-probe-P1` |
+| `combo-probe-P1` | `dsh-client-modules/lib/index.js` | 把 compose 探针送进产品内，并在既有 Loader settle barrier 批量发布启动 graph：构造器仍产生同 shape/rev 的空 graph，启动期 Fiber dirty 合并，在 connection ready continuation 前 compose 完整图；构造时已有 rows 最多先同步一次、settle 再一次（≤2），settle 后运行期 add/remove 与 HMR 保持即时语义。只主线程安装（worker 的 calls=0 TOTAL 不得冒充真读数）；每次 compose 返回时立即输出累计 TOTAL，从同一 C4 monitor 读取当次 p99/样本数，保持壳 tail 与 last-row 解析时序。phase 独立使用四阶段 allowlist Map 聚合、固定 250ms unref timer 收口，后续事件不重置 deadline；字段区分 wall-clock 耗时、observations 与 forwardedCallbacks。phase 不改变 TOTAL/C4 采样窗口；不新增快照成员。回归 `scripts/patches/tests/combo-probe-p1.test.mjs` 覆盖空图、分批 activation、ready 顺序、compose/TOTAL 即时对应、phase 边界与固定 deadline、运行期/HMR。壳 `LogCollector` 另缓存 LISTEN 前读数并在 markListen 关联，用于避免 C6 -1。完整二进制设备预算仍须真实复跑。`provenance` 见 `scripts/patches/registry.json` 的 `combo-probe-P1` |
+| `client-registry-scan-C4` | `dsh-client-modules/lib/index.js` | flush 内按名称索引 Loader rows，错误回调后失效；复用 nearestPackage 本次已解析 manifest。保留构造同步聚合失败、settle/Web ready 顺序、运行期 add/remove 与 HMR；回归 `client-registry-scan-c4.test.mjs`、联合 `combo-probe-p1.test.mjs`。 |
+| `typert-registry-scan-C4` | `dsh-typert-loader/lib/index.js` | 同步 flush 单次索引已挂接名称，错误回调后失效；异步 manifest 完成后继续使用 live Loader 判定，防消失的条目误注册。显式包、激活失败及运行期撤销保留；回归 `typert-registry-scan-c4.test.mjs`。 |
 | `boot-third-party-isolation-G3` | `dsh-app-boot/lib/index.js` | 第三方插件 boot 期失败隔离：`boot()` 经隔离式挂载器挂 root include，失败条目若属**用户自装**（非 `@deepseek-ai/*` / `@dsh-android/*` / 出货具名插件）则加 `disabled:true` 后重试并点名列出被跳过的插件；官方/出厂插件失败、不可识别失败、或超过上限 8 个仍响亮失败。真因：用户自装插件 import 期抛错在 `mountRootInclude` 就抛出，`boot-pending-G1` 的锚点 `assertEntriesActivated` 结构上不可达。真源见 `scripts/patches/registry.json` 的 `boot-third-party-isolation-G3`；回归 `node scripts/patches/tests/boot-third-party-isolation-g3.test.mjs` |
 | `file-upload-restart-R1` | `dsh-client-file-upload/lib/index.js` | Agent resolver 单槽注册改为**同槽覆盖**（2026-09-28 模拟器 5556 实锤）：cordis `Fiber._reload` 的顺序是「先执行新实例 body、再 `_unload()` 释放旧 effect」，故 session-controller 因 `agent-default-model` 条目被改写而重启时，新 `SessionController` 构造里的 `ctx.effect(() => ctx.fileUploads.registerAgentResolver(...))` 撞上上游的 already-registered 守卫 → 新 fiber 判 FAILED、服务永久缺席（切一次默认模型即触发，客户端恒报 `session/control: active Service "sessionController" is unavailable`）。修法只去掉守卫、保留身份判据的 disposer（旧 fiber 的 disposer 不会清掉新注册）；仍只有一个槽。真源见 `scripts/patches/registry.json` 的 `file-upload-restart-R1` |
+| `mimo-thinking-toggle-056` | `dsh-llm-pi-ai/lib/index.js` + `@earendil-works/pi-ai/dist/api/openai-completions.js` | Issue #56：开放显式 `thinkingFormat=mimo`；仅精确官方 MiMo profile 或用户显式 compat 生成 off/low 二态映射，选择器显示“关闭思考/开启思考”，默认开启。Completions serializer 将状态编码为 `thinking.type=disabled|enabled`，不发送 `reasoning_effort`；保留 assistant 多轮 `reasoning_content`。固定 DSH 0.2.0-rc.2 / pi-ai 0.87.1 锚点；行为回归 `scripts/patches/tests/mimo-thinking-toggle-056.test.mjs`。 |
 
 
 ### 7.1a 0.14.3 新增/变更补丁与构建钩子（源码在场，未执行）
@@ -246,6 +249,8 @@ unlink ENOENT 容忍），与 attachment 资产逐字节同源——此前这三
   直驱产品内单条服务路径（断言 200 + 载荷含 id + 两次 `body()` 同一 promise），C5 判据改三态
   （0 / >0 / 缺席），既不恒绿也不恒红。C3「compose ≤ 2」阈值**不放宽**（裸树正是 2 次，仍可满足）。
 
+**0.14.5 启动重组降载（在 P1 内实现，不恢复 A4）**：首批真机 0.14.4 的 C3 实读为同一 registry 八次真实 `flush.changed → compose`，不是探针重复或多实例。源码 `dsh/` 只读；新增 P1 patch 在已有 `loader.await()` settle 屏障收敛启动期 dirty Fiber，保持构造时空 graph 的 rev/hash，完整 graph 在 web connection ready continuation 前发布。若已有条目先 active，保留原同步首 flush，之后启动 dirty 一次性合并（最多两次）；settle 后 HMR/add/remove 仍立即生效。行为 fixture 覆盖空图、三批延迟 activation、未丢 Fiber、ready 顺序、次数和运行期即时更新。每条 TOTAL 在 compose 返回时立即采同一 event-loop histogram 并同步输出，保持 C4/LogCollector last-row 语义；启动 phase 诊断以固定阶段 Map 聚合，最多四行，首事件后的 250ms 固定窗口收口，不会延迟 TOTAL 或改变 histogram。当前集成 0.14.5 APK 的 C3=2 通过；五次冷启动 C4 均为 157.7–217.1ms/17–25 samples，超过 100ms 预算；C2、C5/C5+（显式指定设备 probe 文件）、C6 通过。新增 phase 行记录构造 flush、loader settle wall time、延迟启动 flush 与首次 settle 后 compose start；离线 fixture 已通过，修正后的诊断 patch 尚待重建进 APK 与设备测量，目前不能断言 C4 根因已定位或修复。
+
 **引擎 overlay 追版**（`scripts/snapshot-config/engine-overlay.json`，2026-09-25 现数）：
 `vendorTop` 17 → **36** 条（+19：`execa` 及其依赖闭包、`@sec-ant/readable-stream`、
 `@sindresorhus/merge-streams`、`get-stream`、`human-signals`、`is-plain-obj`、`is-stream`、
@@ -295,6 +300,27 @@ node scripts/patches/apply-patches.mjs <stage> --apply --scope engine --only fs-
 
 **管线自证**：只施加 F8（不带 B）可**逐字节复现**原 43,405 B 资产（sha256 `368e382cc71c…`），
 证明产物确由该 fixture 经补丁链生成，F8+B 版即其正确超集。
+
+### 7.6 0.14.5 C4 实耗与最小修复（2026-10-06）
+
+受控 wrapper 的计时含诊断开销：client 构造
+flush 193 次扫描、38,021 行，entry 迭代49.8ms；metadata38.6ms，其中 locate28.1ms、nearest19.6ms；
+bundle55份10.8MB读取17.6ms，compose9.4ms。typert 首 flush193次 qualifies、24,181行，qualify41.5ms，
+整轮118.4ms。CPU样本还定位到本方模型能力自动补给初次 descriptor 与最终 signature 的两次
+全量 settings.describe，与离线目录解析堆在同一 turn。修复由上述两条 scan 补丁和插件异步
+pass checkpoint 共同组成；完整自动补给行为见 `plugins/dsh-model-capability/README.md`。
+
+实际对照使用同一同步 TOTAL/C4 monitor：仅 client scan 五轮为126.4/13、114.4/12 FAIL，
+76.1/11、88.9/12、93.5/10 PASS；再加 typert scan 仍有147.2/13、110.6/13、116.6/14 FAIL。
+三项一起热推后的五次独立冷启动为90.6/13、79.9/11、89.9/13、88.7/14、84.0/11，
+C1–C6/C5正向对照全部PASS且SKIP=0，C3均2，WebView CDP五轮39/39；ADB实际点按菜单并以
+Android Back关闭后仍在MainActivity，MiMo选择保留。未改100ms预算、samples>=10或采样窗口。
+原始预算、计时与截图在协调仓 `.deploy-tmp/refactor/c4-rootcause/`。
+
+这些结果证明该 runtime 热推组合的本轮行为与预算；当前已安装APK仍是此前phase包，不能写成
+新APK完成验收。临时CPU/wrapper诊断原件需恢复并核验hash；最终发布必须重新生成快照/全链APK
+并完成集成三层验收。首次constructor TOTAL的样本为0、deferred返回前尚未采到其同步阻塞，因此
+不能把phase wall time直接当C4 p99；更早debounce TOTAL的统计窗口不同，也不能拿来作性能归因。
 
 ## 8. 0.13.7fx-1：web-frontend-index.html 退役（2026-09-11）
 

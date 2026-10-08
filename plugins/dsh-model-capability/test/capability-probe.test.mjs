@@ -8,6 +8,7 @@ import {
   parseDescriptor,
   parseOllamaShow,
   probePassive,
+  probeResponsesReasoningEfforts,
   probeReasoningEfforts,
 } from '../lib/capability-probe.js'
 import { providerFromSettings } from '../lib/settings-config.js'
@@ -92,6 +93,23 @@ test('passive probe fetches only the configured endpoint and reports unknowns', 
   assert.deepEqual(report.unknown, ['declared-but-absent'])
 })
 
+test('passive reasoning descriptors require a known serializer and distinct Responses evidence', async () => {
+  const payload = { data: [{ id: 'm', reasoning_efforts: ['low', 'medium', 'high'] }] }
+  const fetchImpl = async () => jsonResponse(payload)
+  const response = await probePassive({ route: 'r', api: 'openai-responses', baseURL: 'https://gw/v1', models: ['m'] }, { fetchImpl })
+  assert.equal(response.models[0].reasoningEfforts, undefined, 'multi-level descriptor is not proof of distinct Responses semantics')
+  assert.ok(response.notes.some((note) => note.includes('保持未知')))
+
+  const completions = await probePassive({
+    route: 'r', api: 'openai-completions', baseURL: 'https://gw/v1', models: ['m'],
+    compat: { thinkingFormat: 'openai', supportsReasoningEffort: true },
+  }, { fetchImpl })
+  assert.deepEqual(completions.models[0].reasoningEfforts, { low: 'low', medium: 'medium', high: 'high' })
+
+  const unconfigured = await probePassive({ route: 'r', baseURL: 'https://gw/v1', models: ['m'] }, { fetchImpl })
+  assert.equal(unconfigured.models[0].reasoningEfforts, undefined, 'unknown route protocol cannot select a serializer')
+})
+
 test('anthropic-shaped routes authenticate with x-api-key', async () => {
   let seen = {}
   const fetchImpl = async (url, init) => {
@@ -124,6 +142,85 @@ test('active probe classifies acceptance, rejection and uncertainty', async () =
   assert.deepEqual(result.efforts, { low: 'low' })
 })
 
+test('Responses active probe uses /responses reasoning.effort and requires an effective negative control', async () => {
+  const calls = []
+  const result = await probeResponsesReasoningEfforts({
+    route: 'responses', api: 'openai-responses', baseURL: 'https://gw.example/v1', apiKey: 'k', models: ['m'],
+  }, 'm', ['low', 'medium'], {
+    fetchImpl: async (url, init) => {
+      const body = JSON.parse(init.body)
+      calls.push({ url, init, body })
+      if (body.reasoning.effort === '__dsh_invalid_effort__') {
+        return { ok: false, status: 400, text: async () => 'invalid reasoning effort' }
+      }
+      return jsonResponse({ id: 'resp_1' })
+    },
+  })
+  assert.equal(calls.length, 3)
+  assert.ok(calls.every((call) => call.url === 'https://gw.example/v1/responses'))
+  assert.ok(calls.every((call) => call.init.method === 'POST'))
+  assert.ok(calls.every((call) => call.init.headers.authorization === 'Bearer k'))
+  assert.deepEqual(calls[0].body.reasoning, { effort: '__dsh_invalid_effort__' })
+  assert.deepEqual(calls[1].body.reasoning, { effort: 'low' })
+  assert.equal(calls[1].body.model, 'm')
+  assert.equal(result.negativeControl.accepted, false)
+  assert.deepEqual(result.accepted, ['low', 'medium'])
+  assert.deepEqual(result.efforts, { low: 'low', medium: 'medium' })
+
+  let candidateRequests = 0
+  const ineffective = await probeResponsesReasoningEfforts({
+    route: 'responses', api: 'openai-responses', baseURL: 'https://gw.example/v1', models: ['m'],
+  }, 'm', ['low'], {
+    fetchImpl: async () => { candidateRequests++; return jsonResponse({ id: 'ignored-control' }) },
+  })
+  assert.equal(candidateRequests, 1, 'only the negative control is sent when it is accepted')
+  assert.deepEqual(ineffective.accepted, [])
+  assert.equal(ineffective.inconclusive[0].level, 'low')
+})
+
+test('generic model errors cannot validate the reasoning.effort negative control or reject a candidate', async () => {
+  let controlCalls = 0
+  const falseControl = await probeResponsesReasoningEfforts({
+    route: 'responses', api: 'openai-responses', baseURL: 'https://gw.example/v1', models: ['missing-model'],
+  }, 'missing-model', ['low'], {
+    fetchImpl: async () => {
+      controlCalls++
+      return { ok: false, status: 400, text: async () => 'invalid model' }
+    },
+  })
+  assert.equal(controlCalls, 1, 'a generic control error must stop candidate probing')
+  assert.deepEqual(falseControl.accepted, [])
+  assert.equal(falseControl.negativeControl.reason, 'invalid model')
+
+  let candidateCalls = 0
+  const falseCandidate = await probeResponsesReasoningEfforts({
+    route: 'responses', api: 'openai-responses', baseURL: 'https://gw.example/v1', models: ['m'],
+  }, 'm', ['low'], {
+    fetchImpl: async (_url, init) => {
+      candidateCalls++
+      const body = JSON.parse(init.body)
+      if (body.reasoning.effort === '__dsh_invalid_effort__') {
+        return { ok: false, status: 422, text: async () => 'unsupported reasoning effort' }
+      }
+      return { ok: false, status: 400, text: async () => 'invalid model' }
+    },
+  })
+  assert.equal(candidateCalls, 2)
+  assert.deepEqual(falseCandidate.rejected, [])
+  assert.equal(falseCandidate.inconclusive[0].reason, 'invalid model')
+})
+
+test('active probe helper rejects unsupported wire dialects without requests', async () => {
+  let calls = 0
+  const result = await probeResponsesReasoningEfforts({
+    route: 'mimo', api: 'openai-completions', baseURL: 'https://gw.example/v1', models: ['m'],
+    compat: { thinkingFormat: 'mimo' },
+  }, 'm', ['low', 'high'], { fetchImpl: async () => { calls++; return jsonResponse({}) } })
+  assert.equal(calls, 0)
+  assert.equal(result.inconclusive.length, 2)
+  assert.match(result.inconclusive[0].reason, /only for the openai-responses/)
+})
+
 test('providerFromSettings maps declared models and never fabricates a route', () => {
   const settings = {
     describe: () => [{
@@ -134,9 +231,15 @@ test('providerFromSettings maps declared models and never fabricates a route', (
           'my-gateway': {
             api: 'openai-completions',
             baseURL: 'https://gw.example/v1',
+            compat: { thinkingFormat: 'zai', supportsReasoningEffort: true },
             apiKey: 'k',
             headers: { 'x-tenant': 't' },
-            models: [{ id: 'a' }, 'b'],
+            models: [{ id: 'a', compat: { thinkingFormat: 'deepseek' }, reasoningEfforts: false }, 'b'],
+            modelOverrides: {
+              a: { compat: { thinkingFormat: 'openai', supportsReasoningEffort: true } },
+              b: { reasoningEfforts: { high: 'high' } },
+              ignored: { compat: { thinkingFormat: 'openai' } },
+            },
           },
           'no-base-url': { models: ['c'] },
         },
@@ -147,10 +250,15 @@ test('providerFromSettings maps declared models and never fabricates a route', (
   assert.deepEqual(config, {
     route: 'my-gateway',
     api: 'openai-completions',
+    compat: { thinkingFormat: 'zai', supportsReasoningEffort: true },
     baseURL: 'https://gw.example/v1',
     apiKey: 'k',
     headers: { 'x-tenant': 't' },
     models: ['a', 'b'],
+    modelProfiles: {
+      a: { compat: { thinkingFormat: 'deepseek', supportsReasoningEffort: true }, reasoningEfforts: false },
+      b: { reasoningEfforts: { high: 'high' } },
+    },
   })
   assert.equal(providerFromSettings(settings, 'no-base-url'), undefined)
   assert.equal(providerFromSettings(settings, 'unknown'), undefined)
@@ -180,5 +288,6 @@ test('多命名空间时按 ns 查找 llm-pi-ai，而不是取第一个（0.13.5
     apiKeyEnv: 'MHS_API_KEY',
     headers: undefined,
     models: ['glm-5.3-flash'],
+    modelProfiles: {},
   })
 })

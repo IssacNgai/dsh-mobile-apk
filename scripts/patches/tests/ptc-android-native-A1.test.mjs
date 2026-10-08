@@ -1,7 +1,6 @@
-/** Source-only/fake-provider regressions. No child processes, devices, network, or runtime probes. */
+/** Regressions against the published 0.2.0-rc.2 runtime library. No child processes, devices, network, or runtime probes. */
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { stripTypeScriptTypes } from 'node:module'
 import { posix } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { runInNewContext } from 'node:vm'
@@ -13,11 +12,11 @@ import {
 
 const fixture = new URL('./fixtures/dsh-ptc-runtime-node-0.2.0-rc.2/', import.meta.url)
 const read = name => readFileSync(new URL(name, fixture), 'utf8')
-const rawIndex = read('src/index.ts')
-const rawEnvironment = read('src/environment.ts')
-const rawChild = read('src/process.ts')
-const index = patchRuntimeIndex(rawIndex, true)
-const environment = patchEnvironment(rawEnvironment, true)
+const rawIndex = read('lib/index.js')
+const rawChild = read('lib/process.js')
+const environment = patchEnvironment(rawIndex)
+const index = patchRuntimeIndex(environment)
+const child = patchEnvironment(rawChild)
 const prefix = '/data/data/com.dsharnessmobile.shell/files/usr'
 const node = prefix + '/bin/node'
 const native = {
@@ -30,8 +29,9 @@ const native = {
   OPENSSL_CONF: prefix + '/etc/tls/openssl.cnf', SSL_CERT_FILE: prefix + '/etc/tls/cert.pem',
 }
 function environmentSet(platform) {
-  return runInNewContext(environment.replace('export ', '').replace(': ReadonlySet<string>', '')
-    + '\nSTARTUP_ENVIRONMENT_NAMES;', { process: { platform } })
+  const declaration = environment.match(/const STARTUP_ENVIRONMENT_NAMES = new Set\([\s\S]*?\);/)
+  assert.ok(declaration, 'published runtime startup environment declaration exists')
+  return runInNewContext(declaration[0] + '\nSTARTUP_ENVIRONMENT_NAMES;', { process: { platform } })
 }
 function choose(executable, options = {}) {
   return Array.from(runInNewContext(LAUNCH_HELPER_JS + '\ndshMobilePtcLaunchPrefix(executable);', {
@@ -41,7 +41,9 @@ function choose(executable, options = {}) {
 }
 /** Execute exactly the patched host launch segment with fake subprocess/sandbox services. */
 async function launch(mode, options = {}) {
-  const segment = index.slice(index.indexOf('      const executable = await'), index.indexOf('      const launched = handle'))
+  const launchStart = index.search(/^[\t ]*const executable = await/m)
+  const launchEnd = index.indexOf('const launched = handle;', launchStart)
+  const segment = index.slice(launchStart, launchEnd)
   assert.ok(segment.includes('this.ctx.subprocess.spawn'))
   const calls = { spawn: [], confine: [], resolved: [] }
   const policy = { mode, workspaceRoot: '/workspace' }
@@ -62,7 +64,7 @@ async function launch(mode, options = {}) {
     },
     config: { nodeExecutable: options.executable ?? node, maxOldGenerationSizeMb: 512, maxMessageBytes: 1234, graceMs: 3000 },
   }
-  const js = stripTypeScriptTypes('(async function () {\n' + segment + '\nreturn { handle, sandbox };\n})')
+  const js = '(async function () {\n' + segment + '\nreturn { handle, sandbox };\n})'
   const fn = runInNewContext(LAUNCH_HELPER_JS + '\n' + js, {
     isAbsolute: posix.isAbsolute,
     process: { platform: 'android', execPath: '/system/bin/linker64', env: { PATH: prefix + '/bin:/system/bin', ...native, DEEPSEEK_API_KEY: 'fixture-secret', DSH_PICK_TOKEN: 'fixture-token', NODE_OPTIONS: '--inspect=0' } },
@@ -75,13 +77,13 @@ async function launch(mode, options = {}) {
   catch (error) { return { calls, error } }
 }
 
-test('newest firsthand source patch is idempotent and preflights the unchanged child', () => {
-  assert.equal(patchRuntimeIndex(index, true), index)
-  assert.equal(patchEnvironment(environment, true), environment)
-  assertChildClearing(rawChild)
-  const plan = planPatch(fileURLToPath(fixture), true)
-  assert.deepEqual(plan.filter(file => file.before !== file.after).map(file => file.name), ['src/environment.ts', 'src/index.ts'])
-  assert.equal(read('src/index.ts'), rawIndex)
+test('published 0.2.0-rc.2 library patch is idempotent and preflights the unchanged child', () => {
+  assert.equal(patchRuntimeIndex(index), index)
+  assert.equal(patchEnvironment(environment), environment)
+  assertChildClearing(child)
+  const plan = planPatch(fileURLToPath(fixture))
+  assert.deepEqual(plan.filter(file => file.before !== file.after).map(file => file.name), ['lib/index.js', 'lib/process.js'])
+  assert.equal(read('lib/index.js'), rawIndex)
 })
 test('Android retains exactly the native settings; other platforms retain the original six names', () => {
   const android = environmentSet('android')
@@ -138,11 +140,11 @@ test('an enforcing provider keeps its complete argv and honest enforcement metad
   assert.equal(run.result.sandbox.enforcement, 'full')
   assert.equal(run.result.sandbox.mode, 'workspace-write')
 })
-test('child retains only native OS values while the model-facing process.env stays empty', () => {
+test('published child retains only native OS values while the model-facing process.env stays empty', () => {
   const osEnv = { ...native, PATH: prefix + '/bin', DEEPSEEK_API_KEY: 'fixture-secret', DSH_PICK_TOKEN: 'fixture-token', NODE_OPTIONS: '--max-old-space-size=512' }
   const processState = { env: osEnv }
-  const clearing = rawChild.slice(rawChild.indexOf('  for (const key'), rawChild.indexOf('  const boot ='))
-    .replace(' as NodeJS.ProcessEnv', '')
+  const clearing = /^[\t ]*for \(const key of Object\.keys\(processState\.env\)\)[\s\S]*?^[\t ]*processState\.env = Object\.create\(null\);/m.exec(child)?.[0]
+  assert.ok(clearing, 'published child contains its startup environment clearing boundary')
   runInNewContext(clearing, { processState, STARTUP_ENVIRONMENT_NAMES: environmentSet('android') })
   assert.deepEqual(Object.keys(processState.env), [])
   assert.equal(Object.getPrototypeOf(processState.env), null)
@@ -150,11 +152,11 @@ test('child retains only native OS values while the model-facing process.env sta
   for (const key of ['DEEPSEEK_API_KEY', 'DSH_PICK_TOKEN', 'NODE_OPTIONS']) assert.equal(Object.hasOwn(osEnv, key), false)
 })
 test('anchor, marker, heap placement, and sandbox-policy drift are rejected', () => {
-  assert.throws(() => patchEnvironment(rawEnvironment.replace("'TMP'", "'TMPDIR'"), true))
-  assert.throws(() => patchEnvironment(environment.replace('"LD_PRELOAD"', '"EVIL_PRELOAD"'), true))
-  assert.throws(() => patchRuntimeIndex(rawIndex.replace("policy.mode === 'danger-full-access'", "policy.mode === 'workspace-write'"), true))
-  assert.throws(() => patchRuntimeIndex(index.replace('...launchPrefix,', '...launchPrefix, heapFlag,'), true))
-  assert.throws(() => assertChildClearing(rawChild.replace('Object.create(null)', '{}')))
+  assert.throws(() => patchEnvironment(rawIndex.replace('"TMP"', '"TMPDIR"')))
+  assert.throws(() => patchEnvironment(environment.replace('"LD_PRELOAD"', '"EVIL_PRELOAD"')))
+  assert.throws(() => patchRuntimeIndex(rawIndex.replace('policy.mode === "danger-full-access"', 'policy.mode === "workspace-write"')))
+  assert.throws(() => patchRuntimeIndex(index.replace('...launchPrefix,', '...launchPrefix, heapFlag,')))
+  assert.throws(() => assertChildClearing(child.replace('processState.env = Object.create(null)', 'processState.env = {}')))
 })
 test('compiled formatting is covered separately, without claiming the old fixture is a newest build', () => {
   const oldBuilt = readFileSync(new URL('./fixtures/dsh-ptc-runtime-node-0.1.7-rc.2/lib/index.js', import.meta.url), 'utf8')

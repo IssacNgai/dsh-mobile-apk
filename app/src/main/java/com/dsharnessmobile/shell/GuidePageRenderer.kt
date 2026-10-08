@@ -461,15 +461,20 @@ internal class GuidePageRenderer(private val activity: MainActivity) {
    */
   private fun enterSafeMode() = activity.runOnUiThread {
     val engine = activity.engineManager
+    val hardManifest = PluginMounts.ensureHard(activity, PluginMounts.currentFingerprint(activity))
     val (stage, logTail) = SafeMode.readFailureContext(activity)
     val result = SafeMode.enter(
       patch = SafeMode.patchFile(engine),
       homePatch = SafeMode.homePatchFile(engine),
       autoDir = SafeMode.autoDir(engine),
       id = SafeMode.newId(),
+      // 归属判定的权威来源：本版本实际装配的条目（不再是包名前缀，见 [SafeMode.isProductOwned]）。
+      hardManifestAvailable = hardManifest != null,
+      hardEntries = hardManifest?.entries,
+      factoryBundles = hardManifest?.factoryBundles,
     )
     if (!result.ok) {
-      // 备份不成功就绝不进入（[SafeMode.enter] 保证未改任何文件）——回执必须带真因。
+      // 备份失败时 live 配置未动；marker 落盘后的 live 写失败可能部分生效，但恢复来源仍保留，回执必须带真因。
       applyGuideHint(activity.getString(R.string.ds_safe_failed, result.message))
       return@runOnUiThread
     }

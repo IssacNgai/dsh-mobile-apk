@@ -39,6 +39,8 @@ export interface CatalogSnapshot {
 }
 
 export interface CatalogCapabilities {
+  /** Only set when every matching catalog row names the same protocol. */
+  api?: string
   reasoningEfforts?: ReasoningEfforts
   input?: Modality[]
   contextWindow?: number
@@ -99,16 +101,22 @@ function keyOf(value: unknown): string {
 
 /**
  * Looks one model id up across the snapshot. When [api] is given, only entries
- * for that wire family are considered (a hand-declared route may name its api).
+ * explicitly describing that wire family are considered; an absent API cannot
+ * safely inherit protocol-specific serialization data.
  */
 export function lookupCatalog(snapshot: CatalogSnapshot | undefined, id: string, api?: string): CatalogMatch {
   const match: CatalogMatch = { id, providers: [], capabilities: {}, conflicts: [] }
   if (!snapshot?.models) return match
   const entries = (snapshot.models[id] ?? []).filter((entry) => {
     if (!api) return true
-    return entry.api === undefined || entry.api === api
+    return entry.api === api
   })
   if (entries.length === 0) return match
+  const apis = [...new Set(entries.map((entry) => entry.api).filter((value): value is string => typeof value === 'string'))]
+  const hasMissingApi = entries.some((entry) => typeof entry.api !== 'string')
+  if (api !== undefined) match.capabilities.api = api
+  else if (apis.length === 1 && !hasMissingApi) match.capabilities.api = apis[0]
+  else if (apis.length > 1 || hasMissingApi) match.conflicts.push(`api conflict: ${apis.join('/') || 'unknown'}`)
   match.providers = entries.map((entry) => entry.provider)
 
   const unanimous = <T>(values: Array<T | undefined>, label: string): T | undefined => {

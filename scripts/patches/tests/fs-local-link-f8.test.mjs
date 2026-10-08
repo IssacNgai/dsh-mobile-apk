@@ -95,13 +95,68 @@ if (ASSET) {
   check('站点带 F8 回退标记', (patched.match(/dsh-mobile link->rename fallback \(F8\)/g) || []).length === 1)
   check('等价实现带 F8 标记', patched.includes('dsh-mobile exclusive create (F8)'))
   check('等价实现被定义且被站点调用', (patched.match(/dshMobilePublishExclusive\(/g) || []).length === 2)
-  check('权限错误才走回退（EACCES/EPERM/ENOTSUP）', patched.includes('(error.code === "EACCES" || error.code === "EPERM" || error.code === "ENOTSUP")'))
+  const F8_PREDICATE = '(error.code === "EACCES" || error.code === "EPERM" || error.code === "ENOTSUP" || error.code === "ENOSYS")'
+  check('F8站点的精确predicate包含ENOSYS', patched.includes(F8_PREDICATE))
   check('非权限错误仍走原拒绝路径',
     patched.includes('await throwGuardedCreateFailure(error, absolutePath, createIfAbsent.displayPath, inspectPublicationTarget);'))
   check('站点把 internals 透传给等价实现',
     patched.includes('await dshMobilePublishExclusive(tempPath, absolutePath, createIfAbsent.displayPath, inspectPublicationTarget, internals);'))
   check('等价实现用 O_EXCL 占位（保住 no-replace 语义）', patched.includes('await openFile(absolutePath, "wx");'))
   check('未把 link 站点直接改成裸 rename', !patched.includes('\t\t\tawait rename(tempPath, absolutePath);\n\t\t} catch (error) {\n\t\t\t/* dsh-mobile'))
+
+  // Execute the exact runtime catch predicate: unsupported links may fall back,
+  // unrelated IO/refusal failures must preserve their original path.
+  const predicate = /if \(!\((error instanceof Error && "code" in error && \(error\.code === "EACCES"[^\n]+?)\)\) \{/.exec(patched)?.[1]
+  check('runtime catch predicate extracted', typeof predicate === 'string')
+  if (predicate) {
+    const eligible = new Function('error', 'return (' + predicate + ')')
+    for (const code of ['EACCES', 'EPERM', 'ENOTSUP', 'ENOSYS']) {
+      check(code + ' routes to exclusive publication fallback', eligible(Object.assign(new Error(code), { code })) === true)
+    }
+    for (const code of ['EIO', 'EEXIST', 'ENOENT']) {
+      check(code + ' preserves original refusal', eligible(Object.assign(new Error(code), { code })) === false)
+    }
+  }
+
+  // ②-a 从旧版已打 F8 的资产升级：只升级 F8 predicate，重复应用必须字节幂等。
+  if (!ASSET) {
+    const scratch = mkdtempSync(join(tmpdir(), 'f8-upgrade-test-'))
+    try {
+      const target = join(scratch, TARGET)
+      mkdirSync(dirname(target), { recursive: true })
+      const olderPredicate = '(error.code === "EACCES" || error.code === "EPERM" || error.code === "ENOTSUP")'
+      const oldAsset = patched.replace(F8_PREDICATE, olderPredicate) + '\n// unrelated copy of expected-looking text must not suppress the F8 upgrade.\n// ' + F8_PREDICATE
+      writeFileSync(target, oldAsset)
+      const apply = () => spawnSync(NODE, [join(repoRoot, 'scripts', 'patches', 'apply-patches.mjs'), scratch, '--apply', '--scope', 'engine', '--only', 'fs-local-link-F8'], { encoding: 'utf8' })
+      const upgraded = apply()
+      const once = readFileSync(target, 'utf8')
+      check('旧F8资产升级命令成功', upgraded.status === 0)
+      check('旧F8资产只升级到精确predicate', once.includes(F8_PREDICATE) && (once.match(/dsh-mobile link->rename fallback \(F8\)/g) || []).length === 1 && once.includes('// ' + F8_PREDICATE))
+      const repeated = apply()
+      check('已升级F8资产再次应用成功', repeated.status === 0)
+      check('已升级F8资产重复应用字节幂等', readFileSync(target).equals(Buffer.from(once)))
+    } finally { rmSync(scratch, { recursive: true, force: true }) }
+  }
+
+  // Execute the actual generated link catch block, not a separately retyped predicate.
+  {
+    const site = /\t\t\tif \(!\(error instanceof Error[\s\S]*?\n\t\t\t\}\n\t\t\}/.exec(patched)
+    check('F8实际link catch块可提取', !!site)
+    if (site) {
+      const block = site[0].replaceAll('createIfAbsent.displayPath', 'displayPath')
+      const call = new Function('linkFile', 'throwGuardedCreateFailure', 'dshMobilePublishExclusive', 'tempPath', 'absolutePath', 'displayPath', 'inspectPublicationTarget', 'internals',
+        'return async function run() { try { await linkFile(tempPath, absolutePath); } catch (error) {' + block + '\n}')
+      const invoke = (link, events) => call(link,
+        async (e) => { events.push('guard:' + e.code); throw e },
+        async () => { events.push('fallback') }, 'tmp', 'dst', 'dst', async () => undefined, {})
+      const events = []
+      await invoke(async () => { throw Object.assign(new Error('synthetic'), { code: 'ENOSYS' }) }, events)()
+      check('真实ENOSYS link调用路径进入exclusive fallback', events.join(',') === 'fallback', events.join(','))
+      const deniedEvents = []
+      try { await invoke(async () => { throw Object.assign(new Error('synthetic'), { code: 'EIO' }) }, deniedEvents)() } catch {}
+      check('真实EIO link调用路径保留原guard且不fallback', deniedEvents.join(',') === 'guard:EIO', deniedEvents.join(','))
+    }
+  }
 
   // ③ 行为：把等价实现逐字抽出，注入桩件跑三条路径
   const source = extractFunction(patched, 'async function dshMobilePublishExclusive(')

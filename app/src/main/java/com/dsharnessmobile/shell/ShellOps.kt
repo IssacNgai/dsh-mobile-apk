@@ -154,9 +154,19 @@ internal object ShellOps {
     return result.put("op", "shRemove").put("transport", "shizuku")
   }
 
-  /** §6：屏幕范围（virtual-only 栅栏）在本通道执行点复查——与引擎侧同一套段级判据。 */
+  /** §6：virtual-only / real-only 屏幕范围在本通道执行点复查；两份判据与引擎侧同口径。 */
   private fun scopeDenied(context: Context, command: String): JSONObject? {
-    if (ScreenScopePrefs.current(context) != ScreenScope.VIRTUAL_ONLY) return null
+    when (ScreenScopePrefs.current(context)) {
+      ScreenScope.ALL -> return null
+      ScreenScope.REAL_ONLY -> {
+        if (realOnlyScreenCommandAllowed(command)) return null
+        return JSONObject()
+          .put("__error", "用户当前开放屏幕范围为 real-only；屏幕命令只能作用于物理屏 display 0。虚拟屏或无法确认的显式显示目标已拒绝。")
+          .put("reason", "screen-out-of-scope")
+          .put("op", "shExec")
+      }
+      ScreenScope.VIRTUAL_ONLY -> Unit
+    }
     // 块G F5（0.14.1）：目标屏是**已注册虚拟屏**的命令放行——`screencap -d <虚拟屏 id>` 读的是
     // 范围内的屏，与无参 `screencap`（读真实屏 0）根本不是一件事。
     //
@@ -183,6 +193,27 @@ internal object ShellOps {
         + "（android_vdisplay_create / vdInfo），或由用户在设置中修改范围后重试。")
       .put("reason", "screen-out-of-scope")
       .put("op", "shExec")
+  }
+
+  /**
+   * real-only 下的 raw shell 判据：无显式 display 参数的屏幕命令使用 Android 物理默认屏 0；
+   * 有明确显示参数时仅 0 通过。未知/虚拟目标 fail-closed。非屏幕命令保持可用。
+   */
+  internal fun realOnlyScreenCommandAllowed(command: String): Boolean {
+    val parsed = splitCommandSegments(command)
+    if (parsed.unparsed) return false
+    for (segment in parsed.segments) {
+      val bare = stripQuotedText(segment)
+      val options = displayOptionsIn(bare)
+      val normalized = stripDisplayOptions(bare)
+      val families = SCREEN_FAMILIES.filter { it.pattern.containsMatchIn(normalized) }
+      for (family in families) {
+        val relevant = options.filter { it.first in family.targetFlags }
+        if (family.targetFlags.isEmpty() && options.isNotEmpty()) return false
+        if (relevant.any { it.second != "0" }) return false
+      }
+    }
+    return true
   }
 
   /**

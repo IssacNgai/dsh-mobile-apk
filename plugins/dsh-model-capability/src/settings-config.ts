@@ -37,6 +37,28 @@ function stringMap(value: unknown): Record<string, string> | undefined {
   return Object.keys(out).length > 0 ? out : undefined
 }
 
+function compatMap(value: unknown): Record<string, unknown> | undefined {
+  const source = record(value)
+  return Object.keys(source).length > 0 ? { ...source } : undefined
+}
+
+function modelProfiles(value: unknown): NonNullable<ProviderConfig['modelProfiles']> {
+  const out: NonNullable<ProviderConfig['modelProfiles']> = {}
+  if (!Array.isArray(value)) return out
+  for (const item of value) {
+    if (typeof item === 'string') continue
+    const profile = record(item)
+    if (typeof profile.id !== 'string' || profile.id === '') continue
+    out[profile.id] = {
+      ...(profile.compat === undefined ? {} : { compat: compatMap(profile.compat) ?? {} }),
+      ...(Object.prototype.hasOwnProperty.call(profile, 'reasoningEfforts')
+        ? { reasoningEfforts: profile.reasoningEfforts }
+        : {}),
+    }
+  }
+  return out
+}
+
 /**
  * Returns the provider configuration, or undefined when the route (or its
  * baseURL) is absent — the caller reports that instead of guessing a target.
@@ -61,15 +83,36 @@ export function providerFromSettings(
   const baseURL = typeof entry.baseURL === 'string' && entry.baseURL !== '' ? entry.baseURL : undefined
   if (!baseURL) return undefined
   const models = stringList(entry.models)
-  const overrideIds = Object.keys(record(entry.modelOverrides))
+  const overrides = record(entry.modelOverrides)
+  const overrideIds = Object.keys(overrides)
+  const declaredProfiles = modelProfiles(entry.models)
+  for (const [id, value] of Object.entries(overrides)) {
+    if (models.length > 0 && !models.includes(id)) continue
+    const override = record(value)
+    const declared = declaredProfiles[id] ?? {}
+    const overrideCompat = compatMap(override.compat)
+    const declaredCompat = declared.compat
+    declaredProfiles[id] = {
+      ...(overrideCompat || declaredCompat
+        ? { compat: { ...overrideCompat, ...declaredCompat } }
+        : {}),
+      ...(Object.prototype.hasOwnProperty.call(declared, 'reasoningEfforts')
+        ? { reasoningEfforts: declared.reasoningEfforts }
+        : Object.prototype.hasOwnProperty.call(override, 'reasoningEfforts')
+          ? { reasoningEfforts: override.reasoningEfforts }
+          : {}),
+    }
+  }
   const apiKeyEnv = typeof entry.apiKeyEnv === 'string' && entry.apiKeyEnv !== '' ? entry.apiKeyEnv : undefined
   return {
     route,
     api: typeof entry.api === 'string' ? entry.api : undefined,
+    ...(entry.compat === undefined ? {} : { compat: compatMap(entry.compat) ?? {} }),
     baseURL,
     apiKey: typeof entry.apiKey === 'string' ? entry.apiKey : undefined,
     ...(apiKeyEnv === undefined ? {} : { apiKeyEnv }),
     headers: stringMap(entry.headers),
     models: models.length > 0 ? models : overrideIds,
+    modelProfiles: declaredProfiles,
   }
 }

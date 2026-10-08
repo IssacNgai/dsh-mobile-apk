@@ -140,6 +140,39 @@ if (p1Ok) {
       + '——两侧漂移会让「补丁在跑」与「壳侧读到值」互相假装成立')
 }
 
+// phase instrumentation is part of the 0.14.5 C4 diagnostic contract. The old P1 probe already
+// emitted TOTAL/C4 fields, so checking only the registry marker let a stale pre-phase snapshot
+// pass the APK build while silently omitting the code needed to locate high loop p99 readings.
+const PHASE_PROBE_MARKERS = [
+  'dshMobileComboProbePhaseNames = new Set(',
+  'dshMobileComboProbePhases = new Map()',
+  'dshMobileComboProbePhaseWindowMs = 250',
+  'function dshMobileComboProbeRecordPhase(',
+  '[perf] phase name=${phase.name}',
+  'durTotalMs=',
+  'forwardedCallbacks=',
+  // C4 采样器口径（2026-10-06）：自建、arming 时锚定墙钟基线的采样器。
+  // 缺了这条，旧快照（用对外部 monitor）会一路通过构建并再次把整段卡顿报成健康。
+  'function dshMobileComboProbeLoopHistogram(',
+  'function dshMobileComboProbeArmLoopSampler(',
+  'let last = performance.now();',
+]
+const missingPhaseProbeMarkers = (text) => PHASE_PROBE_MARKERS.filter((marker) => !text.includes(marker))
+const staleP1Fixture = 'dsh-mobile combo probe (P1)\ndshMobileComboProbeEmit\n[perf] TOTAL calls=1 totalMs=5 loopP99Ms=-1 loopSamples=0'
+const completePhaseFixture = [
+  'dsh-mobile combo probe (P1)',
+  'dshMobileComboProbeEmit',
+  ...PHASE_PROBE_MARKERS,
+].join('\n')
+check('phase 探针判据反例：旧 P1/TOTAL 不能冒充完整 phase 插桩', missingPhaseProbeMarkers(staleP1Fixture).length === PHASE_PROBE_MARKERS.length)
+check('phase 探针判据正例：完整签名可被识别', missingPhaseProbeMarkers(completePhaseFixture).length === 0)
+const patchSource = readFileSync(join(ROOT, 'scripts', 'patches', 'apply-patches.mjs'), 'utf8')
+const p1PatchStart = patchSource.indexOf("'combo-probe-P1':")
+const p1PatchSource = p1PatchStart < 0 ? '' : patchSource.slice(p1PatchStart, patchSource.indexOf("\n  },", p1PatchStart))
+const sourceMissingPhaseMarkers = missingPhaseProbeMarkers(p1PatchSource)
+check('combo-probe-P1 源码包含完整 phase 诊断实现', sourceMissingPhaseMarkers.length === 0,
+  sourceMissingPhaseMarkers.length ? '缺少 ' + sourceMissingPhaseMarkers.join(', ') : undefined)
+
 // ── 3. A1 出厂声明值对账（P-AC-01）─────────────────────────────────────────
 const autoTar = join(ROOT, '.deploy-tmp', 'snapshot-013', ABI, 'snapshot.tar.xz')
 const tarPath = argOf('snapshot') || (existsSync(autoTar) ? autoTar : null)
@@ -149,6 +182,14 @@ const readFromTar = (tar, member) => {
 if (!tarPath) {
   skip('无快照可对账（--snapshot <tar> 或 ' + autoTar + '）——A1 出厂值未在真实产物上核对')
 } else {
+  const comboProbeMember = 'usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-modules/lib/index.js'
+  const comboProbeText = readFromTar(tarPath, comboProbeMember)
+  const missingPhaseMarkers = comboProbeText === null ? PHASE_PROBE_MARKERS : missingPhaseProbeMarkers(comboProbeText)
+  check('快照内产品 index.js 携带当前 phase 探针（阻止旧 P1 快照进入 APK）',
+    comboProbeText !== null && missingPhaseMarkers.length === 0,
+    comboProbeText === null
+      ? '缺少 ' + comboProbeMember + '；请从当前代码重建 snapshot'
+      : 'phase 签名缺失：' + missingPhaseMarkers.join(', ') + '；请从当前代码重建 snapshot')
   for (const profile of ['web', 'headless']) {
     const member = 'home/.dsh/profiles/' + profile + '/package.json'
     const text = readFromTar(tarPath, member)

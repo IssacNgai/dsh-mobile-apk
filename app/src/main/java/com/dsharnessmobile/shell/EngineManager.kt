@@ -100,11 +100,30 @@ class EngineManager(private val context: Context, private val pickToken: String?
    * Upgrade lesson (v0.10.5→v0.10.6): engineReady only checked node existence, so an upgrade never
    * re-extracted → old plugins kept running (injection-guard fixes etc. never took effect).
    */
-  fun snapshotFresh(): Boolean = SnapshotFingerprintPolicy.fresh(
-    nodeExists = nodeBin.exists(),
-    bundled = bundledSnapshotFingerprint,
-    committed = liveFingerprint(),
-  )
+  fun snapshotFresh(): Boolean {
+    val committed = liveFingerprint()
+    if (SnapshotFingerprintPolicy.fresh(nodeBin.exists(), bundledSnapshotFingerprint, committed)) return true
+    // Compatibility for an online update created before purpose-aware transaction markers existed.
+    // The pending marker plus preserved usr-old is its only on-disk probation evidence.
+    if (nodeBin.exists() && File(context.filesDir, ".update-pending").exists() &&
+      SnapshotFs.exists(File(context.filesDir, "usr-old"))) return true
+    val online = readOnlineSnapshotIdentity()
+    return SnapshotFingerprintPolicy.onlineFresh(
+      nodeBin.exists(), bundledFingerprint(), committed, online?.first, online?.second,
+    )
+  }
+
+  private fun readOnlineSnapshotIdentity(): Pair<String, String>? {
+    return try {
+      val fields = File(context.filesDir, ONLINE_SNAPSHOT_NAME).readLines()
+        .mapNotNull { line -> line.indexOf('=').takeIf { it > 0 }?.let { line.substring(0, it) to line.substring(it + 1) } }
+        .toMap()
+      val base = fields["base"] ?: return null
+      val archive = fields["archive"] ?: return null
+      if (!Regex("[0-9a-fA-F]{64}").matches(base) || !Regex("[0-9a-fA-F]{64}").matches(archive)) return null
+      base.lowercase(java.util.Locale.ROOT) to archive.lowercase(java.util.Locale.ROOT)
+    } catch (_: Throwable) { null }
+  }
 
   /**
    * Upgrade/snapshot change: extract the embedded snapshot into a staging directory, then
@@ -156,10 +175,14 @@ class EngineManager(private val context: Context, private val pickToken: String?
     onStage: (String) -> Unit = {},
   ): Boolean {
     val filesDir = context.filesDir
+    if (!beginSnapshotTransaction()) {
+      lastRefreshFailure = IllegalStateException("another runtime transaction is already in progress")
+      lastRefreshFailureCode = "snapshot-transaction-in-flight"
+      return false
+    }
     val fingerprint = bundledFingerprint()
     val startedAt = System.currentTimeMillis()
     val stage = SnapshotTransaction.stageRoot(filesDir)
-    EngineManager.snapshotRefreshing.set(true)
     try {
       onStage("正在检查上次更新…")
       applyRecovery(SnapshotTransaction.recover(filesDir, stage, usrDir, homeDir))
@@ -196,14 +219,12 @@ class EngineManager(private val context: Context, private val pickToken: String?
           + " -> " + discarded.joinToString(", "))
       }
       SnapshotFs.createDirectories(stage)
-      if (!extractSnapshotTo(stage, onProgress)) {
-        SnapshotFs.deletePath(stage)
-        Log.e(TAG, "snapshot refresh: extract failed; live runtime untouched")
-        return false
-      }
-      if (!stagedRuntimeComplete(stage)) {
-        SnapshotFs.deletePath(stage)
-        Log.e(TAG, "snapshot refresh: staged runtime incomplete; live runtime untouched")
+      if (!SnapshotRefreshStage.extractAndValidate(
+          stage,
+          extract = { extractSnapshotTo(it, onProgress) },
+          validate = ::stagedRuntimeComplete,
+        )) {
+        Log.e(TAG, "snapshot refresh: extraction failed or staged runtime incomplete; live runtime untouched")
         return false
       }
 
@@ -277,7 +298,7 @@ class EngineManager(private val context: Context, private val pickToken: String?
       }
       return false
     } finally {
-      EngineManager.snapshotRefreshing.set(false)
+      endSnapshotTransaction()
     }
   }
 
@@ -411,6 +432,11 @@ class EngineManager(private val context: Context, private val pickToken: String?
   var pendingRecoveryFailure: String? = null
     private set
 
+  internal fun snapshotRecoveryBlocksRuntime(): Boolean = SnapshotRecoveryNotice.blocksRuntimeStart(
+    pendingRecoveryFailure,
+    SnapshotTransaction.readMarker(context.filesDir) != null,
+  )
+
   /**
    * Resolves a transaction interrupted by a kill, an OEM cleaner or a low-memory restart.
    * Cheap when nothing is pending (one stat) and safe to call on every start.
@@ -420,11 +446,12 @@ class EngineManager(private val context: Context, private val pickToken: String?
    */
   fun recoverInterruptedRefresh() {
     // Another refresh/recovery owns the stage/previous trees right now: never race it.
-    if (!EngineManager.snapshotRefreshing.compareAndSet(false, true)) return
+    if (!beginSnapshotTransaction()) return
     // 提到 try 之外：catch 里要用它做「marker 是否真的还在」的对账（0.14.1 块K ②）。
     val filesDir = context.filesDir
     try {
       val marker = SnapshotTransaction.readMarker(filesDir)
+      if (onlineUpdateActive.get()) return
       if (marker == null) {
         // No marker: only a stale stage directory can survive (a rollback that was
         // interrupted before it deleted the stage).
@@ -466,8 +493,28 @@ class EngineManager(private val context: Context, private val pickToken: String?
         }
       }
     } finally {
-      EngineManager.snapshotRefreshing.set(false)
+      endSnapshotTransaction()
     }
+  }
+
+  private fun beginSnapshotTransaction(): Boolean = synchronized(EngineManager.transactionStateLock) {
+    SnapshotTransaction.canBeginFactoryTransaction(snapshotRefreshing.get(), onlineUpdateActive.get()) &&
+      snapshotRefreshing.compareAndSet(false, true)
+  }
+
+  private fun endSnapshotTransaction() = synchronized(EngineManager.transactionStateLock) {
+    snapshotRefreshing.set(false)
+  }
+
+  internal fun beginOnlineUpdateTransaction(): Boolean = synchronized(EngineManager.transactionStateLock) {
+    SnapshotTransaction.canBeginOnlineTransaction(
+      factoryBusy = snapshotRefreshing.get(),
+      onlineBusy = onlineUpdateActive.get(),
+      markerPresent = SnapshotTransaction.readMarker(context.filesDir) != null,
+      previousRuntimePresent = SnapshotFs.exists(SnapshotTransaction.previousRoot(context.filesDir)),
+      stageResiduePresent = SnapshotFs.exists(SnapshotTransaction.stageRoot(context.filesDir)),
+    ) &&
+      onlineUpdateActive.compareAndSet(false, true)
   }
 
   private fun applyRecovery(recovery: SnapshotTransaction.Recovery) {
@@ -482,12 +529,24 @@ class EngineManager(private val context: Context, private val pickToken: String?
         Log.w(TAG, "interrupted refresh discarded (staged runtime was never activated)")
       }
       SnapshotTransaction.Outcome.ROLLED_BACK -> {
+        if (recovery.fingerprintToRestore != null) {
+          writeFingerprint(recovery.fingerprintToRestore)
+          File(context.filesDir, ".update-pending").delete()
+          File(context.filesDir, ".update-pending-at").delete()
+          onlineUpdateActive.set(false)
+        }
         Log.w(TAG, "interrupted refresh rolled back to the previous factory runtime")
       }
       SnapshotTransaction.Outcome.ROLLED_FORWARD -> {
         val fingerprint = recovery.fingerprintToCommit
         if (!fingerprint.isNullOrEmpty()) writeFingerprint(fingerprint)
+        if (recovery.onlineUpdateCommit && !fingerprint.isNullOrEmpty()) {
+          writeOnlineSnapshotIdentity(bundledFingerprint(), fingerprint)
+          File(context.filesDir, ".update-pending").delete()
+          File(context.filesDir, ".update-pending-at").delete()
+        }
         SnapshotTransaction.finish(context.filesDir)
+        if (recovery.onlineUpdateCommit) onlineUpdateActive.set(false)
         Log.w(TAG, "interrupted refresh completed (runtime was already activated)")
       }
       // 【D-3 / 审查 §7.7.5】回滚未完整落地：marker **已保留**（下次启动先重试），
@@ -558,6 +617,22 @@ class EngineManager(private val context: Context, private val pickToken: String?
       target.writeText(fingerprint)
       SnapshotFs.deletePath(tmp)
     }
+  }
+
+  private fun writeOnlineSnapshotIdentity(base: String, archive: String) {
+    val target = File(context.filesDir, ONLINE_SNAPSHOT_NAME)
+    val tmp = File(context.filesDir, ONLINE_SNAPSHOT_NAME + ".tmp")
+    tmp.writeText("base=$base\narchive=$archive\n")
+    SnapshotFs.move(tmp, target)
+  }
+
+  private fun commitOnlineUpdateIfPending(): Boolean {
+    val markerFile = SnapshotTransaction.markerFile(context.filesDir)
+    val marker = SnapshotTransaction.readMarker(context.filesDir) ?: return false
+    if (marker.purpose != SnapshotTransaction.Purpose.ONLINE_UPDATE || marker.phase != SnapshotTransaction.Phase.SWAPPED) return false
+    SnapshotTransaction.writeMarker(context.filesDir, marker.copy(phase = SnapshotTransaction.Phase.ONLINE_COMMITTED))
+    applyRecovery(SnapshotTransaction.recover(context.filesDir, SnapshotTransaction.stageRoot(context.filesDir), usrDir, homeDir))
+    return !SnapshotFs.exists(markerFile)
   }
 
   /**
@@ -887,25 +962,7 @@ class EngineManager(private val context: Context, private val pickToken: String?
     if (isSymlink(privateDir)) {
       Files.delete(privateDir.toPath())
     }
-    if (!publicDir.isDirectory) return
-    if (privateDir.isDirectory) {
-      if (privateDir.listFiles()?.isNotEmpty() == true) {
-        // Conflict: the private entity wins; the public copy is kept aside for review.
-        val backup = uniqueBackup(publicDir)
-        if (!publicDir.renameTo(backup)) {
-          throw java.io.IOException("failed to backup public dir " + publicDir.absolutePath)
-        }
-        Log.w(TAG, "private " + privateDir.absolutePath + " exists; public kept as " + backup.absolutePath)
-        return
-      }
-      SnapshotFs.deletePath(privateDir)
-    }
-    privateDir.parentFile?.mkdirs()
-    copyTreeVerified(publicDir, privateDir)
-    SnapshotFs.deletePath(publicDir)
-    if (SnapshotFs.exists(publicDir)) {
-      throw java.io.IOException("failed to delete public source " + publicDir.absolutePath)
-    }
+    ReverseMigration.migrateDir(privateDir, publicDir)
   }
 
   /** File-level reverse migration: drop the private symlink, copy the public file back, then delete the public source. */
@@ -1050,16 +1107,6 @@ class EngineManager(private val context: Context, private val pickToken: String?
 
   private fun isSymlink(file: File): Boolean = Files.isSymbolicLink(file.toPath())
 
-  private fun uniqueBackup(publicFile: File): File {
-    var candidate = File(publicFile.parentFile, publicFile.name + ".public-backup")
-    var i = 1
-    while (candidate.exists()) {
-      candidate = File(publicFile.parentFile, publicFile.name + ".public-backup-" + i)
-      i++
-    }
-    return candidate
-  }
-
   private fun uniquePrivateBackup(privateFile: File): File {
     var candidate = File(privateFile.parentFile, privateFile.name + ".private-backup")
     var i = 1
@@ -1068,26 +1115,6 @@ class EngineManager(private val context: Context, private val pickToken: String?
       i++
     }
     return candidate
-  }
-
-  /** Recursively copy a directory tree, verifying the file count and total size. */
-  private fun copyTreeVerified(src: File, dst: File) {
-    dst.mkdirs()
-    src.listFiles()?.forEach { f ->
-      val target = File(dst, f.name)
-      if (f.isDirectory) {
-        copyTreeVerified(f, target)
-      } else {
-        f.copyTo(target, overwrite = true)
-      }
-    }
-    val srcFiles = src.walkBottomUp().filter { it.isFile }.toList()
-    val dstFiles = dst.walkBottomUp().filter { it.isFile }.toList()
-    val srcSize = srcFiles.sumOf { it.length() }
-    val dstSize = dstFiles.sumOf { it.length() }
-    if (srcFiles.size != dstFiles.size || srcSize != dstSize) {
-      throw java.io.IOException("copy verification failed for " + src.absolutePath)
-    }
   }
 
   /**
@@ -1237,6 +1264,32 @@ class EngineManager(private val context: Context, private val pickToken: String?
       LogCollector.log(TAG, "engine start refused (live runtime incomplete) evidence=" + lastStartRefusalEvidence)
       return false
     }
+    // Persisted profile state can predate the current Hard manifest (for example, a bundle
+    // selection missing from an older migration). Reconcile before *every* spawn decision, even
+    // when the extracted snapshot fingerprint is already fresh. Only exact installed identities
+    // from the trusted manifest may be added; user Soft selections and pins remain intact.
+    val hard = PluginMounts.ensureHard(context, PluginMounts.currentFingerprint(context))
+    if (hard == null) {
+      lastStartRefusalCode = REFUSAL_HARD_BUNDLE_SELECTION
+      lastStartRefusal = "当前版本 Hard 插件清单缺失或与运行时快照不匹配；拒绝启动引擎，profile 未修改"
+      Log.e(TAG, "engine start refused: " + lastStartRefusal)
+      return false
+    }
+    val hardBundleRepair = PluginMounts.ensureHardBundlesSelected(
+      File(homeDir, ".dsh/profiles/web/package.json"),
+      File(usrDir, "lib/node_modules/@deepseek-ai/dsh/node_modules"),
+      hard,
+    )
+    if (hardBundleRepair.failure != null) {
+      lastStartRefusalCode = REFUSAL_HARD_BUNDLE_SELECTION
+      lastStartRefusal = "Hard bundle profile 校验/修复失败；拒绝启动引擎，" + hardBundleRepair.failure
+      Log.e(TAG, "engine start refused: " + lastStartRefusal)
+      return false
+    }
+    if (hardBundleRepair.changed) {
+      LogCollector.log(TAG, "required Hard factory bundles added to web profile; engine restart required")
+    }
+    val restartForHardBundleRepair = hardBundleRepair.changed
     // 通过闸门 A：码与确诊项已在入口清过（见函数头注释），此处无需重复。
     // 取证字段**刻意不清**：它是只增的现场记录，供诊断包读取。
     val now = System.currentTimeMillis()
@@ -1260,12 +1313,12 @@ class EngineManager(private val context: Context, private val pickToken: String?
     val engineUsable = availability == EngineProbe.EngineAvailability.OUR_PROCESS ||
       availability == EngineProbe.EngineAvailability.OUR_HTTP
     val degradedHttp = engineUsable && WatchdogV2.degradedHttpTripped()
-    if (!force && engineUsable && !degradedHttp) {
+    if (!force && !restartForHardBundleRepair && engineUsable && !degradedHttp) {
       STARTING.set(false)
       LogCollector.log(TAG, "engine start skipped (existing engine usable: " + availability + ")")
       return true
     }
-    if ((force || degradedHttp) && availability == EngineProbe.EngineAvailability.OUR_HTTP && !managedProcessAlive) {
+    if ((force || restartForHardBundleRepair || degradedHttp) && availability == EngineProbe.EngineAvailability.OUR_HTTP && !managedProcessAlive) {
       lastStartRefusal = "引擎 HTTP 响应可归属，但本壳没有可安全停止的子进程句柄；拒绝盲目重启"
       LogCollector.log(TAG, "engine restart refused (owned HTTP without tracked process handle)")
       STARTING.set(false)
@@ -1576,17 +1629,20 @@ class EngineManager(private val context: Context, private val pickToken: String?
     // 字段名与 MainActivity 在 boot-diag.log 里用的**逐字一致**，便于两处对账。
     // 取值口径同源：统一走 WebViewShim（provider 回读唯一实现）。
     try {
-      val ver = WebViewShim.providerVersionName()
+      val providerVersion = WebViewShim.providerVersionName()
       // 这里的「读不到」哨兵保留 -1（显式缺席）；与 MainActivity 判据侧的 0 口径不同是有意的：
       // 判据侧 0 不冒充通过，诊断包侧 -1 强调「连版本名都没拿到」。
-      val major = if (ver.isEmpty()) -1 else WebViewShim.providerMajor()
+      val chromiumVersion = MainActivity.observedChromiumVersion
+      val major = if (chromiumVersion.isEmpty()) -1 else WebViewShim.majorOf(chromiumVersion)
       sb.append("webview_package: ").append(WebViewShim.providerPackageName()).append('\n')
       // provider 缺席（无 WebView ROM / 升级窗口）与「版本串解析失败」含义不同，单列一项。
       sb.append("webview_provider_available: ").append(WebViewShim.providerAvailable()).append('\n')
-      sb.append("webview_version: ").append(ver).append('\n')
+      sb.append("webview_provider_version: ").append(providerVersion).append('\n')
+      sb.append("webview_version: ").append(chromiumVersion).append('\n')
       sb.append("webview_major: ").append(major).append('\n')
       // 语法下限 94（Chromium 94 起才有类静态块 static{}；低于它入口 chunk 解析即整体不执行 = 纯白无字）。
-      sb.append("syntax_floor_ok: ").append(major >= MainActivity.WEBVIEW_SYNTAX_FLOOR_MAJOR).append('\n')
+      val syntaxFloor = WebViewShim.syntaxFloorStatus(chromiumVersion, MainActivity.WEBVIEW_SYNTAX_FLOOR_MAJOR)
+      sb.append("syntax_floor_ok: ").append(syntaxFloor).append('\n')
     } catch (_: Throwable) {
       // 诊断本身不得成为故障源；字段缺席好过抛异常。
     }
@@ -1931,32 +1987,77 @@ class EngineManager(private val context: Context, private val pickToken: String?
       updateHealthTicks = 0
       return
     }
-    if (healthy) {
+    val marker = SnapshotTransaction.readMarker(context.filesDir)
+    if (marker?.phase == SnapshotTransaction.Phase.UNKNOWN || marker?.purpose == SnapshotTransaction.Purpose.UNKNOWN) {
+      updateHealthTicks = 0
+      Log.e(TAG, "update health confirmation blocked by unknown transaction marker; recovery source retained")
+      return
+    }
+    if (marker?.purpose == SnapshotTransaction.Purpose.ONLINE_UPDATE &&
+      marker.phase == SnapshotTransaction.Phase.ONLINE_COMMITTED) {
+      applyRecovery(SnapshotTransaction.recover(context.filesDir, SnapshotTransaction.stageRoot(context.filesDir), usrDir, homeDir))
+      return
+    }
+    val acceptedHealth = if (healthy && marker?.purpose == SnapshotTransaction.Purpose.ONLINE_UPDATE) {
+      // HTTP readiness alone can commit a candidate whose required Android/product loaders
+      // failed to register. Reuse the same read-only inventory + preset + session/catalog
+      // proof used by Soft promotion; provider execution/permissions are intentionally excluded.
+      val hard = PluginMounts.ensureHard(context, marker.fingerprint)
+      hard != null && EngineProbe.completeSoftHealth(context, hard)
+    } else healthy
+    if (acceptedHealth) {
       updateHealthTicks++
       if (updateHealthTicks >= UPDATE_CONFIRM_TICKS) {
+        if (SnapshotTransaction.readMarker(context.filesDir)?.purpose == SnapshotTransaction.Purpose.ONLINE_UPDATE) {
+          try {
+            if (!commitOnlineUpdateIfPending()) {
+              Log.e(TAG, "online runtime health confirmation could not finalize transaction; journal retained")
+              return
+            }
+          } catch (t: Throwable) {
+            Log.e(TAG, "online runtime health confirmation failed; journal retained", t)
+            return
+          }
+        } else {
+          // Migrate the legacy pending-update fingerprint into the explicit freshness record before
+          // clearing its only probation marker. Keep usr-old as the legacy recovery source.
+          val committed = liveFingerprint()
+          if (bundledFingerprint().isNotEmpty() && Regex("[0-9a-fA-F]{64}").matches(committed)) {
+            try { writeOnlineSnapshotIdentity(bundledFingerprint(), committed) } catch (t: Throwable) {
+              Log.e(TAG, "legacy online update identity migration failed; pending state retained", t)
+              return
+            }
+          }
+        }
         pending.delete()
         File(context.filesDir, ".update-pending-at").delete()
-        // 审查 I-9 点名：usr-old 里的绝对链此时已指向**新** usr 树，跟随删除会穿进 live 运行时。
-        SnapshotFs.deletePath(File(context.filesDir, "usr-old"))
         updateHealthTicks = 0
-        LogCollector.log(TAG, "update confirmed: old runtime cleaned (usr-old removed)")
+        LogCollector.log(TAG, "update confirmed")
       }
     } else {
       updateHealthTicks = 0
       val at = File(context.filesDir, ".update-pending-at").takeIf { it.exists() }?.readText()?.trim()?.toLongOrNull()
       if (at != null && System.currentTimeMillis() - at > UPDATE_ROLLBACK_MS) {
-        rollbackToOld()
-        pending.delete()
-        File(context.filesDir, ".update-pending-at").delete()
+        if (rollbackToOld()) {
+          pending.delete()
+          File(context.filesDir, ".update-pending-at").delete()
+        }
       }
     }
   }
 
   /** Swap the current runtime back to the kept previous one; restarts the engine from it. */
-  private fun rollbackToOld() {
+  private fun rollbackToOld(): Boolean {
+    val marker = SnapshotTransaction.readMarker(context.filesDir)
+    if (marker?.purpose == SnapshotTransaction.Purpose.ONLINE_UPDATE) {
+      if (!rollbackOnlineRuntime()) return false
+      lastStartAttemptAt = 0
+      try { startEngine() } catch (_: Throwable) { }
+      return true
+    }
     val usr = File(context.filesDir, "usr")
     val old = File(context.filesDir, "usr-old")
-    if (!old.exists()) return
+    if (!old.exists()) return false
     try {
       val broken = File(context.filesDir, "usr-broken")
       SnapshotFs.deletePath(broken)
@@ -1966,14 +2067,44 @@ class EngineManager(private val context: Context, private val pickToken: String?
         EngineManager.lastStartAttemptAt = 0 // allow an immediate restart (no cooldown stall)
         try { startEngine() } catch (_: Throwable) {
         }
+        return true
       } else {
         // Rollback of the rollback: the failed old-swap left no usr — put the broken new one back.
         if (!usr.exists() && broken.exists()) broken.renameTo(usr)
         Log.e(TAG, "update rollback failed; usr restored from usr-old: " + usr.exists())
+        return false
       }
     } catch (t: Throwable) {
       Log.e(TAG, "update rollback threw", t)
+      return false
     }
+  }
+
+  internal fun rollbackOnlineRuntime(): Boolean {
+    val marker = SnapshotTransaction.readMarker(context.filesDir)
+      ?.takeIf { it.purpose == SnapshotTransaction.Purpose.ONLINE_UPDATE } ?: return false
+    val result = SnapshotTransaction.rollbackOnlineUpdate(
+      context.filesDir, SnapshotTransaction.stageRoot(context.filesDir), usrDir, homeDir, marker,
+    )
+    if (!result.ok) {
+      Log.e(TAG, "online update rollback failed; journal and previous runtime retained: " + result.failures.joinToString(", "))
+      return false
+    }
+    SnapshotTransaction.clearMarker(context.filesDir)
+    if (marker.priorFingerprint.isNotEmpty()) writeFingerprint(marker.priorFingerprint)
+    File(context.filesDir, ".update-pending").delete()
+    File(context.filesDir, ".update-pending-at").delete()
+    onlineUpdateActive.set(false)
+    updateHealthTicks = 0
+    return true
+  }
+
+  internal fun abortOnlineUpdate(): Boolean {
+    val marker = SnapshotTransaction.readMarker(context.filesDir)
+      ?.takeIf { it.purpose == SnapshotTransaction.Purpose.ONLINE_UPDATE } ?: return true
+    val recovery = SnapshotTransaction.recover(context.filesDir, SnapshotTransaction.stageRoot(context.filesDir), usrDir, homeDir)
+    applyRecovery(recovery)
+    return SnapshotTransaction.readMarker(context.filesDir) == null
   }
 
   /**
@@ -2123,6 +2254,9 @@ description: 手机操控纪律：无障碍语义树优先、ref 语义点击/�
    */
   const val REFUSAL_LIVE_RUNTIME_INCOMPLETE = "live-runtime-incomplete"
 
+  /** Refusal code: Hard bundle ownership or installed identity could not be proven safely. */
+  const val REFUSAL_HARD_BUNDLE_SELECTION = "hard-bundle-selection-unverified"
+
     /** Process handle shared by every EngineManager in the application process. */
     @Volatile
     private var sharedEngineProcess: Process? = null
@@ -2137,6 +2271,10 @@ description: 手机操控纪律：无障碍语义树优先、ref 语义点击/�
      *  review C13：改 CAS（AtomicBoolean）——旧实现「if (设位) return; … 设位」的 check-then-set
      *  在刷新入口与恢复入口之间无互斥，两个线程可同时通过检查并同时操作 stage/previous。 */
     val snapshotRefreshing = java.util.concurrent.atomic.AtomicBoolean(false)
+    val onlineUpdateActive = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    private val transactionStateLock = Any()
+    private const val ONLINE_SNAPSHOT_NAME = ".online-snapshot"
 
     /** Last real start time (epoch ms); the watchdog cooldown-window baseline. */
     @Volatile

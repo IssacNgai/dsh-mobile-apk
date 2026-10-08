@@ -200,3 +200,7 @@ PR 描述里贴**结论表**（每行一条用户动作）：
   不按「某一步返回成功」判。**工具自报成功不算达成**——必须有设备侧可观察的结果（截图、落点 displayId、像素变化）。
 - **反证**：同一任务在受限条件下重跑一次（如屏幕范围切 `real-only`、关掉某条通道），断言结果整体翻转；
   不翻转说明任务没有真正压到该条件。
+- ScreenScope 矩阵的 `real-only` 反证必须覆盖 `android_vdisplay_input` 的真实调用：结果应为稳定
+  `screen-out-of-scope`，且壳侧不得执行 `input -d`；引擎 bridge 服务面与壳侧 `VdisplayController.input`
+  都有执行点门禁，工具文案或模型自行避让不构成安全证据。`virtual-only`/`all` 下仅允许已登记的
+  虚拟别名；显式 target 必须对应实际注入 display，不能被 selected 屏静默替换。

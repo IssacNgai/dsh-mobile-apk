@@ -41,6 +41,17 @@ test('字符串形态条目在需要写入时升格为对象', () => {
   assert.deepEqual(plan.models[2], { id: 'string-form-model', contextWindow: 4096 })
 })
 
+test('无实际字段变更时保留字符串条目，即使同一批稍后有其他写入', () => {
+  const models = ['unchanged-string-model', 'target-model']
+  const plan = planModelPatch(models, [
+    { id: 'unchanged-string-model' },
+    { id: 'target-model', contextWindow: 8192 },
+  ])
+  assert.deepEqual(plan.models, ['unchanged-string-model', { id: 'target-model', contextWindow: 8192 }])
+  assert.deepEqual(plan.changes, ['target-model: 补 contextWindow=8192'])
+  assert.deepEqual(plan.written, [{ id: 'target-model', field: 'contextWindow', value: 8192 }])
+})
+
 test('compat 逐键合并，不覆盖已有键', () => {
   const models = [{ id: 'm', compat: { thinkingFormat: 'deepseek' } }]
   const plan = planModelPatch(models, [{ id: 'm', compat: { thinkingFormat: 'zai', supportsReasoningEffort: true } }])

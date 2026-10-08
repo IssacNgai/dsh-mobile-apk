@@ -21,6 +21,9 @@ if ($Fast) {
 # 共用同一份脚本——双仓字节级同版，杜绝雷点 10 单边演进。
 $apkDir = Join-Path $Root "dsh-mobile-apk"
 if (-not (Test-Path $apkDir)) { $apkDir = $Root }
+Write-Host "== APK scheme / version suffix regression tests =="
+node --test (Join-Path $Root "scripts\check-apk-signatures.test.mjs") (Join-Path $Root "scripts\resolve-version-suffix.test.mjs") (Join-Path $Root "scripts\build-apk-engine.test.mjs") (Join-Path $Root "scripts\check-third-party.test.mjs")
+if ($LASTEXITCODE -ne 0) { throw "APK scheme/version regression tests failed" }
 
 # 统一 per-ABI 拒绝记账（坑 94 / review C2，2026-09-14）：曾有三处拒绝路径只 `continue` 不记账
 # （机密 / 运行时资产 / A1 出厂值）+ elf-check 退出码被丢弃 → 请求双 ABI 时只交付单 ABI 仍 exit 0。
@@ -68,6 +71,12 @@ if ($LASTEXITCODE -ne 0) { Write-Host "补丁镜像不一致，拒绝打包（�
 Write-Host "== 补丁测试夹具随版门禁 =="
 node (Join-Path $Root "scripts\check-patch-fixtures.mjs") 2>&1
 if ($LASTEXITCODE -ne 0) { Write-Host "夹具未随版，拒绝打包（跑 node scripts\probe-engine-anchors.mjs --fixtures 重生成）"; exit 1 }
+
+# 0.14.5（上游对齐审计 C-1）：26 个补丁回归里此前只有 6 个有自动化入口，其余只被 node --check 解析过。
+# 本门禁把全部 26 个真的串行跑起来；存量失败用带理由的显式白名单记账，新增失败立刻判红。
+Write-Host "== 补丁回归清单门禁 =="
+node (Join-Path $Root "scripts\check-patch-test-manifest.mjs") 2>&1
+if ($LASTEXITCODE -ne 0) { Write-Host "补丁回归出现未声明失败，拒绝打包（修掉，或按既有格式加带 reason/since 的白名单）"; exit 1 }
 
 # 0.14.2 D3 / B6：死 token 防漂移——我们 CSS 引用的 --dsw-* 必须在上游现存令牌集合里（上游树缺席即 SKIP 计数）。
 # 注意：本门禁**必须紧随自己的守卫**，不得插在别的门禁调用与其 $LASTEXITCODE 守卫之间——
@@ -224,6 +233,9 @@ $Out = Join-Path $Root ("out\v" + $GradleVer)
 # Keep the layout-resolved path from the root self-detection above.
 # Overwriting it here breaks self-contained APK checkouts by targeting Root\dsh-mobile-apk.
 New-Item -ItemType Directory -Force -Path $Out | Out-Null
+# This directory contains generated deliverables. Remove old APKs before the dual-ABI run so a
+# stale or extra package cannot pass the final directory-wide signature scan as this build's output.
+Get-ChildItem $Out -Filter '*.apk' -File -Recurse | Remove-Item -Force
 
 # 注入集单一常量（0.13.8-b ST-06 / F-ENV-04）：dirs/externals 都在 scripts/plugin-dirs.json，
 # 与云端链 dsh-mobile-apk/scripts/build-apk.mjs 共用同一份——此前两条链各写一份，云端
@@ -389,7 +401,7 @@ foreach ($abi in @('arm64', 'x86_64')) {
     }
     # 第三方许可合规（GPL 义务 A1/A2 门禁 2026-08-23）：copyleft 包许可证全文须随快照分发，
     # 矩阵须覆盖 dpkg status 全部包；缺失直接拒绝打包（--- tar 视图：9p 权限不影响判定）。
-    node (Join-Path $Root "scripts\check-third-party.mjs") (Join-Path $work "x") --tar $snapIn 2>&1 | Select-Object -First 4
+    node (Join-Path $Root "scripts\check-third-party.mjs") (Join-Path $work "x") --tar $snapIn --write-notices (Join-Path $Root "THIRD_PARTY_NOTICES.md") 2>&1 | Select-Object -First 4
     if ($LASTEXITCODE -ne 0) { Deny-Abi $abi "THIRD-PARTY CHECK FAILED（许可合规）"; continue }
     # 许可资产（LICENSES 标准文本 + notices）打入 APK assets（A2：随包分发）
     $licAssets = Join-Path $apkDir "app\src\main\assets\licenses"
@@ -426,7 +438,7 @@ foreach ($abi in @('arm64', 'x86_64')) {
     # FX-208.1：按当前 ABI 传参；--require = 快照/资产缺席即失败，不得 SKIP exit 0（旧实现把构建机状态
     # 变成门禁结果）。ST-06：本调用原先落在 foreach 之外（$abi 未定义恒走 x86_64 默认值）——已移进循环。
     Write-Host "== 运行时补丁资产门禁（$abi，严格）=="
-    node (Join-Path $Root "scripts\check-runtime-assets.mjs") $abi --require 2>&1
+    node (Join-Path $Root "scripts\check-runtime-assets.mjs") $abi --require --snapshot $snapIn 2>&1
     if ($LASTEXITCODE -ne 0) { Deny-Abi $abi "运行时补丁资产过期或缺失（从快照重新生成 assets/patched）"; continue }
 
     # MCP client 运行期依赖闭包（0.14.2-fx-2 H-1）：该宿主**不在我们装配的行面上**（用户自己在
@@ -441,29 +453,23 @@ foreach ($abi in @('arm64', 'x86_64')) {
     node (Join-Path $Root "scripts\check-perf-instrumentation.mjs") --require --snapshot $snapIn --abi $abi 2>&1
     if ($LASTEXITCODE -ne 0) { Deny-Abi $abi "A1 出厂值/度量入口校验失败"; continue }
 
-    # 3. 双 ABI APK（cp 快照 + 指纹 → gradle assembleDebug）
+    # 3. Shared per-ABI terminal engine: snapshot/fingerprint -> Gradle -> named artifact.
+    # The ABI-specific gates/injection above and multi-ABI rejection accounting remain local.
     Write-Host "== 构建 APK（$abi, suffix=$Suffix）=="
-    # 增量打包防护（2026-08-23 修复）：mergeDebugAssets 缓存随 ABI 切换不会失效，
-    # 且打包器会在旧 APK 上叠加同名条目（产品曾出现双 snapshot.tar.xz、APK 288MB）——每次迭代前清理。
-    Remove-Item (Join-Path $apkDir "app\build\intermediates\assets") -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item (Join-Path $apkDir "app\build\outputs\apk\debug") -Recurse -Force -ErrorAction SilentlyContinue
-    Copy-Item $snapIn (Join-Path $apkDir "app\src\main\assets\snapshot.tar.xz") -Force
-    $sha = (Get-FileHash $snapIn -Algorithm SHA256).Hash.ToLower()
-    Set-Content -Path (Join-Path $apkDir "app\src\main\assets\snapshot.sha256") -Value $sha -NoNewline -Encoding ascii
-    # ST-04 严格复核：本 ABI 的 tar 与刚写入的声明值必须逐字节一致（--require：缺件即失败，不得 SKIP）。
-    # 两个 ABI 各自构建时各自声明值与各自 tar 一致——不得再出现「入库值是单一 ABI 构建的事实」。
-    node (Join-Path $Root "scripts\check-snapshot-fingerprint.mjs") --require 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "快照指纹对账失败（$abi）：tar 与声明值不一致，拒绝打包" }
-    Push-Location $apkDir
-    try {
-        & .\gradlew :app:assembleDebug --no-daemon -PversionNameSuffix="$Suffix" 2>&1 | Select-Object -Last 4
-        if ($LASTEXITCODE -ne 0) { throw "gradle 构建失败（$abi）" }
-        $ver = "$GradleVer$Suffix"
-        Copy-Item "app\build\outputs\apk\debug\app-debug.apk" (Join-Path $Out "dsh-mobile-apk-v$ver-$abi.apk") -Force
-        Write-Host "产物: $Out\dsh-mobile-apk-v$ver-$abi.apk"
-    } finally {
-        Pop-Location
-    }
+    $ver = "$GradleVer$Suffix"
+    $engineArgs = @(
+        (Join-Path $Root "scripts\build-apk-engine.mjs"), "assemble",
+        "--snapshot", $snapIn,
+        "--apk-dir", $apkDir,
+        "--output-dir", $Out,
+        "--artifact-name", "dsh-mobile-apk-v$ver-$abi.apk",
+        "--clean"
+    )
+    # Windows PowerShell drops an empty native argument during splatting. Omitting an empty
+    # suffix avoids shifting --clean into the suffix value (and producing versionName 0.14.5--clean).
+    if (-not [string]::IsNullOrEmpty($Suffix)) { $engineArgs += @("--suffix", $Suffix) }
+    node @engineArgs
+    if ($LASTEXITCODE -ne 0) { throw "APK build engine failed ($abi)" }
     $producedAbis += $abi
 }
 
@@ -491,6 +497,12 @@ if ($ExportSnapshots) {
 }
 $producedList = (($producedAbis | Select-Object -Unique) -join ", ")
 $rejectedList = (($rejectedAbis | Select-Object -Unique) -join ", ")
+# Validate the exact APK files left at the final output path. An unsigned intermediate is never a delivered APK.
+Write-Host "== 最终 APK 签名门禁（v1 + v2 + v3；apksigner 原始输出与退出码留在日志）=="
+node (Join-Path $Root "scripts\check-apk-signatures.mjs") --self-test
+if ($LASTEXITCODE -ne 0) { throw "APK 签名门禁自测失败" }
+node (Join-Path $Root "scripts\build-apk-engine.mjs") verify --dir $Out --skip-self-test
+if ($LASTEXITCODE -ne 0) { throw "最终 APK 缺少 v1/v2/v3 全部签名，拒绝交付" }
 Write-Host "=== 汇总。已产出 ABI: [$producedList] / 被拒 ABI: [$rejectedList] ==="
 Write-Host "=== 产物目录：$Out ==="
 # 任一 ABI 被门禁拒绝 = 不得交付（单 ABI 产物发布 = 缺 ABI 的 release）——必须非 0 退出，

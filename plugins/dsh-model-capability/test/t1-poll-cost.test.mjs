@@ -617,3 +617,41 @@ test('P2-S3 结构：apply() 的 diag 行必须报告 modelsDev 状态（可观�
     assert.ok(CODE_INDEX.includes("'" + s + "'"), 'modelsDevStatus 缺少状态 ' + s)
   }
 })
+
+
+test('C4 automatic pass yields before fresh signature and observes intervening settings', async (t) => {
+  const c = makeCtx({})
+  t.after(() => c.dispose())
+  const original = c.ctx.settings.describe
+  let peerTurnRan = false
+  let readsAfterPeerTurn = 0
+  c.ctx.settings.describe = () => {
+    const descriptor = original()
+    if (c.state.describes === 1) setImmediate(() => { peerTurnRan = true })
+    else if (peerTurnRan) readsAfterPeerTurn++
+    return descriptor
+  }
+  apply(c.ctx, { startupDelaySeconds: 3600, pollIntervalSeconds: 3600 })
+  await flush()
+  c.emit(EV, 'llm-pi-ai', 1)
+  await flush()
+  assert.ok(readsAfterPeerTurn >= 1, 'fresh signature was read in the same turn as initial projection')
+  assert.equal(c.state.mutates, 0)
+})
+
+test('C4 disposal during the pass checkpoint prevents further discovery or signature reads', async (t) => {
+  const c = makeCtx({ gateway: { api: 'openai-completions', models: [{ id: 'unrecognized-model' }] } })
+  t.after(() => c.dispose())
+  const original = c.ctx.settings.describe
+  c.ctx.settings.describe = () => {
+    const descriptor = original()
+    if (c.state.describes === 1) setImmediate(() => c.dispose())
+    return descriptor
+  }
+  apply(c.ctx, { startupDelaySeconds: 3600, pollIntervalSeconds: 3600 })
+  await flush()
+  c.emit(EV, 'llm-pi-ai', 1)
+  await flush()
+  assert.equal(c.state.describes, 1, 'disposed pass performed another settings projection')
+  assert.equal(c.state.mutates, 0)
+})

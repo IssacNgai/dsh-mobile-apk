@@ -131,10 +131,16 @@ class ClientRollbackGateTest {
 
   @Test
   fun 一次性入口源码_不得起观察窗也不得等WATCH_MS() {
-    val code = memberBody(codeOnly(shellSource("UndoGate.kt")), "fun onClientPluginTreeFailure(context: Context, detail: String): Boolean")
+    val code = memberBody(codeOnly(shellSource("UndoGate.kt")), "fun onClientPluginTreeFailure(context: Context, detail: String, engine: EngineManager? = null): Boolean")
     assertTrue("必须用 decide 复用 SUPPRESS/EXECUTE 语义", code.contains("decide(TRIGGER_CONSEC_FAILURES"))
-    assertTrue("必须读上次回滚时刻（防循环窗口）", code.contains("lastUndoAt(context)"))
-    assertFalse("不得写 arm 文件（那会引入永不打开的观察窗）", code.contains("armFile("))
+    assertTrue("必须按安装 + 当前失败patch身份读取重试marker", code.contains("retrySuppression(markerFile(context), currentRetryIdentity(context, engine), now)"))
+    // 契约是「不得**新开**观察窗」，不是「不得碰 arm 文件」：清退一个陈旧起点是安全方向，
+    // 写入时间戳才会造出一个在这条路上永远走不到 EXECUTE 的窗口（历史缺陷形状即 armFile().writeText(now)）。
+    assertFalse(
+      "不得写 arm 文件（那会引入永不打开的观察窗）",
+      Regex("""armFile\s*\([^)]*\)\s*\.\s*(writeText|writeBytes|appendText|createNewFile)""").containsMatchIn(code),
+    )
+    assertTrue("观察窗起点只能来自读盘，不得在本入口重新计时", code.contains("armedAt("))
     assertFalse("不得等待 WATCH_MS", code.contains("WATCH_MS"))
     assertTrue("判定必须走纯函数两态映射", code.contains("clientPluginFailureDecision("))
   }
@@ -314,11 +320,17 @@ class ClientRollbackGateTest {
 
   // ── pullByClientIds：语义与副作用与 pull 一致 ────────────────────────────────
 
-  /** 本仓测试面没有 Mockito，也拿不到真实 Context；[PluginMounts.pull] 的实现体**不使用** context
-   *  （纯文件操作），因此这里用最小 ContextWrapper 子类提供 filesDir 即可真跑文件路径。
-   *  「实现体不碰 context」这条前提由 [外科拔除的Context参数必须真未被使用] 单独钉住。 */
+  /** 最小 ContextWrapper 只提供本测试临时 filesDir；生产入口会用它解析 live composition。 */
   private fun testContext(files: File): Context = object : ContextWrapper(null) {
     override fun getFilesDir(): File = files
+  }
+
+  private val testHardManifest: PluginMounts.HardManifest by lazy {
+    val entries = setOf(
+      PluginMounts.HardEntry("shell-termux", "@dsh-android/dsh-shell-termux"),
+      PluginMounts.HardEntry("android-bridge", "@dsh-android/dsh-android-bridge"),
+    )
+    PluginMounts.HardManifest("a".repeat(64), entries, profileEntries = entries, factoryBundles = emptySet())
   }
 
   private fun tempPatch(text: String): Pair<Context, File> {
@@ -326,6 +338,8 @@ class ClientRollbackGateTest {
     val patch = File(File(dir, ".dsh/profiles/web"), "cordis.patch.yml")
     patch.parentFile!!.mkdirs()
     patch.writeText(text)
+    File(patch.parentFile, "package.json").writeText("""{"dsh":{"profile":{"bundles":[]}}}""")
+    File(File(dir, "usr/lib/node_modules/@deepseek-ai/dsh/node_modules"), ".keep").apply { parentFile!!.mkdirs(); writeText("") }
     return testContext(dir) to patch
   }
 
@@ -334,21 +348,25 @@ class ClientRollbackGateTest {
     val (ctx, patch) = tempPatch(fixture)
     try {
       val candidate = PluginMounts.clientPullCandidate(patch.readText(), listOf("dsh-bad-probe"), hard)!!
-      assertTrue("唯一命中必须拔除成功", PluginMounts.pullByClientIds(ctx, patch, candidate))
+      assertTrue("唯一命中必须拔除成功", PluginMounts.pullByClientIdsWithManifest(ctx, patch, candidate, testHardManifest))
       val after = patch.readText()
-      assertFalse("目标块必须消失", after.contains("dsh-bad-probe"))
-      assertTrue("其它条目一条不少", PluginMounts.entryNames(after).containsAll(
+      val homePatch = File(patch.parentFile!!.parentFile!!.parentFile, "cordis.patch.yml")
+      val homeAfter = homePatch.readText()
+      assertEquals("profile原文必须保留", fixture, after)
+      assertTrue("目标插件原块必须保留供用户恢复", after.contains("dsh-bad-probe-plugin"))
+      assertTrue("目标插件必须在后置HOME层由Cordis disabled override隔离", homeAfter.contains("- id: \"dsh-bad-probe\"\n  name: \"dsh-bad-probe-plugin\"\n  disabled: true"))
+      assertTrue("profile其它条目一条不少", PluginMounts.entryNames(after).containsAll(
         listOf("@dsh-android/dsh-shell-termux", "dshmarketplace-plugin", "@dsh-android/dsh-android-bridge"),
       ))
       assertTrue("顶层说明注释不得被误删", after.contains("顶层说明注释"))
       assertTrue("disabled 条目不得受影响", after.contains("disabled: true"))
       assertEquals(
-        "条目数 4 -> 3",
-        PluginMounts.entryNames(fixture).size - 1,
-        PluginMounts.entryNames(after).size,
+        "HOME仅增加一个顶层 disabled override，profile条目计数不变",
+        PluginMounts.entryNames(fixture).size + 1,
+        PluginMounts.entryNames(after).size + PluginMounts.entryNames(homeAfter).size,
       )
     } finally {
-      patch.parentFile!!.parentFile!!.parentFile!!.deleteRecursively()
+      patch.parentFile!!.parentFile!!.parentFile!!.parentFile!!.deleteRecursively()
     }
   }
 
@@ -360,11 +378,13 @@ class ClientRollbackGateTest {
       // 点不出块：清单里没有这个 id（调用方不得自造 FailedEntry）。
       assertFalse(
         "点不出块必须返回 false",
-        PluginMounts.pullByClientIds(ctx, patch, PluginMounts.FailedEntry(id = "no-such-entry", name = "no-such-plugin")),
+        PluginMounts.pullByClientIdsWithManifest(ctx, patch, PluginMounts.FailedEntry(id = "no-such-entry", name = "no-such-plugin"), testHardManifest),
       )
       assertEquals("失败时文件必须一个字节都不改", before, patch.readText())
+      val homePatch = File(patch.parentFile!!.parentFile!!.parentFile, "cordis.patch.yml")
+      assertFalse("失败时不得创建或改写HOME补丁", homePatch.exists())
     } finally {
-      patch.parentFile!!.parentFile!!.parentFile!!.deleteRecursively()
+      patch.parentFile!!.parentFile!!.parentFile!!.parentFile!!.deleteRecursively()
     }
   }
 
@@ -375,21 +395,28 @@ class ClientRollbackGateTest {
     val (ctxB, patchB) = tempPatch(fixture)
     try {
       val failed = PluginMounts.FailedEntry(id = "dsh-bad-probe", name = "dsh-bad-probe-plugin")
-      assertTrue(PluginMounts.pullByClientIds(ctxA, patchA, failed))
-      assertTrue(PluginMounts.pull(ctxB, patchB, failed))
+      assertTrue(PluginMounts.pullByClientIdsWithManifest(ctxA, patchA, failed, testHardManifest))
+      assertTrue(PluginMounts.pullWithManifest(ctxB, patchB, failed, testHardManifest))
       assertEquals("两条路的产物必须逐字节一致", patchB.readText(), patchA.readText())
+      val homeA = File(patchA.parentFile!!.parentFile!!.parentFile, "cordis.patch.yml")
+      val homeB = File(patchB.parentFile!!.parentFile!!.parentFile, "cordis.patch.yml")
+      assertEquals("两条路的HOME输出也必须逐字节一致", homeB.readText(), homeA.readText())
     } finally {
-      patchA.parentFile!!.parentFile!!.parentFile!!.deleteRecursively()
-      patchB.parentFile!!.parentFile!!.parentFile!!.deleteRecursively()
+      patchA.parentFile!!.parentFile!!.parentFile!!.parentFile!!.deleteRecursively()
+      patchB.parentFile!!.parentFile!!.parentFile!!.parentFile!!.deleteRecursively()
     }
   }
 
   @Test
-  fun 外科拔除的Context参数必须真未被使用() {
-    // 上面用 ContextWrapper(null) 真跑文件路径的前提：pull / pullByClientIds 不触达 context。
+  fun 外科拔除的生产入口必须使用权威Hard和当前组合() {
+    // 测试通过结构有效的HardManifest overload注入权威身份；生产入口仍必须解析设备Hard来源和实时composition。
     val code = codeOnly(shellSource("PluginMounts.kt"))
     val body = memberBody(code, "fun pull(context: Context, patch: File, failed: FailedEntry): Boolean")
-    assertFalse("pull 实现体不得触达 context（否则测试用最小 Context 会失真）", body.contains("context."))
+    assertTrue("生产pull必须选当前安装的权威Hard", body.contains("ensureHard(context, currentFingerprint(context))"))
+    assertTrue("生产pull必须委派给统一manifest复验执行器", body.contains("pullWithManifest(context, patch, failed, hard)"))
+    val verified = memberBody(code, "internal fun pullWithManifest(context: Context, patch: File, failed: FailedEntry, hard: HardManifest): Boolean")
+    assertTrue("共享执行器必须解析实际runtime组合", verified.contains("liveComposition(context, patch)"))
+    assertTrue("共享执行器必须拒绝结构无效Hard", verified.contains("validHardForMutation(hard)"))
     val client = memberBody(code, "fun pullByClientIds(context: Context, patch: File, failed: FailedEntry): Boolean")
     assertTrue("pullByClientIds 必须直接委派 pull", client.contains("pull(context, patch, failed)"))
   }
@@ -421,14 +448,16 @@ class ClientRollbackGateTest {
   fun execute_分支顺序与安全护栏一字不改() {
     val code = codeOnly(shellSource("UndoGate.kt"))
     val sourceAt = code.indexOf("?: clientFailure")
-    val hardAt = code.indexOf("failed.name !in hard")
+    val hardAt = code.indexOf("val hard = PluginMounts.ensureHard(context, installFingerprint(context))")
+    val exactOwnershipAt = code.indexOf("!hard.owns(failed.id, failed.name)")
     val pullAt = code.indexOf("PluginMounts.pull(context, patch, failed)")
     val mountAt = code.indexOf("PluginMounts.mountUnchangedSinceHealthy(context, patch)")
     val q = '"'
     val restoreAt = code.indexOf("listOf(" + q + "restore" + q + ", known)")
     assertTrue("失败条目来源必须在最前", sourceAt > 0)
-    assertTrue("硬清单护栏必须在拔除之前", hardAt > sourceAt)
-    assertTrue("外科拔除必须仍在整份回滚之前", pullAt > hardAt && pullAt < restoreAt)
+    assertTrue("权威Hard清单必须在拔除之前解析", hardAt > sourceAt)
+    assertTrue("失败entry必须按exact id/name归属后才允许拔除", exactOwnershipAt > hardAt)
+    assertTrue("外科拔除必须仍在整份回滚之前", pullAt > exactOwnershipAt && pullAt < restoreAt)
     assertTrue("清单未变护栏必须仍在场", mountAt > pullAt)
     assertTrue("整份回滚目标必须仍是已知良好 id", restoreAt > mountAt)
     assertTrue("跨版本护栏必须仍在场", code.contains("knownGoodUsable(knownGoodId(context), knownGoodFp(context), installFingerprint(context))"))

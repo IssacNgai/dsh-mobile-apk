@@ -1,5 +1,6 @@
 param(
   [string]$Version = "",
+  [string]$VersionSuffix = "",
   [string]$Gradle = "gradle",          # gradle command (accepts a GRADLE_USER_HOME-aware wrapper)
   [switch]$SkipGitCheck,                # skip the git dirty-state gate (emergency releases only)
   [switch]$GatesOnly                    # 只跑到门禁段（0.13.8-b：验收/本地核验用，不做插件构建与打包）
@@ -70,12 +71,24 @@ if ($GatesOnly) {
 
 # 0) Version (default: the APK versionName)
 $apkVer = (Select-String -Path (Join-Path $root "dsh-mobile-apk\app\build.gradle.kts") -Pattern 'versionName = "([^"]+)"').Matches.Groups[1].Value
-if ($Version -eq "") { $Version = $apkVer }
+$versionArgs = @('--base', $apkVer)
+if ($Version) { $versionArgs += @('--version', $Version) }
+if ($VersionSuffix) { $versionArgs += @('--suffix', $VersionSuffix) }
+$versionResolution = & node (Join-Path $root "scripts\resolve-version-suffix.mjs") @versionArgs
+if ($LASTEXITCODE -ne 0) { throw "版本参数必须基于 Gradle versionName；完整版本号不能重复作为 versionNameSuffix" }
+$versionResolution = ($versionResolution -join "`n") | ConvertFrom-Json
+$Version = $versionResolution.version
+$VersionSuffix = $versionResolution.suffix
+node --test (Join-Path $root "scripts\check-apk-signatures.test.mjs") (Join-Path $root "scripts\resolve-version-suffix.test.mjs") (Join-Path $root "scripts\build-apk-engine.test.mjs")
+if ($LASTEXITCODE -ne 0) { throw "APK scheme/version regression tests failed" }
 $outDir = Join-Path $relRoot ("v" + $Version)
 $apkDir = Join-Path $outDir "apk"
 $snapDir = Join-Path $outDir "snapshot"
 $plugDir = Join-Path $outDir "plugins"
 foreach ($d in @($apkDir, $snapDir, $plugDir)) { New-Item -ItemType Directory -Force $d | Out-Null }
+# Release output is regenerated as a unit. Old APKs must not survive into this version's
+# directory-wide signature check or MANIFEST, even when a prior build used a different ABI set.
+Get-ChildItem $apkDir -Filter '*.apk' -File -Recurse | Remove-Item -Force
 Write-Output ("== release v" + $Version + " -> " + $outDir)
 
 # 1) Plugin build + npm pack (artifacts reused for host injection)
@@ -180,32 +193,35 @@ if ($LASTEXITCODE -ne 0) { throw "注入后第三方合规校验失败（x86_64�
 Write-Output "  注入后产物门禁全部通过"
 
 # 3) Dual-ABI APK build (swap snapshot in assets, build twice)
-$assets = Join-Path $root "dsh-mobile-apk\app\src\main\assets\snapshot.tar.xz"
 foreach ($abi in @(@{n='arm64-v8a'; f=$armSnap}, @{n='x86_64'; f=$x86Snap})) {
   Write-Output ("== build APK " + $abi.n)
-  Copy-Item $abi.f $assets -Force
-  # Snapshot fingerprint: the shell compares filesDir/.snapshot-fingerprint at boot and re-extracts the
-  # embedded snapshot on mismatch (upgrades auto-update runtime/plugins; v0.10.7 fixed "upgrade not applied").
-  $fpPath = Join-Path $root "dsh-mobile-apk\app\src\main\assets\snapshot.sha256"
-  $fpValue = (Get-FileHash $abi.f -Algorithm SHA256).Hash.ToLower()
-  [IO.File]::WriteAllText($fpPath, $fpValue)
-  # ST-04 严格复核：本 ABI 的快照与刚写入的指纹必须逐字节一致（--require：缺件即失败，不得 SKIP）。
-  node (Join-Path $root "scripts\check-snapshot-fingerprint.mjs") --require
-  if ($LASTEXITCODE -ne 0) { throw ("快照指纹对账失败（" + $abi.n + "）：tar 与声明值不一致，中止组装") }
-  Push-Location (Join-Path $root "dsh-mobile-apk")
-  # 0.14.2-fx-2 修（本机实测）：不得用系统 gradle + --offline 组装发布包 ——
-  # AndroidX 产物不在系统 gradle 的依赖缓存里，离线档下 arm64-v8a/x86_64 必失败：
-  #   "No cached version of androidx.webkit:webkit:1.12.1 available for offline mode"（22s 即 break）
-  # 而 build-apk-013.ps1 走项目 wrapper、不带 --offline，同一棵工作树 BUILD SUCCESSFUL。
-  # 两条链必须同一条调用口径，否则「本地发布链」只在「开发链」成功过的那台机器上偶然可用。
-  # -PversionNameSuffix 与开发链同参；--rerun-tasks 已去（产物由 gradle 缓存裁决，与开发链一致）。
-  if ($Gradle -eq "gradle") { $Gradle = ".\gradlew.bat" }
-  & $Gradle :app:assembleDebug --no-daemon -PversionNameSuffix="$Version" 2>$null | Out-Null
-  if ($LASTEXITCODE -ne 0) { throw ("APK build failed (" + $abi.n + ")") }
-  Pop-Location
-  $apk = Get-ChildItem (Join-Path $root "dsh-mobile-apk\app\build\outputs\apk\debug\app-debug.apk") | Select-Object -First 1
-  Copy-Item $apk.FullName (Join-Path $apkDir ("dsh-mobile-apk-v" + $Version + "-" + $abi.n + ".apk")) -Force
+  # The release assembler shares the terminal build engine but keeps its
+  # release snapshot/plugin gates and release/v<version>/apk artifact layout.
+  # This job still builds once; the publish job only verifies/uploads this artifact.
+  $gradleCommand = $Gradle
+  if ($gradleCommand -eq "gradle") { $gradleCommand = ".\gradlew.bat" }
+  $engineArgs = @(
+    (Join-Path $root "scripts\build-apk-engine.mjs"), "assemble",
+    "--snapshot", $abi.f,
+    "--apk-dir", (Join-Path $root "dsh-mobile-apk"),
+    "--output-dir", $apkDir,
+    "--artifact-name", ("dsh-mobile-apk-v" + $Version + "-" + $abi.n + ".apk"),
+    "--gradle", $gradleCommand
+  )
+  # Empty native arguments are dropped by Windows PowerShell and would shift the following
+  # option into the suffix value. The engine defaults to an empty suffix when omitted.
+  if (-not [string]::IsNullOrEmpty($VersionSuffix)) { $engineArgs += @("--suffix", $VersionSuffix) }
+  node @engineArgs
+  if ($LASTEXITCODE -ne 0) { throw ("APK build engine failed (" + $abi.n + ")") }
 }
+
+# Verify the exact APK files in the final release directory before MANIFEST/upload assembly.
+Write-Output "== final APK signing gate (v1 + v2 + v3) =="
+$signatureGate = Join-Path $root "scripts\check-apk-signatures.mjs"
+node $signatureGate --self-test
+if ($LASTEXITCODE -ne 0) { throw "APK signature gate self-test failed" }
+node (Join-Path $root "scripts\build-apk-engine.mjs") verify --dir $apkDir --skip-self-test
+if ($LASTEXITCODE -ne 0) { throw "A final release APK is missing a required v1/v2/v3 signature" }
 
 # 4) Snapshot security gate —— G.0 ④ 冗余消除（0.14.2-fx-2）：**本段不再单独跑**。
 #

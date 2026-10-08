@@ -15,8 +15,8 @@
  *   4. exact model-id lookup in the pi-ai catalogs the engine ships;
  *   5. user-declared fallbacks — present only when the user configured them,
  *      never a factory default, so an unstated capability stays absent;
- *   6. active probes — only when the caller passes explicit approval, because
- *      they send a real (minimal) completion request.
+ *   6. an explicitly confirmed Responses-only active probe may verify wire-level
+ *      acceptance after passive discovery; unsupported dialects stay unknown.
  *
  * Invariants:
  *   - a capability that no stage reported stays absent (never guessed);
@@ -41,15 +41,56 @@ export type CapabilitySource =
   | 'models-dev'
   | 'engine-catalog'
   | 'user-fallback'
+  | 'protocol-profile'
   | 'active-probe'
 
 export type CapabilityKey = 'input' | 'contextWindow' | 'maxTokens' | 'reasoningEfforts'
 
 /** pi-ai compat keys that decide how a reasoning level is serialized on the wire. */
-export const DIALECT_COMPAT_KEYS = ['thinkingFormat', 'supportsReasoningEffort', 'maxTokensField'] as const
+export const DIALECT_COMPAT_KEYS = [
+  'thinkingFormat', 'supportsReasoningEffort', 'maxTokensField', 'requiresReasoningContentOnAssistantMessages',
+] as const
+
+/** Whether pi-ai's selected serializer has a proven reasoning-effort wire field. */
+export function canApplyReasoningEfforts(api: string | undefined, compat: Record<string, unknown> | undefined): boolean {
+  if (api === 'openai-responses') return true
+  if (api === 'openai-completions') {
+    // MiMo's documented thinking switch is boolean, not a set of effort levels.
+    if (compat?.thinkingFormat === 'mimo') return false
+    return compat?.supportsReasoningEffort === true
+      && typeof compat.thinkingFormat === 'string'
+      && compat.thinkingFormat !== ''
+  }
+  return false
+}
+
+/** Remove duplicate spellings and refuse unverified multi-level Responses declarations. */
+export function normalizeReasoningEfforts(
+  api: string | undefined,
+  compat: Record<string, unknown> | undefined,
+  efforts: ReasoningEfforts | undefined,
+  source: CapabilitySource,
+): ReasoningEfforts | undefined {
+  if (!efforts || !canApplyReasoningEfforts(api, compat)) return undefined
+  const normalized: ReasoningEfforts = {}
+  const seen = new Set<string>()
+  for (const level of THINKING_LEVELS) {
+    const wire = efforts[level]
+    if (typeof wire !== 'string' || wire === '' || seen.has(wire)) continue
+    normalized[level] = wire
+    seen.add(wire)
+  }
+  const onLevels = Object.keys(normalized).filter((level) => level !== 'off')
+  if (api === 'openai-responses' && source !== 'engine-catalog' && source !== 'user-fallback' && onLevels.length > 1) {
+    return undefined
+  }
+  return Object.keys(normalized).length > 0 ? normalized : undefined
+}
 
 export interface ModelCapabilities {
   id: string
+  /** Resolved wire protocol when the provider route or unanimous catalog supplies one. */
+  api?: string
   input?: Modality[]
   contextWindow?: number
   maxTokens?: number
@@ -71,6 +112,8 @@ export interface ProviderConfig {
   route: string
   /** Wire protocol family; decides which passive endpoints are tried. */
   api?: string
+  /** Explicit route-level pi-ai compat fields. */
+  compat?: Record<string, unknown>
   baseURL: string
   apiKey?: string
   /** Credential reference the route names (`apiKeyEnv`); resolved by the caller. */
@@ -78,6 +121,8 @@ export interface ProviderConfig {
   headers?: Record<string, string>
   /** Model ids the user declared for this route (used to report unknowns). */
   models?: string[]
+  /** Valid model-level declarations retained for correct merge/gating. */
+  modelProfiles?: Record<string, { compat?: Record<string, unknown>; reasoningEfforts?: unknown }>
 }
 
 export interface ProbeReport {
@@ -348,8 +393,20 @@ export async function probePassive(config: ProviderConfig, options: ProbeOptions
     const parsed = parseDescriptor(payload, url)
     report.notes.push(...parsed.notes)
     for (const model of parsed.models) {
-      const { id, ...patch } = model
-      mergeModel(byId, id, patch, isOllama ? 'vendor-descriptor' : 'endpoint-descriptor')
+      const { id, reasoningEfforts, ...patch } = model
+      const source: CapabilitySource = isOllama ? 'vendor-descriptor' : 'endpoint-descriptor'
+      const declaredCompat = {
+        ...config.compat,
+        ...config.modelProfiles?.[id]?.compat,
+      }
+      const safeEfforts = normalizeReasoningEfforts(config.api, declaredCompat, reasoningEfforts, source)
+      if (reasoningEfforts && !safeEfforts) {
+        report.notes.push(`${id}: endpoint 列出了推理档位，但 API/compat 未证明可用的 wire 格式或档位差异，保持未知`)
+      }
+      mergeModel(byId, id, {
+        ...patch,
+        ...(safeEfforts ? { reasoningEfforts: safeEfforts } : {}),
+      }, source)
     }
   }
 
@@ -385,6 +442,8 @@ export interface ActiveProbeRequest {
   headers: Record<string, string>
   /** Builds the minimal body for one candidate level. */
   body: (level: string) => unknown
+  /** An intentionally invalid candidate; must be rejected before positives count. */
+  negativeControlBody?: unknown
   /** Candidate levels, e.g. ['low', 'medium', 'high']. */
   levels: string[]
   fetchImpl?: FetchLike
@@ -398,6 +457,13 @@ export interface ActiveProbeResult {
   /** Accepted levels translated into the engine vocabulary (unknown words dropped). */
   efforts?: ReasoningEfforts
   dropped: string[]
+  negativeControl?: { accepted: boolean; status?: number; reason?: string }
+}
+
+function isReasoningEffortValidationError(body: string): boolean {
+  // Require the error to identify this field. Generic "invalid model" or
+  // "unsupported model" errors do not prove reasoning.effort was validated.
+  return /(?:^|[^a-z])(?:reasoning|effort)(?:$|[^a-z])/i.test(body)
 }
 
 /**
@@ -413,6 +479,42 @@ export async function probeReasoningEfforts(request: ActiveProbeRequest): Promis
     for (const level of request.levels) result.inconclusive.push({ level, reason: 'no fetch implementation available' })
     return result
   }
+  if (request.negativeControlBody !== undefined) {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    try {
+      const response = await fetchImpl(request.url, {
+        headers: request.headers,
+        method: 'POST',
+        body: JSON.stringify(request.negativeControlBody),
+        signal: controller.signal,
+      })
+      const body = await response.text().catch(() => '')
+      const rejected = !response.ok && (response.status === 400 || response.status === 422)
+        && isReasoningEffortValidationError(body)
+      result.negativeControl = {
+        accepted: response.ok,
+        status: response.status,
+        reason: rejected ? undefined : body.slice(0, 160),
+      }
+      if (!rejected) {
+        for (const level of request.levels) {
+          result.inconclusive.push({ level, status: response.status, reason: response.ok
+            ? 'negative control was accepted; endpoint may ignore or not validate reasoning.effort'
+            : `negative control did not prove effort validation: ${body.slice(0, 160)}` })
+        }
+        return result
+      }
+    } catch (error) {
+      result.negativeControl = { accepted: false, reason: (error as Error)?.message ?? String(error) }
+      for (const level of request.levels) {
+        result.inconclusive.push({ level, reason: 'negative control request failed; capability is unknown' })
+      }
+      return result
+    } finally {
+      clearTimeout(timer)
+    }
+  }
   for (const level of request.levels) {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), timeoutMs)
@@ -426,7 +528,7 @@ export async function probeReasoningEfforts(request: ActiveProbeRequest): Promis
       const body = await response.text().catch(() => '')
       if (response.ok) {
         result.accepted.push(level)
-      } else if ((response.status === 400 || response.status === 422) && /reasoning|effort|unsupported|invalid/i.test(body)) {
+      } else if ((response.status === 400 || response.status === 422) && isReasoningEffortValidationError(body)) {
         result.rejected.push({ level, status: response.status })
       } else {
         result.inconclusive.push({ level, status: response.status, reason: body.slice(0, 160) })
@@ -441,4 +543,81 @@ export async function probeReasoningEfforts(request: ActiveProbeRequest): Promis
   result.efforts = efforts
   result.dropped = dropped
   return result
+}
+
+/**
+ * The only active wire format currently implemented. It deliberately uses the
+ * Responses endpoint and `reasoning.effort`; Completions `thinking.type` is a
+ * boolean mode switch and cannot establish a multi-level effort vocabulary.
+ */
+export async function probeResponsesReasoningEfforts(
+  config: ProviderConfig,
+  model: string,
+  levels: string[],
+  options: Pick<ProbeOptions, 'fetchImpl' | 'timeoutMs'> = {},
+): Promise<ActiveProbeResult> {
+  const candidates = levels.filter((level) => THINKING_LEVELS.includes(level as ThinkingLevel) && level !== 'off')
+  const result: ActiveProbeResult = { accepted: [], rejected: [], inconclusive: [], dropped: [] }
+  if ((config.api ?? '').toLowerCase() !== 'openai-responses') {
+    for (const level of candidates) result.inconclusive.push({ level, reason: 'active probe is implemented only for the openai-responses API dialect' })
+    return result
+  }
+  const base = config.baseURL.replace(/\/+$/, '')
+  return probeReasoningEfforts({
+    url: `${base}/responses`,
+    headers: { ...authHeaders(config), 'content-type': 'application/json' },
+    levels: candidates,
+    fetchImpl: options.fetchImpl,
+    timeoutMs: options.timeoutMs,
+    negativeControlBody: {
+      model,
+      input: 'Reply with OK.',
+      max_output_tokens: 1,
+      reasoning: { effort: '__dsh_invalid_effort__' },
+    },
+    body: (level) => ({
+      model,
+      input: 'Reply with OK.',
+      max_output_tokens: 1,
+      reasoning: { effort: level },
+    }),
+  })
+}
+
+/**
+ * Probe conventional OpenAI Completions `reasoning_effort` only when the route
+ * explicitly selects the known `openai` serializer and declares field support.
+ * Special serializers, including MiMo's boolean thinking toggle, are excluded.
+ */
+export async function probeOpenAICompletionsReasoningEfforts(
+  config: ProviderConfig,
+  model: string,
+  compat: Record<string, unknown> | undefined,
+  levels: string[],
+  options: Pick<ProbeOptions, 'fetchImpl' | 'timeoutMs'> = {},
+): Promise<ActiveProbeResult> {
+  const candidates = levels.filter((level) => THINKING_LEVELS.includes(level as ThinkingLevel) && level !== 'off')
+  const result: ActiveProbeResult = { accepted: [], rejected: [], inconclusive: [], dropped: [] }
+  if ((config.api ?? '').toLowerCase() !== 'openai-completions'
+      || compat?.thinkingFormat !== 'openai'
+      || compat.supportsReasoningEffort !== true) {
+    for (const level of candidates) result.inconclusive.push({ level, reason: 'OpenAI Completions effort probe requires explicit thinkingFormat=openai and supportsReasoningEffort=true' })
+    return result
+  }
+  const base = config.baseURL.replace(/\/+$/, '')
+  const makeBody = (effort: string) => ({
+    model,
+    messages: [{ role: 'user', content: 'Reply with OK.' }],
+    max_tokens: 1,
+    reasoning_effort: effort,
+  })
+  return probeReasoningEfforts({
+    url: `${base}/chat/completions`,
+    headers: { ...authHeaders(config), 'content-type': 'application/json' },
+    levels: candidates,
+    fetchImpl: options.fetchImpl,
+    timeoutMs: options.timeoutMs,
+    negativeControlBody: makeBody('__dsh_invalid_effort__'),
+    body: makeBody,
+  })
 }

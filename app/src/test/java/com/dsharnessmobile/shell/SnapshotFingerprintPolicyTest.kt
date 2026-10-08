@@ -39,13 +39,25 @@ class SnapshotFingerprintPolicyTest {
     assertFalse(SnapshotFingerprintPolicy.fresh(true, bundled, "f".repeat(64)))
   }
 
+  @Test fun onlineSnapshotStaysFreshOnlyForTheSameEmbeddedBaseAndCommittedArchive() {
+    val archive = "fedcba9876543210".repeat(4)
+    assertTrue(SnapshotFingerprintPolicy.onlineFresh(true, sha, archive, sha, archive))
+    assertTrue(SnapshotFingerprintPolicy.onlineFresh(true, sha.uppercase(), archive.uppercase(), sha, archive))
+    assertFalse(SnapshotFingerprintPolicy.onlineFresh(false, sha, archive, sha, archive))
+    assertFalse(SnapshotFingerprintPolicy.onlineFresh(true, "f".repeat(64), archive, sha, archive))
+    assertFalse(SnapshotFingerprintPolicy.onlineFresh(true, sha, "0".repeat(64), sha, archive))
+    assertFalse(SnapshotFingerprintPolicy.onlineFresh(true, sha, archive, "bad", archive))
+  }
+
   @Test fun invalidBundledMetadataHasNoLegacyFreshnessOrDegradedStartupBypass() {
     fun source(name: String): String = listOf(
       java.io.File("src/main/java/com/dsharnessmobile/shell", name),
       java.io.File("app/src/main/java/com/dsharnessmobile/shell", name),
     ).first { it.isFile }.readText()
     val manager = source("EngineManager.kt")
-    assertTrue(manager.contains("fun snapshotFresh(): Boolean = SnapshotFingerprintPolicy.fresh("))
+    assertTrue(manager.contains("fun snapshotFresh(): Boolean {"))
+    assertTrue(manager.contains("SnapshotFingerprintPolicy.fresh(nodeBin.exists(), bundledSnapshotFingerprint, committed)"))
+    assertTrue(manager.contains("SnapshotFingerprintPolicy.onlineFresh("))
     assertTrue(manager.contains("fun shouldDegradeRefresh(): Boolean = bundledSnapshotFingerprint.fingerprint != null"))
     assertFalse(manager.contains("if (fp.isEmpty()) return true"))
     val refresh = manager.substringAfter("fun refreshSnapshot(").substringBefore("private fun refreshSnapshotInternal(")

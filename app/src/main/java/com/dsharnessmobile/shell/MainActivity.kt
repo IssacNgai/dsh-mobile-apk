@@ -194,6 +194,10 @@ class MainActivity : ComponentActivity() {
     @Volatile
     internal var webViewRef: WebView? = null
 
+    /** Actual Chromium version parsed from the main WebView UA; empty means unknown. */
+    @Volatile
+    internal var observedChromiumVersion: String = ""
+
     /** #242：引擎文档首帧是否已提交（`onPageCommitVisible`）；新文档在 `onPageStarted` 复位。 */
     @Volatile internal var webFrameCommitted = false
 
@@ -1737,26 +1741,29 @@ class MainActivity : ComponentActivity() {
    */
   internal fun currentWebViewVersionName(): String = WebViewShim.providerVersionName()
 
-  /** 主版本号（§2.4 的判据字段：`syntax_floor_ok` 的输入）；读不到记 0（显式未知，不当通过）。 */
-  internal fun currentWebViewMajor(): Int = WebViewShim.providerMajor()
+  /** Chromium 主版本号来自实际 WebView UA；读不到记 0，不用厂商 provider 版本冒充。 */
+  internal fun currentWebViewMajor(): Int =
+    WebViewShim.majorOf(WebViewShim.chromiumVersionFromUserAgent(webView.settings.userAgentString.orEmpty()))
 
   /**
    * §2.4：把内核版本落到启动诊断面。**判据**：`files/boot-diag.log` 出现
-   * `source=webview-version` 行且 `webview_major` 与 `dumpsys webviewupdate` 一致。
+   * `source=webview-version` 行同时保留 provider 包版本与 UA 中的 Chromium 版本。
    * 失败绝不抛出（诊断通路不得成为故障源）。
    */
   private fun reportWebViewVersion(source: String) {
     try {
       val version = currentWebViewVersionName()
+      val chromiumVersion = WebViewShim.chromiumVersionFromUserAgent(webView.settings.userAgentString.orEmpty())
+      observedChromiumVersion = chromiumVersion
       val major = currentWebViewMajor()
-      // ES2022 类静态块需 Chromium 94+；<94 的产物会在解析期整体不执行（详档 §1.2）。
-      val floorOk = major >= WEBVIEW_SYNTAX_FLOOR_MAJOR
+      // ES2022 类静态块需 Chromium 94+；vendor package version 不是该 Chromium 版本。
+      val floorOk = WebViewShim.syntaxFloorStatus(chromiumVersion, WEBVIEW_SYNTAX_FLOOR_MAJOR)
       LogCollector.writeBootDiag(
         this,
         "webview-version",
         "from=$source webview_package=${WebViewShim.providerPackageName()}"
           + " webview_provider_available=${WebViewShim.providerAvailable()}"
-          + " webview_version=$version webview_major=$major"
+          + " webview_provider_version=$version webview_version=$chromiumVersion webview_major=${major.takeIf { it > 0 } ?: -1}"
           + " syntax_floor_ok=$floorOk"
       )
     } catch (t: Throwable) {

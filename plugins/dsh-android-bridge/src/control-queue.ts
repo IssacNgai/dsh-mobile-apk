@@ -36,6 +36,8 @@ export type ControlResult =
   | {
     ok: false
     error: string
+    /** Stable machine-readable refusal code when the service rejects before queue dispatch. */
+    code?: string
     /** 该 op 在受限通道下的替代动作模式（目前只有 coordinate）。 */
     actionMode?: string
     /** 目标屏幕别名（便于模型把后续坐标操作收敛到同一屏）。 */

@@ -148,19 +148,24 @@ class ConsoleActivity : ComponentActivity() {
         return
       }
       val engine = EngineManager(this@ConsoleActivity)
+      val hardManifest = PluginMounts.ensureHard(this@ConsoleActivity, PluginMounts.currentFingerprint(this@ConsoleActivity))
       val result = when (action) {
         SafeAction.ON -> SafeMode.enter(
           patch = SafeMode.patchFile(engine),
           homePatch = SafeMode.homePatchFile(engine),
           autoDir = SafeMode.autoDir(engine),
           id = SafeMode.newId(),
+          // 与引导页按钮同一权威来源（[SafeMode.isProductOwned]）：离线 CLI 与 UI 必须同口径。
+          hardManifestAvailable = hardManifest != null,
+          hardEntries = hardManifest?.entries,
+          factoryBundles = hardManifest?.factoryBundles,
         )
         SafeAction.OFF -> SafeMode.exit(
           patch = SafeMode.patchFile(engine),
           homePatch = SafeMode.homePatchFile(engine),
           autoDir = SafeMode.autoDir(engine),
         )
-        SafeAction.STATUS -> SafeMode.status(SafeMode.autoDir(engine))
+        SafeAction.STATUS -> SafeMode.status(SafeMode.autoDir(engine), SafeMode.patchFile(engine), SafeMode.homePatchFile(engine))
       }
       // 回执走既有输出通道（与 bash 输出同一条路径），用户看到的就是他敲的那条命令的结果。
       sessionListener.onOutput(result.message + "\n" + safeCommandUsage() + "\n")

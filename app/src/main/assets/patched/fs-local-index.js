@@ -496,8 +496,8 @@ async function throwGuardedCreateFailure(error, absolutePath, displayPath, inspe
 }
 
 /**
- * dsh-mobile exclusive create (F8): Android app-private directories reject link(2) with EACCES,
- * so the createIfAbsent publication cannot use the hard-link no-replace primitive at all.
+ * dsh-mobile exclusive create (F8): Android private directories reject link(2) with EACCES,
+ * and shared-storage/FUSE may reject it with ENOSYS; createIfAbsent cannot rely on hard links.
  * Re-implement it with an O_EXCL placeholder plus a rename, which keeps the semantics the hard
  * link provided: the loser of a concurrent create gets EEXIST and reports the same
  * "cannot overwrite existing" refusal, and a failed rename releases the placeholder so a
@@ -584,8 +584,8 @@ async function writeFileAtomic(absolutePath, content, mode, signal, internals = 
 		if (createIfAbsent !== void 0) try {
 			await linkFile(tempPath, absolutePath);
 		} catch (error) {
-			/* dsh-mobile link->rename fallback (F8): Android app-private dirs reject link(2) (EACCES). */
-			if (!(error instanceof Error && "code" in error && (error.code === "EACCES" || error.code === "EPERM" || error.code === "ENOTSUP"))) {
+			/* dsh-mobile link->rename fallback (F8): Android private EACCES and shared-storage/FUSE ENOSYS. */
+			if (!(error instanceof Error && "code" in error && (error.code === "EACCES" || error.code === "EPERM" || error.code === "ENOTSUP" || error.code === "ENOSYS"))) {
 				await throwGuardedCreateFailure(error, absolutePath, createIfAbsent.displayPath, inspectPublicationTarget);
 			} else {
 				await dshMobilePublishExclusive(tempPath, absolutePath, createIfAbsent.displayPath, inspectPublicationTarget, internals);

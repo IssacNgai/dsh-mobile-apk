@@ -43,6 +43,23 @@ class EngineBootInstrumentationTest {
   }
 
   @Test
+  fun composeTotalArrivingBeforeListenIsCachedAndAssociatedWhenListenArrives() {
+    val early = "[perf] TOTAL calls=1 totalMs=8400 instances=1 firstAt=214ms loopP99Ms=12 loopSamples=24"
+    val cached = LogCollector.composeTotalUpdate(-1L, 0L, early)
+    assertEquals(8400L, cached?.totalMs)
+    assertEquals("LISTEN 尚未观测到时不落未关联的 compose 行", false, cached?.shouldEmit)
+
+    // markListen() emits a new segment snapshot; it must carry the already cached TOTAL value.
+    val listenSnapshot = LogCollector.bootSegmentsLine(1_000_000L, 1_009_000L, cached!!.totalMs)
+    assertTrue("早到的合法 TOTAL 应关联到 LISTEN 行", listenSnapshot.contains("t_compose_total=8400"))
+    assertNull("重复读同一个累计 TOTAL 不应再产生更新", LogCollector.composeTotalUpdate(cached.totalMs, 1_009_000L, early))
+
+    val late = LogCollector.composeTotalUpdate(-1L, 1_009_000L, early)
+    assertEquals(8400L, late?.totalMs)
+    assertEquals("LISTEN 后到达时立即可落盘", true, late?.shouldEmit)
+  }
+
+  @Test
   fun composeSourceDistinguishesAbsentProbeFromZeroSample() {
     // 这正是 -1 混过 42 个样本的教训：必须能区分「探针完全没装」与「探针装了但没耗时口径」。
     // 分流按 T2 定稿的**行内特征字段**（不用宽泛前缀 —— `[perf] TOTAL` 与 `[perf] boot singles=`

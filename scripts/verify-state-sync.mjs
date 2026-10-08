@@ -19,6 +19,22 @@ const SELF_TEST = argv.includes('--self-test')
 const SERIAL = argOf('serial', '')
 const PKG = argOf('pkg', 'com.dsharnessmobile.shell')
 const WS = argOf('ws', '')
+/**
+ * CDP 转发用的 **host 端口**。
+ *
+ * 坑（2026-10-06 实测）：此处原先硬编码 `tcp:29225`。`adb forward` 的 host 端口属于 **adb server 全局**，
+ * 并不随 `-s <serial>` 隔离 —— 于是本套件为 B 设备跑一次，就会把指向 A 设备的 `host:29225` 映射
+ * 静默改指到 B。并行跑两台设备时，A 的后续 CDP 解析会连到 B 且**不报错**（拿到一个合法 ws）。
+ * 现改为按 serial 派生独立端口，并允许 `--port` 显式指定；退出时移除该转发。
+ */
+const CDP_PORT = (() => {
+  const explicit = Number(argOf('port', ''))
+  if (Number.isInteger(explicit) && explicit > 0) return explicit
+  if (!SERIAL) return 29225
+  let h = 0
+  for (const ch of SERIAL) h = (h * 31 + ch.codePointAt(0)) >>> 0
+  return 29225 + (h % 100)
+})()
 
 /** 设备原语：函数体 = adb shell（可 run-as），`.raw` = adb 级命令（get-state/forward/install 等）。
  *  真实模式用 spawnSync；自检模式注入桩（桩只需可调用，不必有 .raw）。 */
@@ -244,8 +260,8 @@ const resolveWsUrl = async (force = false) => {
   if (WS && !force) return WS
   const pid = adb(['pidof', PKG]).out.trim()
   if (!pid) throw new Error('取不到 ' + PKG + ' 进程号；请先启动 App')
-  adb.raw(['forward', 'tcp:29225', 'localabstract:webview_devtools_remote_' + pid])
-  const list = JSON.parse(await (await fetch('http://127.0.0.1:29225/json/list')).text())
+  adb.raw(['forward', 'tcp:' + CDP_PORT, 'localabstract:webview_devtools_remote_' + pid])
+  const list = JSON.parse(await (await fetch('http://127.0.0.1:' + CDP_PORT + '/json/list')).text())
   if (!list[0]?.webSocketDebuggerUrl) throw new Error('CDP 列表为空（WebView 尚未加载完成）')
   return list[0].webSocketDebuggerUrl
 }
@@ -257,7 +273,17 @@ const refreshPage = async () => { try { page.close() } catch { /* 已关闭 */ }
 const ensureForeground = () => adb(['am', 'start', '-n', PKG + '/.MainActivity'])
 // ── 设备状态快照/还原（队列卫生）：每条用例都收在 off，会把 a11y/权限/偏好留在关闭态并影响后续设备测试 ──
 export function captureExternalState(adb) {
-  const modeOf = (out) => { const m = /:\s*([a-z]+)\s*$/.exec(out.trim()); return m ? m[1] : null }
+  // appops get 的真实输出**带尾部元数据**，例如：
+  //   SYSTEM_ALERT_WINDOW: allow; time=+1h40m49s830ms ago (running)
+  //   MANAGE_EXTERNAL_STORAGE: deny; time=+9d2h16m55s675ms ago; rejectTime=+2h22m19s323ms ago
+  // 旧实现用 /:\s*([a-z]+)\s*$/（要求行尾就是裸模式名），对以上两种真实形态**恒返回 null** ——
+  // 于是 captureExternalState 的 allFilesAccess/overlay 恒为 null，restoreExternalState 的
+  // `if (snap.overlay)` 恒为假，两个 appop **永不还原**，而末尾那行「设备状态已还原到初始值」照常打印，
+  // 形成「看起来绿、实际漏还原」的假绿。改为取第一个冒号后的模式 token（可后接 ; 或空白或行尾）。
+  const modeOf = (out) => {
+    const m = /^[A-Z_]+:\s*([a-z]+)(?:\s*;|\s*$)/m.exec(out.trim())
+    return m ? m[1] : null
+  }
   const prefs = {}
   for (const [key, name] of [['immersive_mode', 'dsh_settings'], ['enabled', 'dsh-overlay'], ['dev_log_enabled', 'dsh_prefs']]) {
     const xml = adb(['run-as', PKG, 'cat', 'shared_prefs/' + name + '.xml']).out
@@ -273,8 +299,13 @@ export function captureExternalState(adb) {
 }
 export function restoreExternalState(adb, snap) {
   const actions = []
-  if (snap.allFilesAccess) { adb(['appops', 'set', PKG, 'MANAGE_EXTERNAL_STORAGE', snap.allFilesAccess]); actions.push('appops MANAGE_EXTERNAL_STORAGE=' + snap.allFilesAccess) }
-  if (snap.overlay) { adb(['appops', 'set', PKG, 'SYSTEM_ALERT_WINDOW', snap.overlay]); actions.push('appops SYSTEM_ALERT_WINDOW=' + snap.overlay) }
+  // 捕获为 null = 我们没能读到升级前的值 ⇒ 不能假装还原过：显式记入 actions 以便在结论行里可见。
+  // （旧实现在此静默跳过，是 D1 假绿的另一半成因。）
+  for (const [label, key] of [['MANAGE_EXTERNAL_STORAGE', 'allFilesAccess'], ['SYSTEM_ALERT_WINDOW', 'overlay']]) {
+    const v = snap[key]
+    if (v) { adb(['appops', 'set', PKG, label, v]); actions.push('appops ' + label + '=' + v) }
+    else actions.push('appops ' + label + '=未还原（捕获值为 null）')
+  }
   if (snap.a11y === 'null' || snap.a11y === '') adb(['settings', 'delete', 'secure', 'enabled_accessibility_services'])
   else adb(['settings', 'put', 'secure', 'enabled_accessibility_services', snap.a11y])
   actions.push('a11y=' + (snap.a11y || 'null'))
@@ -306,5 +337,6 @@ try {
   } catch (e) {
     console.error('设备状态还原失败（请人工核对 a11y/权限/偏好，避免影响后续设备测试）：' + e.message)
   }
+  try { adb.raw(['forward', '--remove', 'tcp:' + CDP_PORT]) } catch { /* 未建立或已被移除 */ }
   page.close()
 }

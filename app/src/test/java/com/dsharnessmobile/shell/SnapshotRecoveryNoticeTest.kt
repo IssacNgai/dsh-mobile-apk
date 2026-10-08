@@ -236,6 +236,14 @@ class SnapshotRecoveryNoticeTest {
     assertFalse("不得在恢复上报里 showGuide", body.contains("showGuide"))
   }
 
+  @Test
+  fun unresolvedFactoryOrOnlineRecoveryBlocksProbeAndRuntimeStart() {
+    assertTrue(SnapshotRecoveryNotice.blocksRuntimeStart("usr rollback failed", true))
+    assertTrue(SnapshotRecoveryNotice.blocksRuntimeStart("unknown transaction purpose", true))
+    assertFalse(SnapshotRecoveryNotice.blocksRuntimeStart(null, true))
+    assertFalse(SnapshotRecoveryNotice.blocksRuntimeStart("stale detail after convergence", false))
+  }
+
   /** 读取 EngineStartFlow.kt（兼容从 apk 仓根或 apk 目录运行测试两种 cwd）。 */
   private fun engineStartFlowSource(): String {
     val f = java.io.File("src/main/java/com/dsharnessmobile/shell/EngineStartFlow.kt")

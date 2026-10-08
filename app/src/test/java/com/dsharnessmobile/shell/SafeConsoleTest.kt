@@ -34,6 +34,9 @@ class SafeConsoleTest {
     // 与安全模式**形近**但不是口径的写法：一律交给 bash（含我们自己的离线 CLI 命令）。
     assertNull(parseSafeCommand("dsh safe-mode on"))
     assertNull(parseSafeCommand("node dsh-undo-emergency.mjs safe-mode on"))
+    assertNull("显式快照清单仍交给急救 CLI", parseSafeCommand("node \"\$DSH_FILES_DIR/undo-emergency.mjs\" list"))
+    assertNull("显式快照 ID 恢复仍交给急救 CLI", parseSafeCommand("node \"\$DSH_FILES_DIR/undo-emergency.mjs\" restore 20260920-235635-524b"))
+    assertNull("CLI 的自动 last-good 选择不得被壳当作 Safe Mode 口令", parseSafeCommand("node \"\$DSH_FILES_DIR/undo-emergency.mjs\" restore-last-good"))
     assertNull("多余词一律不猜", parseSafeCommand("dsh safe on extra"))
     assertNull(parseSafeCommand("dsh safe off now"))
     assertNull(parseSafeCommand("dsh safe enable"))

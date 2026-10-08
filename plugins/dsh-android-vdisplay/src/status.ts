@@ -47,6 +47,7 @@ export interface VdisplayFace {
 /** 控制队列回执（逐字段收窄；失败一律带结构化 error）。 */
 export interface VdControlReply {
   ok: boolean
+  code?: string
   data?: Record<string, unknown>
   error?: string
 }

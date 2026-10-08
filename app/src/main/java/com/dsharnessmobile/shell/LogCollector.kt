@@ -177,6 +177,15 @@ object LogCollector {
     return null
   }
 
+  /** A TOTAL can precede the shell's LISTEN observation; cache it, but only emit once associated. */
+  internal data class ComposeTotalUpdate(val totalMs: Long, val shouldEmit: Boolean)
+
+  internal fun composeTotalUpdate(currentTotalMs: Long, listenMs: Long, engineText: String): ComposeTotalUpdate? {
+    val total = parseComposeTotalMs(engineText) ?: return null
+    if (total == currentTotalMs) return null
+    return ComposeTotalUpdate(total, shouldEmit = listenMs > 0L)
+  }
+
   /**
    * 纯函数：判定 compose 口径的来源标签。这是「未装探针」与「采样为 0」可区分的**判据面**
    * （-1 混过 42 个样本的教训 → 详档 §5.1 C6 要求 `t_compose_total != -1`）。
@@ -383,13 +392,11 @@ object LogCollector {
 
   /** 探针 TOTAL 出现/更新时补落一行（真实 t_compose_total）。 */
   private fun maybeEmitComposeTotal(ctx: Context, engineText: String) {
-    if (segListenMs <= 0L) return
     val source = composeProbeSource(engineText)
     if (source != SOURCE_NONE) segComposeSource = source
-    val total = parseComposeTotalMs(engineText) ?: return
-    if (total == segComposeTotalMs) return
-    segComposeTotalMs = total
-    emitBootSegments(ctx, "note=compose-total")
+    val update = composeTotalUpdate(segComposeTotalMs, segListenMs, engineText) ?: return
+    segComposeTotalMs = update.totalMs
+    if (update.shouldEmit) emitBootSegments(ctx, "note=compose-total")
   }
 
   private fun emitBootSegments(ctx: Context, note: String) {

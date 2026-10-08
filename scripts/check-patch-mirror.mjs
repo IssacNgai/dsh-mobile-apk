@@ -118,6 +118,27 @@ if (peer) {
       check(`镜像一致: scripts/patches/${f}`, false, String(e).slice(0, 200))
     }
   }
+  // data/ 注入片段也是 scripts/patches/** 的权威源；逐递归清单和内容比对，避免新片段漏镜像。
+  const walkFiles = (dir, prefix = '') => {
+    const out = []
+    for (const name of readdirSync(dir)) {
+      const full = join(dir, name)
+      const rel = prefix ? `${prefix}/${name}` : name
+      if (statSync(full).isDirectory()) out.push(...walkFiles(full, rel))
+      else out.push(rel)
+    }
+    return out
+  }
+  try {
+    const mineData = walkFiles(join(ROOT, 'scripts', 'patches', 'data'))
+    const peerData = walkFiles(join(peer, 'scripts', 'patches', 'data'))
+    const onlyMine = mineData.filter((r) => !peerData.includes(r))
+    const onlyPeer = peerData.filter((r) => !mineData.includes(r))
+    check('data/ 文件清单一致', onlyMine.length === 0 && onlyPeer.length === 0,
+      `本仓独有: [${onlyMine.join(', ')}]；对端独有: [${onlyPeer.join(', ')}]`)
+    const bad = mineData.filter((r) => peerData.includes(r) && cmp(join(ROOT, 'scripts', 'patches', 'data', r), join(peer, 'scripts', 'patches', 'data', r)) === 'content')
+    check('data/ 共有文件逐字节一致', bad.length === 0, `内容漂移: [${bad.join(', ')}]`)
+  } catch (e) { check('data/ 目录可枚举', false, String(e).slice(0, 200)) }
   // tests/ 递归清单 + 共有文件逐字节
   // **递归**列清单：0.14.3 实锤——旧实现只列 tests/ 的一层，于是 `fixtures` 被当成一个dir 条目，
   // 里面的 31 个夹具目录从未参与比对。协调仓已把夹具换到 0.2.0-rc.2，APK 侧仍留着 0.1.7-rc.2 的旧夹具，
@@ -163,11 +184,34 @@ if (peer) {
   // 对端缺该文件时跳过（apk 仓独占脚本合法）。
   const MIRROR_TOP = [
     'scripts/build-apk-013.ps1',
+    // Shared per-ABI terminal build stage, used by both the local and portable
+    // APK chains as well as the local release assembler.
+    'scripts/build-apk-engine.mjs',
+    'scripts/build-apk-engine.test.mjs',
+    'scripts/build-hard-manifest.mjs',
+    'scripts/build-hard-manifest.test.mjs',
+    'scripts/check-third-party.mjs',
+    'scripts/check-third-party.test.mjs',
+    'scripts/third-party-licenses.json',
+    'LICENSES/Shizuku-API-MIT.txt',
+    'THIRD_PARTY_NOTICES.md',
+    'scripts/build-apk.mjs',
+    // Shared delivery gates and version normalization are invoked from the
+    // mirrored local build entrypoint; keep their implementation and tests in sync.
+    'scripts/check-apk-signatures.mjs',
+    'scripts/check-apk-signatures.test.mjs',
+    'scripts/gen-model-catalog.mjs',
+    'scripts/resolve-version-suffix.mjs',
+    'scripts/resolve-version-suffix.test.mjs',
     // 门禁脚本**自身**也必须在镜像面（AGENTS.md 铁律 6 明文声明：「scripts/patches/** 与
     // scripts/check-patch-mirror.mjs 是双仓逐字节镜像，单边演进必拒」）。此前它没被自己列进
     // MIRROR_TOP，于是 apk 副本可以长期落后而本门禁**永远不会报**——本轮实测就是如此
     // （coord 306 行 vs apk 305 行，差 P0-c 的 manage 条目）。自指条目是本门禁唯一的自守面。
     'scripts/check-patch-mirror.mjs',
+    // The UI provider E2E helper accepts credential material; its secrecy guards
+    // and extracted-function regression must not drift in the APK mirror.
+    'scripts/e2e-provider-ui.ps1',
+    'scripts/tests/e2e-provider-ui-security.test.ps1',
     // ST-06 纳入镜像面：云端自包含构建链自身也是「单边演进 = 幽灵缺陷」面（此前只在 apk 仓存在、
     // 被镜像检查显式 SKIP）；注入集单一常量 + 契约/门禁脚本同批纳入（0.13.8-b 批 B1）。
     'scripts/build-apk.mjs',
@@ -218,6 +262,7 @@ if (peer) {
     'scripts/bridge-symmetry-baseline.json',
     'scripts/check-gate-skips.mjs',
     'scripts/check-perf-instrumentation.mjs',
+    'scripts/check-perf-instrumentation.test.mjs',
     'scripts/perf-instrumentation-gaps.json',
     'scripts/perf/count-compose.mjs',
     'scripts/perf/measure-steady.ps1',
@@ -268,6 +313,9 @@ if (peer) {
     // 0.14.2 D7：执行地图门禁纳入聚合并声明集合，它就必须与产物面同源 ——
     // 单边演进会让协调仓与 apk 仓对同一棵工作树给出不同的地图结论。
     'scripts/check-code-map.mjs',
+    // 0.14.5（上游对齐审计 C-1）：补丁回归清单门禁。它读 scripts/patches/tests/**（已镜像）并调 node:test，
+    // 两端结论必须同源；单边演进会让一仓判红、另一仓判绿。
+    'scripts/check-patch-test-manifest.mjs',
     'scripts/check-strip-noop.mjs',
     // combo 缓存（0.14.0 启动性能 P1-2 / A3）：预计算模块与覆盖门禁是双仓构建链的同一执行面——
     // 云端自包含构建会用 apk 仓副本（单边演进 = 云端算出的缓存与协调仓门禁口径不一致）。
@@ -335,7 +383,7 @@ if (peer) {
    * （假红），反而失去「挡住真漂移」的判别力。两类，逐条具名（排除面刻意极小）：
    *   - `*.tgz`：打包产物，子仓 .gitignore 已忽略；各自打包时按本侧源码生成，两侧本就不同源。
    *   - `lib/catalog-snapshot.json`：由 build-snapshot-013.mjs 按**本次构建的 ABI 引擎树**生成
-   *     （实测 engineRootHint：coord=…/x86_64/root、apk=…/arm64/root），是构建期数据，
+   *     （engineRootHint 使用快照内相对路径；数据仍来自各 ABI 的真实引擎树），是构建期数据，
    *     不属于铁律 5 的「src + package.json + lib 产物」镜像面。
    * 除外：src/、test/、package.json 等源码仍全量逐字节比对。
    */

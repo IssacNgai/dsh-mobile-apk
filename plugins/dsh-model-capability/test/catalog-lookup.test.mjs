@@ -81,6 +81,14 @@ test('api 过滤：路由声明的线协议不匹配时不采用该条目', () =
   assert.equal(hasCapabilities(match), false)
 })
 
+test('api 过滤：目录未声明 wire protocol 时不得当作路由 api 匹配', () => {
+  const match = lookupCatalog({ models: { legacy: [
+    { provider: 'unknown-api', reasoning: true, thinkingLevelMap: { high: 'high' }, compat: { thinkingFormat: 'openai' } },
+  ] } }, 'legacy', 'openai-completions')
+  assert.deepEqual(match.providers, [])
+  assert.equal(match.capabilities.reasoningEfforts, undefined)
+})
+
 test('effortsOf 只保留非空字符串 wire 值', () => {
   assert.deepEqual(effortsOf({ provider: 'x', thinkingLevelMap: { off: null, low: 'low', high: '' } }), { low: 'low' })
   assert.equal(effortsOf({ provider: 'x', thinkingLevelMap: { off: null } }), undefined)

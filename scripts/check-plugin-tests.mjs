@@ -12,12 +12,19 @@
 // 真实执行插件自己的 test/*.test.mjs，不做静态提取。
 import { existsSync, readdirSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = dirname(HERE)
 const PLUGIN_DIR = join(ROOT, 'plugins')
+
+/** Convert a Windows drive path for the WSL npm installation when it exists. */
+function toWslPath(path) {
+  const full = resolve(path)
+  const match = /^([a-z]):[\\/](.*)$/i.exec(full)
+  return match ? `/mnt/${match[1].toLowerCase()}/${match[2].replaceAll('\\', '/')}` : null
+}
 
 /**
  * 去掉 ANSI 颜色转义。为什么必须去（本轮实测）：vitest 的输出是
@@ -151,13 +158,20 @@ for (const repo of SUBREPO_TESTS) {
   }
   ran += 1
   const useNpm = hasDeps && typeof pkg.scripts?.test === 'string'
+  const wslDir = process.platform === 'win32' && repo === 'dsh-client-ui-responsive' ? toWslPath(dir) : null
+  const wslReady = wslDir === null ? null : spawnSync('wsl.exe', [
+    '--cd', wslDir, '--exec', 'bash', '-lc', 'command -v npm >/dev/null && test -e node_modules/.bin/vitest',
+  ], { encoding: 'utf8' })
+  const useWslNpm = useNpm && wslReady !== null && wslReady.error === undefined && wslReady.status === 0
   // Windows 上 `spawnSync('npm.cmd')` 在无 shell 时可能直接 ENOENT/EINVAL（本机实测：errno 无输出、
   // status 为空），于是「测试明明全绿」却被判红。这里先直调，spawn 失败再退到 shell:true 重试
   // ——重试只影响「怎么起 npm」，判据仍是它的退出码与通过数。
   const npmBin = process.platform === 'win32' ? 'npm.cmd' : 'npm'
-  let r3 = useNpm
-    ? spawnSync(npmBin, ['test'], { cwd: dir, encoding: 'utf8' })
-    : spawnSync(process.execPath, ['--test', '--test-reporter=spec', ...bare], { cwd: dir, encoding: 'utf8' })
+  let r3 = useWslNpm
+    ? spawnSync('wsl.exe', ['--cd', wslDir, '--exec', 'env', 'npm_config_cache=/tmp/dsh-mobile-npm-cache', 'npm', 'test'], { cwd: dir, encoding: 'utf8' })
+    : useNpm
+      ? spawnSync(npmBin, ['test'], { cwd: dir, encoding: 'utf8' })
+      : spawnSync(process.execPath, ['--test', '--test-reporter=spec', ...bare], { cwd: dir, encoding: 'utf8' })
   if (useNpm && (r3.error !== undefined || r3.status === null)) {
     console.log('NOTE  ' + repo + '：npm 直调失败（' + String(r3.error?.code ?? 'no-status') + '），退到 shell 重试')
     // shell:true 在 Node 24 会打一条 DEP0190 弃用提示（noise，与被测对象无关），子进程关掉它。
@@ -174,7 +188,7 @@ for (const repo of SUBREPO_TESTS) {
   const plain3 = stripAnsi(out3)
   const passN3 = Number((/^ℹ pass (\d+)/m.exec(plain3) ?? /Tests\s+(\d+) passed/m.exec(plain3) ?? /^# pass (\d+)/m.exec(plain3))?.[1] ?? '0')
   const failN3 = Number(/^ℹ fail (\d+)/m.exec(plain3)?.[1] ?? /^\s*(\d+) failed/m.exec(plain3)?.[1] ?? '0')
-  const how = useNpm ? 'npm test' : 'node --test（无依赖路径）'
+  const how = useWslNpm ? 'WSL npm test' : useNpm ? 'npm test' : 'node --test（无依赖路径）'
   if (r3.status !== 0 || failN3 !== 0) {
     failed += 1
     console.error('FAIL  ' + repo + ' 的子仓测试未通过（' + how + '）')
