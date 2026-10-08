@@ -89,8 +89,21 @@ jobs:
         run: |
           set -euo pipefail
           # 原始快照消费官方引擎与底座；这里只需 TypeScript/esbuild 解析和降级工具。
-          node scripts/source-build/install-project-dependencies.mjs dsh-client-ui-responsive \
-            ".deploy-tmp/source-build/plugin-lock-resolution-${{ matrix.abi }}.json"
+          #
+          # 为什么必须装 **两个**包（2026-10-08 实锤，release run 37856843613 两 ABI 同因失败）：
+          #   check-browser-syntax-floor 把 esbuild 钉在 ESBUILD_PIN=0.25.12（判据 2 的兼容表就是口径，
+          #   漂移即 exit 2）。它的候选顺序是 plugins/dsh-android-bridge -> dsh-android-vdisplay ->
+          #   dsh-client-ui-responsive -> node_modules。
+          #   dsh-client-ui-responsive 的锁图里 esbuild 是 0.21.5（经 tsdown 传递依赖），它**自己并不声明** esbuild；
+          #   只装它会让解析命中 0.21.5 -> 版本漂移 -> exit 2 -> 快照不可发布。
+          #   plugins/dsh-android-bridge 显式声明 esbuild ^0.25.0（锁图 0.25.12），是候选链上第一个能满足 pin 的载体。
+          #   它无 file: 依赖（不同于 linux-env 需要 termux 先构建），故可在本步单独安装。
+          # 注意：本步**只装依赖、不构建**产品插件（保持 CI 瘦身的初衷）；
+          # 且**不得**据此放宽门禁——版本漂移仍应 fail-loud，这里只是确保链上确实存在钉住的版本。
+          for d in dsh-client-ui-responsive plugins/dsh-android-bridge; do
+            node scripts/source-build/install-project-dependencies.mjs "$d" \
+              ".deploy-tmp/source-build/plugin-lock-resolution-${{ matrix.abi }}.json"
+          done
       - name: stage 底座归档（base/ -> .deploy-tmp/<base-dir>/）
         shell: bash
         run: |
