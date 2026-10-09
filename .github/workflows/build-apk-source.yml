@@ -668,6 +668,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # The snapshot builder runs strict tar-member checks before it returns.
+          # Materialize source payloads before bootstrap preserves the deploy links;
+          # doing this after build-snapshot is too late for those archive gates.
+          node scripts/source-build/materialize-dsh-pnpm-packages.mjs \
+            .deploy-tmp/engine-deploy \
+            .deploy-tmp/engine-overlay/source-build-manifest.json \
+            .deploy-tmp/source-build/pnpm-package-materialization.json
           mkdir -p .deploy-tmp/arm64-base
           python3 scripts/source-build/prepare-termux-bootstrap.py \
             .deploy-tmp/source-build/bootstrap-aarch64.zip \
@@ -740,10 +747,6 @@ jobs:
           node scripts/source-build/reconcile-engine-patch-copies.mjs \
             .deploy-tmp/snapshot-013/arm64/stage/root/usr/lib/node_modules/@deepseek-ai/dsh \
             .deploy-tmp/source-build/engine-patch-copy-reconciliation.json
-          node scripts/source-build/materialize-dsh-pnpm-packages.mjs \
-            .deploy-tmp/snapshot-013/arm64/stage/root/usr/lib/node_modules/@deepseek-ai/dsh \
-            .deploy-tmp/engine-overlay/source-build-manifest.json \
-            .deploy-tmp/source-build/pnpm-package-materialization.json
           snapshot_archive="$GITHUB_WORKSPACE/.deploy-tmp/snapshot-013/arm64/snapshot.tar.xz"
           snapshot_repacked="$GITHUB_WORKSPACE/.deploy-tmp/snapshot-013/arm64/snapshot.source-built.tar.xz"
           (

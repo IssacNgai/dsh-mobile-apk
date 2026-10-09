@@ -4,9 +4,10 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { spawnSync, execFileSync } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync, symlinkSync } from 'node:fs'
+import { chmodSync, copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync, symlinkSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, join, relative, resolve } from 'node:path'
 const ROOT = resolve(import.meta.dirname, '../..')
 const yaml = readFileSync(join(ROOT, '.github/workflows/build-apk-source.yml'), 'utf8').replaceAll('\r\n', '\n')
 function step(name, workflow = yaml) {
@@ -459,4 +460,254 @@ test('deploy cleanup is scoped and rejects empty workspace and linked parent', l
   rmSync(join(root, '.deploy-tmp'), { recursive: true }); symlinkSync(other, join(root, '.deploy-tmp'))
   assert.notEqual(bash(cleanup, root).status, 0)
   assert.equal(readFileSync(join(other, 'sentinel'), 'utf8'), 'keep')
+}))
+
+const CLIENT_PACKAGE = '@deepseek-ai/dsh-client-modules'
+const ENGINE_MEMBER = 'usr/lib/node_modules/@deepseek-ai/dsh'
+const PHASE_MEMBER = ENGINE_MEMBER + '/node_modules/' + CLIENT_PACKAGE + '/lib/index.js'
+const assembleSourceBase = step('Assemble clean Termux base with the source-built Android binding')
+const materializer = join(ROOT, 'scripts/source-build/materialize-dsh-pnpm-packages.mjs')
+const phaseChecker = join(ROOT, 'scripts/check-perf-instrumentation.mjs')
+const patchRunner = join(ROOT, 'scripts/patches/apply-patches.mjs')
+const clientFixture = join(ROOT, 'scripts/patches/tests/fixtures/dsh-client-modules-0.2.0-rc.2')
+function command(args, cwd = ROOT) {
+  const r = spawnSync(NODE, args, { cwd, encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024 })
+  if (r.error) throw r.error
+  return r
+}
+function sourcePackageFixture(root) {
+  const engine = join(root, '.deploy-tmp/engine-deploy')
+  const manifest = join(root, '.deploy-tmp/engine-overlay/source-build-manifest.json')
+  const report = join(root, '.deploy-tmp/source-build/pnpm-package-materialization.json')
+  // Real pinned package identities, dummy payloads except for the versioned client fixture.
+  // This is a layout fixture, not a source-build provenance or upstream compilation claim.
+  const overlay = JSON.parse(readFileSync(join(ROOT, 'scripts/snapshot-config/engine-overlay.json'), 'utf8'))
+  const packages = Object.entries(overlay.packages).filter(([name]) => name.startsWith('@deepseek-ai/'))
+    .map(([name, version]) => ({ name, version }))
+  assert.ok(packages.length >= 266)
+  let physical
+  for (const item of packages) {
+    const store = join(engine, 'node_modules/.pnpm', item.name.slice(1).replace('/', '+') + '@' + item.version,
+      'node_modules', item.name)
+    const target = join(engine, 'node_modules', item.name)
+    mkdirSync(join(store, 'lib'), { recursive: true })
+    mkdirSync(dirname(target), { recursive: true })
+    writeFileSync(join(store, 'package.json'), JSON.stringify(item))
+    writeFileSync(join(store, 'lib/index.js'), 'export const fixture = true;\n')
+    symlinkSync(relative(dirname(target), store), target)
+    if (item.name === CLIENT_PACKAGE) {
+      physical = store
+      copyFileSync(join(clientFixture, 'package.json'), join(store, 'package.json'))
+      copyFileSync(join(clientFixture, 'lib/index.js'), join(store, 'lib/index.js'))
+    }
+  }
+  assert.ok(physical)
+  mkdirSync(dirname(manifest), { recursive: true })
+  writeFileSync(manifest, JSON.stringify({ commit: '639ed015397290b3745d163aafe02ffee4aa3f84', packages }))
+  const target = join(engine, 'node_modules', CLIENT_PACKAGE)
+  return { engine, manifest, report, target, physical, packageCount: packages.length }
+}
+function materialize(f) {
+  const r = command([materializer, f.engine, f.manifest, f.report])
+  assert.equal(r.status, 0, r.stdout + r.stderr)
+  return JSON.parse(readFileSync(f.report, 'utf8'))
+}
+function patchPhase(stage) {
+  const r = command([patchRunner, stage, '--apply', '--scope', 'engine', '--only', 'combo-probe-P1'])
+  assert.equal(r.status, 0, r.stdout + r.stderr)
+  assert.match(r.stdout, /combo-probe-P1/)
+}
+function writeProfiles(stage) {
+  for (const name of ['web', 'headless']) {
+    const file = join(stage, 'home/.dsh/profiles', name, 'package.json')
+    mkdirSync(dirname(file), { recursive: true })
+    writeFileSync(file, JSON.stringify({ name, dsh: { profile: { bundles: ['@deepseek-ai/dsh-' + name] } } }))
+  }
+}
+function copyRuntime(engine, stage) {
+  const target = join(stage, ENGINE_MEMBER)
+  mkdirSync(dirname(target), { recursive: true })
+  cpSync(engine, target, { recursive: true, dereference: false, verbatimSymlinks: true })
+  writeProfiles(stage)
+}
+function realArchive(stage, archive) {
+  execFileSync('tar', ['-cf', archive, '-C', stage, 'usr', 'home'])
+}
+function checkArchive(archive) {
+  const args = [phaseChecker, '--require', '--snapshot', archive, '--abi', 'arm64']
+  if (!android) return command(args)
+  // Normalize only the Android host executable for the checker's real Node child;
+  // import the unchanged checker with identical CLI argv, without mocking any gate.
+  return command(['--input-type=module', '-e',
+    'Object.defineProperty(process, "execPath", { value: ' + JSON.stringify(NODE) + ' });'
+    + 'process.argv = [process.execPath, ...process.argv.slice(1)];'
+    + 'await import(' + JSON.stringify(phaseChecker) + ');', ...args])
+}
+function prepareAssemblyBoundary(root, f) {
+  mkdirSync(join(root, 'scripts/source-build'), { recursive: true })
+  copyFileSync(materializer, join(root, 'scripts/source-build/materialize-dsh-pnpm-packages.mjs'))
+  mkdirSync(join(root, 'bin'))
+  // Only the authenticated bootstrap/download boundary is stubbed. The extracted
+  // workflow shell runs the production materializer; real tar and patcher remain real.
+  writeFileSync(join(root, 'bin/python3'), `#!${NODE}
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const { execFileSync } = require('node:child_process');
+const args = process.argv.slice(2);
+assert.deepEqual(args, ['scripts/source-build/prepare-termux-bootstrap.py',
+  '.deploy-tmp/source-build/bootstrap-aarch64.zip', '.deploy-tmp/deepseek-harness',
+  '.deploy-tmp/engine-deploy', '.deploy-tmp/arm64-base/base-usr.tar.xz']);
+const deploy = path.resolve(args[3]);
+const report = JSON.parse(fs.readFileSync('.deploy-tmp/source-build/pnpm-package-materialization.json', 'utf8'));
+assert.equal(report.packageCount, ${f.packageCount});
+assert.equal(report.convertedSymlinkCount, ${f.packageCount});
+for (const item of report.packages) {
+  const target = path.join(deploy, 'node_modules', item.name);
+  assert.ok(fs.lstatSync(target).isDirectory());
+  assert.ok(fs.lstatSync(path.join(target, 'package.json')).isFile());
+  assert.ok(fs.lstatSync(path.join(target, 'lib/index.js')).isFile());
+}
+fs.writeFileSync('bootstrap-boundary-called', deploy);
+const stage = path.resolve('bootstrap-fixture');
+const engine = path.join(stage, '${ENGINE_MEMBER}');
+fs.mkdirSync(path.dirname(engine), { recursive: true });
+fs.cpSync(deploy, engine, { recursive: true, dereference: false, verbatimSymlinks: true });
+for (const name of ['web', 'headless']) {
+  const file = path.join(stage, 'home/.dsh/profiles', name, 'package.json');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ name, dsh: { profile: { bundles: ['@deepseek-ai/dsh-' + name] } } }));
+}
+execFileSync('tar', ['-cf', path.resolve(args[4]), '-C', stage, 'usr', 'home']);
+`)
+  chmodSync(join(root, 'bin/python3'), 0o755)
+}
+
+test('source assembly executes real materialization before bootstrap, not after the strict snapshot gate', linux, () => fixture(root => {
+  const f = sourcePackageFixture(root)
+  prepareAssemblyBoundary(root, f)
+  const r = bash(assembleSourceBase, root)
+  assert.equal(r.status, 0, r.stdout + r.stderr)
+  assert.equal(readFileSync(join(root, 'bootstrap-boundary-called'), 'utf8'), f.engine)
+  assert.ok(lstatSync(join(root, 'bootstrap-fixture', PHASE_MEMBER)).isFile())
+  const beforePatch = readFileSync(join(root, 'bootstrap-fixture', PHASE_MEMBER), 'utf8')
+  assert.equal(beforePatch, readFileSync(join(clientFixture, 'lib/index.js'), 'utf8'))
+  patchPhase(join(root, 'bootstrap-fixture'))
+  const archive = join(root, 'built-phase.tar')
+  realArchive(join(root, 'bootstrap-fixture'), archive)
+  const checked = checkArchive(archive)
+  assert.equal(checked.status, 0, checked.stdout + checked.stderr)
+  for (const name of ['web', 'headless']) assert.match(checked.stdout, new RegExp('PASS  出厂 profile 清单：' + name))
+  assert.match(checked.stdout, /SKIP=0/)
+  const snapshot = step('Build runtime snapshot from verified inputs')
+  assert.ok(!snapshot.includes('materialize-dsh-pnpm-packages.mjs'))
+  assert.ok(snapshot.includes('if node scripts/build-snapshot-013.mjs arm64; then'))
+  assert.ok(snapshot.includes('node scripts/source-build/reconcile-engine-patch-copies.mjs'))
+  assert.ok(snapshot.includes('node scripts/source-build/check-dsh-source-snapshot.mjs "$snapshot_archive"'))
+  assert.equal(yaml.split('node scripts/source-build/materialize-dsh-pnpm-packages.mjs').length - 1, 1)
+  assert.ok(yaml.includes('            .deploy-tmp/source-build/pnpm-package-materialization.json'))
+  assert.equal(JSON.parse(readFileSync(f.report, 'utf8')).convertedSymlinkCount, f.packageCount)
+}))
+
+test('real pnpm archive rejects logical symlink child, then accepts the same patched bytes after materialization', linux, () => fixture(root => {
+  const f = sourcePackageFixture(root)
+  const beforeStage = join(root, 'before')
+  copyRuntime(f.engine, beforeStage)
+  patchPhase(beforeStage)
+  // Patch through the logical link succeeds on the filesystem, but tar does not
+  // synthesize child members under archived symlink directories.
+  const patched = readFileSync(join(beforeStage, PHASE_MEMBER), 'utf8')
+  const beforeArchive = join(root, 'before.tar')
+  realArchive(beforeStage, beforeArchive)
+  const logical = spawnSync('tar', ['-xO', '-f', beforeArchive, PHASE_MEMBER], { encoding: 'utf8' })
+  assert.notEqual(logical.status, 0)
+  assert.match(logical.stderr, /Not found in archive/)
+  const physicalMember = ENGINE_MEMBER + '/' + relative(f.engine, join(f.physical, 'lib/index.js')).replaceAll('\\', '/')
+  assert.equal(execFileSync('tar', ['-xO', '-f', beforeArchive, physicalMember], { encoding: 'utf8' }), patched)
+  const rejected = checkArchive(beforeArchive)
+  assert.notEqual(rejected.status, 0)
+  assert.ok(rejected.stdout.includes('缺少 ' + PHASE_MEMBER))
+  for (const name of ['web', 'headless']) assert.match(rejected.stdout, new RegExp('PASS  出厂 profile 清单：' + name))
+  const beforeEngine = join(beforeStage, ENGINE_MEMBER)
+  materialize({ ...f, engine: beforeEngine })
+  assert.ok(lstatSync(join(beforeStage, PHASE_MEMBER)).isFile())
+  assert.equal(readFileSync(join(beforeStage, PHASE_MEMBER), 'utf8'), patched)
+  const afterArchive = join(root, 'after.tar')
+  realArchive(beforeStage, afterArchive)
+  assert.equal(execFileSync('tar', ['-xO', '-f', afterArchive, PHASE_MEMBER], { encoding: 'utf8' }), patched)
+  const accepted = checkArchive(afterArchive)
+  assert.equal(accepted.status, 0, accepted.stdout + accepted.stderr)
+  assert.match(accepted.stdout, /SKIP=0/)
+}))
+
+for (const defect of ['markerless payload', 'missing phase output']) {
+  test('materialized real tar still fails strict gate for ' + defect, linux, () => fixture(root => {
+    const f = sourcePackageFixture(root)
+    materialize(f)
+    const stage = join(root, 'negative')
+    copyRuntime(f.engine, stage)
+    if (defect === 'missing phase output') {
+      patchPhase(stage)
+      const target = join(stage, PHASE_MEMBER)
+      const patched = readFileSync(target, 'utf8')
+      assert.ok(patched.includes('[perf] phase name=${phase.name}'))
+      writeFileSync(target, patched.replace('[perf] phase name=${phase.name}', '[perf] phase label=${phase.name}'))
+    }
+    const archive = join(root, 'negative.tar')
+    realArchive(stage, archive)
+    const r = checkArchive(archive)
+    assert.notEqual(r.status, 0)
+    assert.match(r.stdout, /FAIL  快照内产品 index\.js 携带当前 phase 探针/)
+    assert.match(r.stdout, /phase 签名缺失/)
+    assert.ok(!r.stdout.includes('缺少 ' + PHASE_MEMBER))
+    if (defect === 'missing phase output') assert.ok(r.stdout.includes('[perf] phase name=${phase.name}'))
+    for (const name of ['web', 'headless']) assert.match(r.stdout, new RegExp('PASS  出厂 profile 清单：' + name))
+  }))
+}
+
+test('materialization preserves local dependency precedence, store fallback, reverse links and idempotent bytes', linux, () => fixture(root => {
+  const f = sourcePackageFixture(root)
+  const peers = dirname(dirname(f.physical))
+  for (const [base, name, value] of [[join(f.physical, 'node_modules'), 'fixture-shared', 'local'],
+    [peers, 'fixture-shared', 'peer'], [peers, 'fixture-fallback', 'fallback']]) {
+    const target = join(base, name)
+    mkdirSync(target, { recursive: true })
+    writeFileSync(join(target, 'package.json'), JSON.stringify({ name, version: '1.0.0', main: 'index.cjs' }))
+    writeFileSync(join(target, 'index.cjs'), 'module.exports = ' + JSON.stringify(value) + ';\n')
+  }
+  const lookup = base => {
+    const req = createRequire(join(base, 'lib/probe.cjs'))
+    return ['fixture-shared', 'fixture-fallback'].map(name => ({ value: req(name), resolved: req.resolve(name) }))
+  }
+  const expected = lookup(f.physical)
+  assert.deepEqual(expected.map(item => item.value), ['local', 'fallback'])
+  const payload = readFileSync(join(f.target, 'lib/index.js'))
+  const converted = materialize(f)
+  assert.equal(converted.convertedSymlinkCount, f.packageCount)
+  assert.equal(converted.sourceCommit, '639ed015397290b3745d163aafe02ffee4aa3f84')
+  assert.deepEqual(lookup(f.target), expected)
+  assert.ok(lstatSync(join(f.physical, 'lib')).isSymbolicLink())
+  assert.ok(lstatSync(join(f.physical, 'package.json')).isSymbolicLink())
+  assert.equal(realpathSync(join(f.physical, 'lib/index.js')), join(f.target, 'lib/index.js'))
+  assert.deepEqual(readFileSync(join(f.physical, 'lib/index.js')), payload)
+  // The second invocation uses a distinct report so conversion evidence is not overwritten.
+  const repeated = materialize({ ...f, report: join(root, 'idempotence-report.json') })
+  assert.equal(repeated.convertedSymlinkCount, 0)
+  assert.equal(repeated.packageCount, f.packageCount)
+  assert.ok(repeated.packages.every(item => item.alreadyMaterialized))
+  assert.deepEqual(readFileSync(join(f.target, 'lib/index.js')), payload)
+  assert.deepEqual(lookup(f.target), expected)
+  assert.equal(JSON.parse(readFileSync(f.report, 'utf8')).convertedSymlinkCount, f.packageCount)
+}))
+
+test('materialization identity failure stops the actual assembly shell before bootstrap or success evidence', linux, () => fixture(root => {
+  const f = sourcePackageFixture(root)
+  prepareAssemblyBoundary(root, f)
+  writeFileSync(join(f.physical, 'package.json'), JSON.stringify({ name: CLIENT_PACKAGE, version: '0.1.7-rc.2' }))
+  const r = bash(assembleSourceBase, root)
+  assert.notEqual(r.status, 0)
+  assert.match(r.stderr, /deploy identity mismatch/)
+  assert.equal(existsSync(join(root, 'bootstrap-boundary-called')), false)
+  assert.equal(existsSync(f.report), false)
+  assert.equal(existsSync(join(root, '.deploy-tmp/arm64-base/base-usr.tar.xz')), false)
 }))
