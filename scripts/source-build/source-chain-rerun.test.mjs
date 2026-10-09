@@ -369,6 +369,79 @@ test('build entry: blank/misdirected workspace is rejected before source reset',
     assert.equal(readFileSync(join(f.source, 'source.txt'), 'utf8'), 'keep dirt')
   }
 }))
+const COMPONENT_PIN = '5349432481f8a2b865b8671bf49383c657ece0d1'
+// Byte proof from the immutable merged component commit; no remote fetch in this regression.
+const COMPONENT_LIB_SHA256 = 'd3250a6b64b5aeb89ce755a4ad4fda95aea2dc69b2cf6df8058056441b677c34'
+const component = step('Checkout pinned component sources')
+const componentStart = component.indexOf('cmp dsh-host-web-compat/lib/index.js ')
+const componentEnd = component.indexOf('\nNODE', componentStart)
+assert.ok(componentStart >= 0 && componentEnd > componentStart)
+const componentGuard = component.slice(componentStart, componentEnd + '\nNODE'.length)
+test('component fetch, checkout, HEAD assertion and provenance bind the same merged immutable commit', () => {
+  assert.ok(component.includes('fetch --depth=1 origin ' + COMPONENT_PIN))
+  assert.ok(component.includes('checkout --detach ' + COMPONENT_PIN))
+  assert.ok(component.includes('rev-parse HEAD)" = "' + COMPONENT_PIN + '"'))
+  assert.ok(component.includes("pinnedCommit: '" + COMPONENT_PIN + "'"))
+  assert.equal(component.split(COMPONENT_PIN).length - 1, 4)
+  assert.equal(component.includes('2de902729e01eb3619aa50bdfa164c5231948848'), false)
+  assert.equal(componentGuard.includes('|| true'), false)
+  const payload = readFileSync(join(ROOT, 'dsh-host-web-compat/lib/index.js'))
+  assert.equal(createHash('sha256').update(payload).digest('hex'), COMPONENT_LIB_SHA256)
+})
+function componentFixture(root) {
+  const pinned = join(root, '.deploy-tmp/component-sources/host-web-compat')
+  const mirror = join(root, 'dsh-host-web-compat')
+  const payload = readFileSync(join(ROOT, 'dsh-host-web-compat/lib/index.js'))
+  const manifest = JSON.parse(readFileSync(join(ROOT, 'dsh-host-web-compat/package.json'), 'utf8'))
+  for (const path of [pinned, mirror]) {
+    mkdirSync(join(path, 'lib'), { recursive: true })
+    writeFileSync(join(path, 'lib/index.js'), payload)
+    writeFileSync(join(path, 'package.json'), JSON.stringify(manifest))
+  }
+  mkdirSync(join(root, 'scripts/snapshot-config'), { recursive: true })
+  const overlay = join(root, 'scripts/snapshot-config/engine-overlay.json')
+  writeFileSync(overlay, JSON.stringify({ packages: { '@deepseek-ai/cordis': manifest.dependencies['@deepseek-ai/cordis'] } }))
+  return { pinned, mirror, manifest, overlay, report: join(root, '.deploy-tmp/source-build/host-web-compat-pin.json') }
+}
+for (const delta of ['none', 'declared Cordis']) {
+  test('component byte guard accepts ' + delta + ' manifest delta and records exact provenance', linux, () => fixture(root => {
+    const f = componentFixture(root)
+    if (delta === 'declared Cordis') {
+      const pinned = structuredClone(f.manifest)
+      pinned.dependencies['@deepseek-ai/cordis'] = '4.0.1'
+      writeFileSync(join(f.pinned, 'package.json'), JSON.stringify(pinned))
+    }
+    const r = bash(componentGuard, root)
+    assert.equal(r.status, 0, r.stderr)
+    const report = JSON.parse(readFileSync(f.report, 'utf8'))
+    assert.equal(report.pinnedCommit, COMPONENT_PIN)
+    assert.equal(report.pinnedLibSha256, COMPONENT_LIB_SHA256)
+    assert.equal(report.mirrorLibSha256, COMPONENT_LIB_SHA256)
+    assert.equal(report.libByteIdentical, true)
+    assert.deepEqual(report.manifestDelta['@deepseek-ai/cordis'], {
+      pinnedCommitPin: delta === 'declared Cordis' ? '4.0.1' : '4.0.4', mirrorPin: '4.0.4', engineOverlayPin: '4.0.4',
+    })
+  }))
+}
+for (const drift of ['payload byte', 'extra manifest field', 'wrong Cordis overlay', 'missing Cordis overlay']) {
+  test('component guard rejects ' + drift + ' without emitting success provenance', linux, () => fixture(root => {
+    const f = componentFixture(root)
+    if (drift === 'payload byte') {
+      const payload = readFileSync(join(f.mirror, 'lib/index.js'))
+      payload[0] ^= 1
+      writeFileSync(join(f.mirror, 'lib/index.js'), payload)
+    }
+    if (drift === 'extra manifest field') writeFileSync(join(f.mirror, 'package.json'), JSON.stringify({ ...f.manifest, version: '0.1.14' }))
+    if (drift === 'wrong Cordis overlay') writeFileSync(f.overlay, JSON.stringify({ packages: { '@deepseek-ai/cordis': '4.0.3' } }))
+    if (drift === 'missing Cordis overlay') writeFileSync(f.overlay, JSON.stringify({ packages: {} }))
+    const r = bash(componentGuard, root)
+    assert.notEqual(r.status, 0)
+    if (drift === 'payload byte') assert.match(r.stdout + r.stderr, /differ/)
+    else if (drift === 'missing Cordis overlay') assert.match(r.stderr, /does not pin/)
+    else assert.match(r.stderr, /differs from the pinned component commit/)
+    assert.equal(existsSync(f.report), false)
+  }))
+}
 test('deploy cleanup is scoped and rejects empty workspace and linked parent', linux, () => fixture(root => {
   const harness = step('Build and pack DeepSeek Harness from source')
   const cleanupStart = harness.indexOf('# Refuse an empty/misdirected workspace or symlinked staging parent before cleanup.')
