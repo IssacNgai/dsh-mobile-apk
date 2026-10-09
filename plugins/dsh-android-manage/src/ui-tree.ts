@@ -17,7 +17,7 @@ export interface UiNode {
   parentId: string
   text: string
   desc: string
-  /** resource-id（截 60）。 */
+  /** 原始 resource-id，完整保留；空串表示源节点未提供，禁止合成。 */
   rid: string
   /** class 短名（截 24）。 */
   type: string
@@ -34,6 +34,9 @@ export interface UiNode {
   scrollable: boolean
   editable: boolean
   checked: boolean
+  enabled: boolean
+  /** true/false only from explicit source metadata; null means unknown. */
+  password: boolean | null
   /** 节点是否对用户可见（`visible-to-user != false`；用于判断遮挡/滚动容器外）。 */
   visible: boolean
   /** 所属应用包名（多窗口/浮窗归属；XML 路径为空）。 */
@@ -205,8 +208,12 @@ export function pruneNodes(
     rawCount++
     parentByOrig.set(r.id, r.parentId)
     const at = r.attrs
-    const bounds = parseBounds(at.bounds)
-    if (!bounds) continue
+    const rid = decodeEntities(at['resource-id'] ?? '')
+    const password = at.password === 'true' ? true : at.password === 'false' ? false : null
+    const identityRelevant = rid !== '' || at.editable === 'true' || password === true
+    const box = parseBoundsToBox(at.bounds)
+    if (!identityRelevant && (box.w <= 0 || box.h <= 0)) continue
+    const bounds = { ...box, cx: box.x + Math.floor(box.w / 2), cy: box.y + Math.floor(box.h / 2) }
     const text = decodeEntities(at.text ?? '').trim()
     const desc = decodeEntities(at['content-desc'] ?? '').trim()
     const clickable = at.clickable === 'true'
@@ -215,14 +222,16 @@ export function pruneNodes(
     // 0.13.5：不再按「可交互或带标签」剪枝——完整暴露（容器/无标签节点同样给模型，
     // 复杂界面靠结构定位；去重仍保留，避免同一位置同内容的重复行）。
     const dedupeKey = [text, desc, at.class ?? '', bounds.cx, bounds.cy].join('|')
-    if (seen.has(dedupeKey)) continue
-    seen.add(dedupeKey)
+    if (!identityRelevant) {
+      if (seen.has(dedupeKey)) continue
+      seen.add(dedupeKey)
+    }
     nodes.push({
       id: r.id,
       parentId: r.parentId,
       text: clip(text, limits.maxText),
       desc: clip(desc, limits.maxDesc),
-      rid: clip(decodeEntities(at['resource-id'] ?? ''), limits.maxRid),
+      rid,
       type: clip((at.class ?? '').split('.').pop() ?? '', limits.maxType),
       x: bounds.cx - Math.floor(bounds.w / 2),
       y: bounds.cy - Math.floor(bounds.h / 2),
@@ -235,6 +244,8 @@ export function pruneNodes(
       scrollable,
       editable,
       checked: at.checked === 'true',
+      enabled: at.enabled !== 'false',
+      password,
       visible: at['visible-to-user'] !== 'false',
       pkg: at.package ?? '',
       windowId: at['window-id'] ?? '',

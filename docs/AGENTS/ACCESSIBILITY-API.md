@@ -148,7 +148,7 @@ javap 校验 android-36 的 `android.jar`，`AccessibilityNodeInfo` 无该符号
 | 能力 | 落点 |
 |---|---|
 | 服务与能力声明 | `app/src/main/AndroidManifest.xml`（`DeviceControlService`）+ `res/xml/accessibility_service_config.xml` |
-| 树快照（路径 id + attrs 同构 uiautomator XML） | `DeviceControlService.buildSnapshot()` / `nodeAtPath()` |
+| 树快照（V2 原始行句柄、显式 password 三态、所选根证据） | `DeviceControlService.buildSnapshot()` / `ControlProtocolV2.encode()`；`SnapshotTraversalBudget` 统计全部访问节点，`SnapshotWindowScope` 登记窗口库存，`SnapshotFreshness` 防止建树覆盖新事件失效 |
 | 动作（click/setText/scroll/global/screenshot） | `DeviceControlService.handle*()` |
 | 屏幕范围失败关闭 | `ScreenScopePrefs` + `DeviceControlService.realScreenScopeError()`；每次 real op 重查，切换范围使旧 snapshot/ref 失效；`virtual-1` 未 ready 时不映射 display 0 |
 | 队列客户端（长轮询 + 心跳 + 回填） | `ControlPoller.kt` |
@@ -156,14 +156,16 @@ javap 校验 android-36 的 `android.jar`，`AccessibilityNodeInfo` 无该符号
 | 桥方法 | `AndroidBridge.a11yStatus()/openA11ySettings()/unlockRestrictedSettings()`（MainActivity 接线） |
 | 引擎侧门禁与路由 | 协调仓 `plugins/dsh-android-bridge/src/control-policy.ts` / `control-queue.ts`；工具面在 `plugins/dsh-android-manage` |
 
-## 7. 状态与待办（2026-09-14 对账）
+## 7. 状态与待办（0.14.5 Jev 源码对账，未替代设备验收）
 
 已完成：服务 + 能力声明、树快照、click/setText/scroll/global、队列长轮询 + 心跳、门禁双通道、
 设置页无障碍优先、`takeScreenshot`（设备实测通过）、**全局动作面由 `getSystemActions()` 驱动**
 （0.13.8 E6，`GlobalActionCatalog`）、**无障碍截屏失败回落 ADB**（E6）、**屏幕范围执行点复查**
 （`ScreenScopePrefs` + `DeviceControlService.realScreenScopeError`）。
 
+本轮源码增量：`pwv:1` / `pw` 保留平台 `isPassword` 的 `true/false/null`（未知不推断为 false）；隐藏/零面积的 RID、editable、password=true 节点保留用于身份与重复计数，句柄仍是原始行号。`truncated:false` 仅证明所选窗口根遍历完整，不证明其他窗口；`snapshotScope` 与权限 `scope` 是不同字段，其 `inventoryComplete:true` 要求真实屏前后库存一致、事件纪元稳定且唯一窗口为选中的 `TYPE_APPLICATION`，输入法/系统/覆盖窗口不会被先过滤掉。窗口/内容/滚动/文本/交互窗口集合事件均失效，动作前复查已送达事件纪元；XML 的 200ms 事件通知节流与检查到动作之间的竞态仍需最终产物验收。完整协议与严格输入契约见 `BRIDGE-API.md`，实际验收状态见 `known-gaps.md`。
+
 待办：① ~~无障碍输入法~~ **已核实不可用**（android-36 无符号）；② ~~`getSystemActions()` 驱动全局动作面~~ **已落地**；
 ③ 长按已接，展开/折叠/复制/翻页/拖拽等节点动作仍未暴露给模型；④ `takeScreenshotOfWindow`(34) 单窗口观察未接；
-⑤ 多窗口 `getWindows()` 的窗口选择面未接；⑥ 回落 ADB 路径只在本机 API 35 验过「无障碍可用」分支，API<30 真机回落未验。
+⑤ 多窗口选择已接 `rootProbe/getWindowsOnAllDisplays/WindowPick.order`（API 30+ 虚拟屏，钉住建树窗口）；这不是跨窗口合并树，也不证明多窗口唯一身份；⑥ 回落 ADB 路径只在本机 API 35 验过「无障碍可用」分支，API<30 真机回落未验。
 完整缺口清单维护在 `known-gaps.md`（本文件只登记 API 参考与实现映射）。

@@ -119,20 +119,32 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Fail closed on inherited Git redirection, before clone/fetch/reset can touch another tree.
+          test -z "${GIT_DIR+x}${GIT_WORK_TREE+x}${GIT_INDEX_FILE+x}${GIT_COMMON_DIR+x}${GIT_OBJECT_DIRECTORY+x}${GIT_ALTERNATE_OBJECT_DIRECTORIES+x}${GIT_NAMESPACE+x}${GIT_CONFIG+x}${GIT_CONFIG_COUNT+x}${GIT_CONFIG_PARAMETERS+x}"
+          workspace=$(realpath .)
+          test ! -L .deploy-tmp
           mkdir -p .deploy-tmp
-          # 已存在则复用：CI 每轮全新目录，本地复跑却会撞 `destination path already exists`。
-          # 下面几条 fetch/checkout 本身幂等，只有 clone 不是，故只守这一条。
-          if [ ! -d .deploy-tmp/deepseek-harness/.git ]; then
-            git clone --filter=blob:none --no-checkout --depth=1 https://github.com/deepseek-ai/deepseek-harness.git .deploy-tmp/deepseek-harness
+          test "$(realpath .deploy-tmp)" = "$workspace/.deploy-tmp"
+          source="$workspace/.deploy-tmp/deepseek-harness"
+          test ! -L "$source"
+          # Reuse only an ordinary dedicated checkout; a gitfile/linked worktree is not this cache.
+          if [ ! -e "$source" ]; then
+            git clone --filter=blob:none --no-checkout --depth=1 https://github.com/deepseek-ai/deepseek-harness.git "$source"
           fi
-          git -C .deploy-tmp/deepseek-harness fetch --depth=1 origin 639ed015397290b3745d163aafe02ffee4aa3f84
-          git -C .deploy-tmp/deepseek-harness fetch --depth=1 origin refs/tags/dsh-v0.2.0-rc.2:refs/tags/dsh-v0.2.0-rc.2
-          # A previous interrupted build may have modified tracked inputs before this checkout.
-          # Reset only this dedicated source checkout; preserve ignored dependency caches.
-          test "$(realpath .deploy-tmp/deepseek-harness)" = "$(realpath .)/.deploy-tmp/deepseek-harness"
-          git -C .deploy-tmp/deepseek-harness checkout -- .
-          git -C .deploy-tmp/deepseek-harness clean -fdq
-          git -C .deploy-tmp/deepseek-harness checkout --detach 639ed015397290b3745d163aafe02ffee4aa3f84
+          # BEGIN dedicated Harness checkout validation (also required for --from harness).
+          test "$(realpath "$source")" = "$workspace/.deploy-tmp/deepseek-harness"
+          test -d "$source/.git" && test ! -L "$source/.git"
+          test "$(git -C "$source" rev-parse --show-toplevel)" = "$source"
+          test "$(git -C "$source" rev-parse --absolute-git-dir)" = "$source/.git"
+          test "$(realpath "$(git -C "$source" rev-parse --path-format=absolute --git-common-dir)")" = "$source/.git"
+          test ! -L "$source/.git/index"
+          # END dedicated Harness checkout validation.
+          git -C "$source" fetch --depth=1 origin 639ed015397290b3745d163aafe02ffee4aa3f84
+          git -C "$source" fetch --depth=1 origin refs/tags/dsh-v0.2.0-rc.2:refs/tags/dsh-v0.2.0-rc.2
+          # BEGIN pinned Harness reset: initialize an empty/unborn index and discard staged dirt.
+          git -C "$source" checkout --force --detach 639ed015397290b3745d163aafe02ffee4aa3f84
+          git -C "$source" clean -fdq
+          # END pinned Harness reset. No -x: retain ignored dependency/build caches.
           test "$(git -C .deploy-tmp/deepseek-harness rev-parse HEAD)" = "639ed015397290b3745d163aafe02ffee4aa3f84"
           test "$(git -C .deploy-tmp/deepseek-harness describe --tags --always)" = "dsh-v0.2.0-rc.2"
           node -e 'const c=require("./scripts/contract.json"); if(c.upstreamRepo!==".deploy-tmp/deepseek-harness" || c.baseline!=="0.2.0-rc.2" || c.upstream.commit!=="639ed015397290b3745d163aafe02ffee4aa3f84") throw Error("source workflow identity does not match contract")'
@@ -147,9 +159,9 @@ jobs:
           if [ ! -d .deploy-tmp/component-sources/host-web-compat/.git ]; then
             git clone --filter=blob:none --no-checkout --depth=1 https://github.com/kelai141/dsh-host-web-compat.git .deploy-tmp/component-sources/host-web-compat
           fi
-          git -C .deploy-tmp/component-sources/host-web-compat fetch --depth=1 origin 2de902729e01eb3619aa50bdfa164c5231948848
-          git -C .deploy-tmp/component-sources/host-web-compat checkout --detach 2de902729e01eb3619aa50bdfa164c5231948848
-          test "$(git -C .deploy-tmp/component-sources/host-web-compat rev-parse HEAD)" = "2de902729e01eb3619aa50bdfa164c5231948848"
+          git -C .deploy-tmp/component-sources/host-web-compat fetch --depth=1 origin 5349432481f8a2b865b8671bf49383c657ece0d1
+          git -C .deploy-tmp/component-sources/host-web-compat checkout --detach 5349432481f8a2b865b8671bf49383c657ece0d1
+          test "$(git -C .deploy-tmp/component-sources/host-web-compat rev-parse HEAD)" = "5349432481f8a2b865b8671bf49383c657ece0d1"
           cmp dsh-host-web-compat/lib/index.js .deploy-tmp/component-sources/host-web-compat/lib/index.js
           mkdir -p .deploy-tmp/source-build
           node <<'NODE'
@@ -187,7 +199,7 @@ jobs:
           }
           const report = {
             repository: 'https://github.com/kelai141/dsh-host-web-compat',
-            pinnedCommit: '2de902729e01eb3619aa50bdfa164c5231948848',
+            pinnedCommit: '5349432481f8a2b865b8671bf49383c657ece0d1',
             pinnedLibSha256: sha256(`${pinnedRoot}/lib/index.js`),
             mirrorLibSha256: sha256(`${mirrorRoot}/lib/index.js`),
             libByteIdentical: true,
@@ -225,15 +237,34 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # A stage-only rerun must validate its checkout independently of the source-fetch step.
+          test -z "${GIT_DIR+x}${GIT_WORK_TREE+x}${GIT_INDEX_FILE+x}${GIT_COMMON_DIR+x}${GIT_OBJECT_DIRECTORY+x}${GIT_ALTERNATE_OBJECT_DIRECTORIES+x}${GIT_NAMESPACE+x}${GIT_CONFIG+x}${GIT_CONFIG_COUNT+x}${GIT_CONFIG_PARAMETERS+x}"
+          test -n "$GITHUB_WORKSPACE"
+          workspace=$(realpath "$GITHUB_WORKSPACE")
+          test "$(realpath .)" = "$workspace"
+          test ! -L .deploy-tmp
+          test "$(realpath .deploy-tmp)" = "$workspace/.deploy-tmp"
+          source="$workspace/.deploy-tmp/deepseek-harness"
+          test ! -L "$source"
+          # BEGIN dedicated Harness checkout validation (also required for --from harness).
+          test "$(realpath "$source")" = "$workspace/.deploy-tmp/deepseek-harness"
+          test -d "$source/.git" && test ! -L "$source/.git"
+          test "$(git -C "$source" rev-parse --show-toplevel)" = "$source"
+          test "$(git -C "$source" rev-parse --absolute-git-dir)" = "$source/.git"
+          test "$(realpath "$(git -C "$source" rev-parse --path-format=absolute --git-common-dir)")" = "$source/.git"
+          test ! -L "$source/.git/index"
+          # END dedicated Harness checkout validation.
+          # BEGIN pinned Harness reset: initialize an empty/unborn index and discard staged dirt.
+          git -C "$source" checkout --force --detach 639ed015397290b3745d163aafe02ffee4aa3f84
+          git -C "$source" clean -fdq
+          # END pinned Harness reset. No -x: retain ignored dependency/build caches.
+          test "$(git -C "$source" rev-parse HEAD)" = "639ed015397290b3745d163aafe02ffee4aa3f84"
+          test "$(git -C "$source" describe --tags --always)" = "dsh-v0.2.0-rc.2"
           mkdir -p "$GITHUB_WORKSPACE/.deploy-tmp/source-build"
           # Previous stage interruption may leave the project overlay in its source-only form.
           # Regenerate from the immutable audited project commit, not the previous run artifact.
           git show "$GITHUB_SHA:scripts/snapshot-config/engine-overlay.json" > scripts/snapshot-config/engine-overlay.json
-          cd .deploy-tmp/deepseek-harness
-          # Reset only the dedicated build checkout on rerun; retain ignored caches.
-          # All vendor sources now follow the official target; no older commit is staged.
-          git checkout -- .
-          git clean -fdq
+          cd "$source"
           corepack enable
           corepack pnpm install --frozen-lockfile
           test "$(corepack pnpm --version)" = "11.7.0"
@@ -637,6 +668,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # The snapshot builder runs strict tar-member checks before it returns.
+          # Materialize source payloads before bootstrap preserves the deploy links;
+          # doing this after build-snapshot is too late for those archive gates.
+          node scripts/source-build/materialize-dsh-pnpm-packages.mjs \
+            .deploy-tmp/engine-deploy \
+            .deploy-tmp/engine-overlay/source-build-manifest.json \
+            .deploy-tmp/source-build/pnpm-package-materialization.json
           mkdir -p .deploy-tmp/arm64-base
           python3 scripts/source-build/prepare-termux-bootstrap.py \
             .deploy-tmp/source-build/bootstrap-aarch64.zip \
@@ -709,10 +747,6 @@ jobs:
           node scripts/source-build/reconcile-engine-patch-copies.mjs \
             .deploy-tmp/snapshot-013/arm64/stage/root/usr/lib/node_modules/@deepseek-ai/dsh \
             .deploy-tmp/source-build/engine-patch-copy-reconciliation.json
-          node scripts/source-build/materialize-dsh-pnpm-packages.mjs \
-            .deploy-tmp/snapshot-013/arm64/stage/root/usr/lib/node_modules/@deepseek-ai/dsh \
-            .deploy-tmp/engine-overlay/source-build-manifest.json \
-            .deploy-tmp/source-build/pnpm-package-materialization.json
           snapshot_archive="$GITHUB_WORKSPACE/.deploy-tmp/snapshot-013/arm64/snapshot.tar.xz"
           snapshot_repacked="$GITHUB_WORKSPACE/.deploy-tmp/snapshot-013/arm64/snapshot.source-built.tar.xz"
           (

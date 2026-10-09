@@ -1,6 +1,7 @@
 package com.dsharnessmobile.shell
 
 import org.json.JSONObject
+import org.json.JSONArray
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -24,7 +25,10 @@ class ControlProtocolV2Test {
   /** canonical-rows.json → 壳侧 Row 表（path/childPath 只用于动作寻址，编码不使用）。 */
   private fun rowsFromFixture(): Pair<List<ControlProtocolV2.Row>, JSONObject> {
     val canonical = JSONObject(resource("canonical-rows.json"))
-    val arr = canonical.getJSONArray("rows")
+    return rowsFromArray(canonical.getJSONArray("rows")) to canonical
+  }
+
+  private fun rowsFromArray(arr: JSONArray): List<ControlProtocolV2.Row> {
     val rows = ArrayList<ControlProtocolV2.Row>(arr.length())
     for (i in 0 until arr.length()) {
       val r = arr.getJSONObject(i)
@@ -41,10 +45,11 @@ class ControlProtocolV2Test {
           windowId = r.getString("windowId"),
           text = r.getString("text"),
           desc = r.getString("desc"),
+          password = if (r.has("password") && !r.isNull("password")) r.getBoolean("password") else null,
         ),
       )
     }
-    return rows to canonical
+    return rows
   }
 
   @Test
@@ -85,8 +90,8 @@ class ControlProtocolV2Test {
       height = canonical.getJSONObject("screen").getInt("h"),
     )
     val bytes = payload.toString().toByteArray(Charsets.UTF_8).size
-    // 冻结基线 4,704 B ±10%（与 TS 侧同口径；超限即「报文胖回去了」）
-    assertTrue("V2 载荷 $bytes B 超出基线 4,704 B ±10%", bytes in 4234..5174)
+    // 冻结基线 5,055 B ±10%（与 TS 侧同口径；超限即「报文胖回去了」）
+    assertTrue("V2 载荷 $bytes B 超出基线 5,055 B ±10%", bytes in 4550..5560)
   }
 
   @Test
@@ -114,6 +119,56 @@ class ControlProtocolV2Test {
     )
     assertEquals(0, ControlProtocolV2.encode(zero, "all", 7L, 0, 100, 200).getInt("n"))
     assertEquals("target 口径下零尺寸同样不入集（不可点）", 0, ControlProtocolV2.encode(zero, "target", 7L, 0, 100, 200).getInt("n"))
+  }
+
+  @Test
+  fun passwordIdentityGoldensMatchNativeEncoder() {
+    val fixtures = JSONArray(resource("password-v1-golden.json"))
+    for (i in 0 until fixtures.length()) {
+      val f = fixtures.getJSONObject(i)
+      val rows = rowsFromArray(f.getJSONArray("rows"))
+      val wire = ControlProtocolV2.encode(rows, "all", 7L, 0, 1000, 2000)
+      assertTrue(f.getString("name"), wire.similar(f.getJSONObject("wire")))
+      val expected = f.getJSONArray("expected")
+      val pw = wire.getJSONArray("pw")
+      val rids = wire.getJSONArray("r")
+      for (j in 0 until expected.length()) {
+        val e = expected.getJSONObject(j)
+        assertEquals(e.get("password"), pw.get(if (pw.length() == 1) 0 else j))
+        val index = rids.getInt(if (rids.length() == 1) 0 else j)
+        assertEquals(e.getString("rid"), if (index < 0) "" else wire.getJSONArray("str").getString(index))
+        assertEquals(e.getInt("originalRow"), wire.getJSONArray("o").getInt(j))
+      }
+    }
+  }
+
+  @Test
+  fun identitySurvivesBothViewsWithoutDedupOrRidTrimming() {
+    val rid = "pkg:id/" + "q".repeat(200)
+    fun row(depth: Int, id: String = "", flag: Int = 0, password: Boolean? = null) =
+      ControlProtocolV2.Row("0", IntArray(0), depth, 0, 0, 0, 0, flag, "View", "p", id, "7", "", "", password)
+    val editable = row(1, rid, 4, false)
+    val rows = listOf(row(0), row(1), editable, editable, row(1, password = true))
+    for (view in listOf("all", "target")) {
+      val wire = ControlProtocolV2.encode(rows, view, 7L, 0, 1000, 2000, truncated = true)
+      assertEquals(listOf(0, 2, 3, 4), (0 until wire.getJSONArray("o").length()).map { wire.getJSONArray("o").getInt(it) })
+      assertTrue(wire.getBoolean("truncated"))
+      val idx = wire.getJSONArray("r").getInt(1)
+      assertEquals(rid, wire.getJSONArray("str").getString(idx))
+    }
+  }
+
+  @Test
+  fun editableRawTextPreservesWhitespaceWhileLabelsStillTrim() {
+    for (text in listOf(" 你好，我是JEV ", "   ", "\tquery\n")) {
+      fun row(editable: Boolean) = ControlProtocolV2.Row("0", IntArray(0), 0, 0, 0, 100, 40,
+        if (editable) 148 else 144, "android.widget.EditText", "p", "p:id/query", "7", text, "", false)
+      val wire = ControlProtocolV2.encode(listOf(row(true)), "all", 7L, 0, 100, 200)
+      assertEquals(text, wire.getJSONArray("str").getString(wire.getJSONArray("t").getInt(0)))
+      val label = ControlProtocolV2.encode(listOf(row(false)), "all", 7L, 0, 100, 200)
+      val index = label.getJSONArray("t").getInt(0)
+      assertEquals(text.trim(), if (index == -1) "" else label.getJSONArray("str").getString(index))
+    }
   }
 
   @Test

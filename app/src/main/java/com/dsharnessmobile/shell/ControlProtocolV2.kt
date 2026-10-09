@@ -77,8 +77,11 @@ object ControlProtocolV2 {
     val windowId: String,
     val text: String,
     val desc: String,
+    /** Direct platform isPassword reading; null means unavailable, never inferred false. */
+    val password: Boolean? = null,
   ) {
     val hasArea: Boolean get() = w > 0 && h > 0
+    val identityRelevant: Boolean get() = rid.isNotEmpty() || (flag and F_EDITABLE) != 0 || password == true
     val actionable: Boolean
       get() = (flag and (F_CLICKABLE or F_EDITABLE or F_SCROLLABLE)) != 0
   }
@@ -90,6 +93,7 @@ object ControlProtocolV2 {
    * 列式编码（§S2.3）。`view="all"`（默认，C4 定例）＝正尺寸节点 ∪ 其全部祖先，再做「仅叶子去重」；
    * `view="target"` ＝ 正尺寸且（可操作 ∪ 有 text/desc）的节点 ∪ 其全部祖先。
    *
+   * Both views retain every RID/editable/password row, including hidden/zero-area duplicates.
    * 纯函数：输入行表 + 口径，输出 JSONObject——不依赖 AccessibilityService，故可被 JVM 单测覆盖
    * （跨语言往返门禁的可测性前提）。
    */
@@ -115,7 +119,7 @@ object ControlProtocolV2 {
       } else {
         all[i].hasArea
       }
-      if (inSet) {
+      if (inSet || all[i].identityRelevant) {
         keep[i] = true
         for (a in ancStack) keep[a] = true
       }
@@ -146,7 +150,7 @@ object ControlProtocolV2 {
     for (i in 0 until n) {
       if (!keep[i]) continue
       val leafInSet = nextKept[i] >= subtreeEnd[i]
-      if (leafInSet) {
+      if (leafInSet && !all[i].identityRelevant) {
         val r = all[i]
         val key = r.text + "\u0000" + r.desc + "\u0000" + r.cls + "\u0000" +
           (r.x + r.w / 2) + "\u0000" + (r.y + r.h / 2)
@@ -193,7 +197,7 @@ object ControlProtocolV2 {
       k.add(sym(row.pkg))
       r.add(sym(row.rid))
       w.add(sym(row.windowId))
-      t.add(sym(row.text.trim()))
+      t.add(sym(if (row.flag and F_EDITABLE != 0) row.text else row.text.trim()))
       s.add(sym(row.desc.trim()))
       stk.addLast(fi)
     }
@@ -220,7 +224,14 @@ object ControlProtocolV2 {
       .put("w", broadcast(w))
       .put("t", broadcast(t))
       .put("s", broadcast(s))
-      .apply { if (truncated) put("truncated", true) } // E2 建树预算：部分树显式标注
+      .put("pwv", 1)
+      .put("pw", passwordColumn(out.map { all[it].password }))
+      .put("truncated", truncated) // Explicit false proves only the selected-root traversal completed.
+  }
+
+  private fun passwordColumn(values: List<Boolean?>): JSONArray {
+    val compact = if (values.size > 1 && values.all { it == values[0] }) values.take(1) else values
+    return JSONArray().apply { for (value in compact) put(value ?: JSONObject.NULL) }
   }
 
   /** 常数广播（§S2.3 D3）：整列同值且 n>1 时只发 1 个元素；`b` 不参与（长度固定 4n）。 */

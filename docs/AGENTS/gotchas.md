@@ -1235,7 +1235,7 @@
 222. **Harness 构建步不复位固定 checkout：中途被杀后复跑会在全仓类型检查处假红（2026-09-29，本地链实测）**：
     **现象**：本地链复跑时 Harness 构建步报 `packages/llm/llm-deepseek/src/host.ts(41,10): error TS2345: ... '"loader/volatile-update"' ...`（`llm-pi-ai` 同型），看着像上游源码不兼容。
     **真因**：该步的顺序是「先全仓 `tsc -b tsconfig.host.json` → 再替换五个旧版 Cordis 源码 → 再单独编译旧版包」（坑 187 定的口径）。上一轮若在**替换之后**被杀，工作区就停在替换态；这一轮的全仓检查于是拿**当前**源码去配**旧版** loader，`loader/volatile-update` 之类事件自然不在旧版 `Events` 里 ⇒ 假红。CI 每轮全新检出，所以从未暴露。
-    **修法**：取源 detach 前与构建步首都复位专用 checkout（`git checkout -- .` + `git clean -fdq`，不带 `-x`，保留忽略依赖缓存）；构建步同时从本次 `GITHUB_SHA` 恢复权威 overlay 输入，避免上轮停在第一方 pin 已摘除的阶段而无法续跑。清理前验证 realpath 未脱离专用工作区。
+    **修法**：取源与构建步首都复位专用 checkout（现为验证物理路径/Git 归属后 `git checkout --force --detach <固定 commit>` + `git clean -fdq`，不带 `-x`，保留忽略依赖缓存；空 index 与已暂存覆盖的补充根因见坑 266）；构建步同时从本次 `GITHUB_SHA` 恢复权威 overlay 输入，避免上轮停在第一方 pin 已摘除的阶段而无法续跑。清理前验证 realpath 未脱离专用工作区。
     **为什么记进坑位**：与坑 220/221 同族——**「可被杀」是本地跑链的常态**（关机、换盘、手停），因此每个「先改后还原」的步骤都要自带复位；判据仍是「同一工作区连跑两次都绿」。此坑尤其阴：报错文本指向源码不兼容，容易误导人去查上游。
 
 223. **`pnpm deploy` 目标目录非空，本地复跑必判红（2026-09-29，本地链实测）**：
@@ -1532,3 +1532,35 @@
     ② `ConvertFrom-Json` 的日期字段**默认就是 DateTime**，要字符串比较就显式 `.ToString('yyyy-MM-dd')`；
     ③ **执行输出与计划不一致时必须当场停手查**——我这次看到了 `62 ≠ 49` 却继续，这正是本仓反复出现的
        「输出看起来正常，但它证明的事情是假的」同一形态，只不过这次是我自己造的。
+
+264. **Jev 严格输入不能把“画面完整/参数 schema 新了”当成原生身份已验证（0.14.5 源码修订，设备验收待补）**：
+    **现象**：旧 V2 没有明确 password 元数据时，absent bit 容易被当 false；隐藏/零面积节点被呈现剪掉，重复 RID 看似唯一；遍历超预算却仍报完整、建树清掉期间事件，旧目标可能获得假新鲜度。更隐蔽的是 `defineTool` 根参数开放，旧工具体可忽略 strictIdentity，output 的未知回执拒绝发生在动作后，不能保护派发。
+    **真因**：呈现裁剪不是身份库存，所选根完整不是全屏窗口完整；缓存/代次不是绝对实时性；消费者支持新字段不是旧 native 能力握手，动作被接受也不是文字等值回读。RID 必须来自平台，不能由文本/路径派生。
+    **修法**：native 保留 `true/false/null` password 与原始行号/隐藏身份行；budget 统计全部访问，getter/null child/节点深度时间耗尽失败关闭；capture/publish 事件纪元不覆盖建树中失效；前后未过滤窗口库存只证明唯一选中 application。manage 从缓存检查 native `strictInputIdentity:1`、完整证据和原始节点后才派发闭合 strict 对象；native 保持原 row/gen，在聚焦前后各从新根全量计同 RID，校验完整 native class/password:false，不走存储节点/路径/指纹恢复与 Web/ADB 回退。严格写入需 `strictIdentityVerified:true`；editable V2 text 保留前后空白。
+    **复验证据与边界**：本轮按保存的 `SnapshotTraversalBudget` / `SnapshotFreshness` / `SnapshotWindowScope` / `StrictInputIdentity`、service 与 manage/protocol 源码对账；门禁执行结果由本轮报告记录，不能借旧 host 绿或旧 APK 冒称完成。200ms 事件通知节流、未送达事件、检查→动作非原子竞态、最终 native/同产物 CDP/ADB/真机均仍需验证。详见 `BRIDGE-API.md` 当前契约与 `known-gaps.md` 验收入口。
+
+265. **闭合嵌套输入揭示输出门禁的样本生成缺陷，不能放宽 schema 或预算遮掉（strictIdentity CI 修复）**：
+    **现象**：输出 schema 门禁在工具执行前报 strictIdentity 六个必填子字段缺席；wire 门禁同时超限。工具/native 单测通过不等于这些集成门禁通过。
+    **真因**：通用生成器把编译后对象的 `required:[keys]` 当 truthy 的根字段必填标记，却只为对象生成 `{}`，还忽略 `const`。因此可选 strictIdentity 被意外加入，再被引擎输入校验拒绝；正确的闭合 schema 反而暴露了门禁自身的 bug。预算计算是序列化 UTF-16 码元代理量，必须按现有口径压缩重复文案。
+    **修法**：共享样本模块递归填必填子字段，`const` 优先于 enum/default，严格区分 `required:true` 与父对象必填数组；显式增加可选对象分支，并在 execute 前用引擎校验器验证每组输入。只缩短 android_ui_input 参数说明，保留闭合身份对象、native 能力/回执要求与原预算。helper 纳入镜像清单，不代表对端仓已经同步。
+    **复验证据与边界**：manage 输出 schema 套件新增通用深层对象、常量优先级、真实 strictIdentity 合法/缺字段/错类型/错常量/额外键反证，以及缺原生证据时零动作拒绝回执；直接执行该套件通过。标准 gate 的宿主 wrapper 限制与其余执行结果由本轮报告分列，不作设备/native 成功声明。运行入口见 `build-and-env.md` §3.2。
+
+266. **`--no-checkout` 新仓的空 index 不能用路径 checkout 复位，已暂存覆盖也不会恢复上游（来源 run 37965315800）**：
+    **现象**：首轮 ARM64 来源链 clone/fetch 固定 commit/tag 后，`git checkout -- .` 报 `pathspec '.' did not match any file(s) known to git`，构建尚未开始即退出 1。旧回归只造已提交且未暂存变更的工作树，没覆盖真实 no-checkout 空 index。
+    **真因**：路径 checkout 从 index 恢复，不会用 HEAD 填充空 index；已暂存的替换也会被当作恢复来源，构建阶段同一命令在中断复跑时同样不可靠。对当前 HEAD 做 reset 还可能保留错误来源版本。
+    **修法**：取源和 Harness 阶段入口独立验证专用物理目录、普通 `.git`、Git toplevel/gitdir/common-dir 与 index 链接，先拒绝已设置的 Git 重定向环境（空值也拒绝，不悄悄清空），再 `checkout --force --detach` 到原有固定 commit，最后 `clean -fdq` 清非忽略残留；不带 `-x`，不改 tag/contract/manifest 断言，也不以 `|| true` 或可变版本绕过。守卫在复用仓 fetch 之前执行；阶段入口在恢复项目 overlay 和安装依赖之前执行。
+    **复验证据与边界**：`source-chain-rerun.test.mjs` 抽实际 workflow 命令，用本地 fixture repo/no-checkout clone 重现原失败，并覆盖空 index、unborn HEAD、暂存/未暂存/删除/新增/冲突、中断后两次运行、ignored 依赖保留、缺 commit 和路径/gitdir/worktree/环境重定向拒绝。fixture 仅替换 URL 和 SHA，不联网；命令与结果由本轮报告记录。局部 Git/静态门禁不代表远端完整来源构建、APK、设备或发布已通过。
+
+267. **隔离 fixture 的 PATH 不能遗漏 setup-node toolcache（PR Gate 37967473053）**：新增完整取源回归执行真实 `node -e` contract/manifest 断言，但 Linux fixture 原本只有 `/usr/bin:/bin`，云端这两处没有 Node，七项回归报 `node: command not found`；Android 保留宿主 PATH 因而本地通过不能覆盖该错误。修法只把当前 `process.execPath` 所在目录加入 Linux fixture PATH 前缀，仍保留隔离 HOME/Git 配置及 file-only 协议，不引入任意宿主 PATH 或跳过断言。复验证据由修复提交的 PR Gate 记录；不代表 APK 或设备已通过。
+
+268. **组件镜像已同步失败契约，但来源 workflow 仍钉旧提交，逐字节门禁应当拒绝（ARM64 run 37968622841）**：
+    **现象**：`Checkout pinned component sources` 成功 fetch/detach `2de902729e01eb3619aa50bdfa164c5231948848`，紧接着 `cmp lib/index.js` 在 byte 10619 / line 105 判红退出；不是 checkout、网络或行尾噪声。
+    **真因**：APK 镜像已包含 10 月 5 日组件 PR 19 的 `[dsh-boot-failed]` 契约、失败投影判据与 `publishReady()` 排除 boot 页，workflow 却仍用 9 月白闪修复的旧 pin。旧 payload 61809 bytes / SHA-256 `e5b13f35bc905da0aa9ca13f1255719fbe9a7f64436e9d4ec9d74f3e90d0cbd4`，镜像为 68700 bytes / `d3250a6b64b5aeb89ce755a4ad4fda95aea2dc69b2cf6df8058056441b677c34`；放宽 cmp 或回退镜像都会掩盖契约断线。
+    **修法**：先完整比较不可变合并 commit `5349432481f8a2b865b8671bf49383c657ece0d1` 的 payload、package.json、boot-watchdog/open-path 测试及 smoke 脚本，确认与 APK 镜像逐字节一致，再只更新 fetch/checkout/HEAD/provenance 四处 pin。页面源码与版本不改，payload cmp、manifest 仅允许 overlay Cordis pin 的断言均保留；该 commit 的两个 parent 为旧 pin 与失败契约实现提交，不能改读 main/latest。
+    **复验证据与边界**：`source-chain-rerun.test.mjs` 锁四处不可变身份与已比较的 payload SHA，抽实际 cmp/manifest/provenance 脚本离线跑一致及显式 Cordis 差异，反证 payload 字节漂移、额外 manifest 改动、错误/缺失 overlay，失败不得写成功来源报告。未改组件的行为回归与注入冒烟按本轮报告记录；这些局部结果不代表整条来源构建、APK、设备或发布验收。
+
+269. **来源包物化放在 snapshot 返回后，无法修复构建器内部的严格归档成员门禁（ARM64 run 37970220155）**：
+    **现象**：固定 APK commit `7101468fd2d9f995e3fa018ca6d2ae351f2d1dff` 的日志已报当前 `combo-probe-P1` APPLIED，阶段 web/headless 清单均 `bundles=2`、死键为空，归档后却以泛化的「出厂 profile 清单对账失败」退出；唯一打印的 FAIL 是归档内逻辑路径的 client-modules index.js 缺失。不能据泛化标签另判 profile 缺陷。
+    **真因**：injector 将固定源码 tarball 写入 pnpm 顶层链接的物理 store 并保留链接，bootstrap `copytree(..., symlinks=True)` 也保留它；真实 tar 不会为链接目录合成逻辑子成员。严格 checker 通过 `tar -xO` 读固定逻辑路径，即使补丁已在文件系统中应用仍会读不到。既有 materializer 正是为普通归档成员设计，却在 `build-snapshot-013.mjs` 成功返回后才运行，先于返回的严格门禁因此使它不可达。
+    **修法**：只把原有 materializer 调用移到 bootstrap 组装前，根目录改为 `engine-deploy`，保留同一固定来源 manifest 与转换报告 artifact。不改镜像 builder/checker/patcher，不跳过 phase/profile 门禁；post-snapshot patch-copy reconciliation 仍在补丁之后执行，后续最终来源、原生与依赖核验仍执行，不追加晚期调用覆盖首次转换证据。
+    **复验证据与边界**：既有来源回归新增真实 pnpm 目录布局、版本化 client fixture 和正式 P1 patcher：抽实际组装 shell，用 bootstrap 边界 stub 检查所有 manifest 包已物化且原始 payload 未改；真实 tar 证明链接逻辑子成员缺失、物理成员有当前补丁、同字节物化后严格 CLI 通过且 profile 均 PASS/零 SKIP。markerless 与缺 phase 输出仍判红；真实 Node 查找保持包内依赖优先/store 回退，反向链接字节一致、二次调用幂等，身份失配在 bootstrap 前拒绝。Android fixture 归一 Node execPath 后才运行 checker 的真实子进程，首次 bad-ELF 宿主失败不是产物 PASS。未下载/检查 run 的实际失败归档，物理成员健康仅为 fixture 证明；局部回归不代表完整来源构建、APK、设备或发布通过。

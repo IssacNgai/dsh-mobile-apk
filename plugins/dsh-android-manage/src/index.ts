@@ -28,6 +28,7 @@ import { join } from 'node:path'
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { parseUiTreeXml, pruneNodes, resolveRef, findActionableAncestor, checkUiTreeParse, type UiNode, actionableAncestorV2, scopePoolV2 } from './ui-tree.js'
 import { cacheFromV2, decodeV2, isV2Payload, type V2Decoded } from './protocol-v2.js'
+import { treeFingerprint, completenessText } from './tree-fingerprint.js'
 import { detailRecord, pageRows, writeDetailStore } from './detail-store.js'
 import { resolveVirtualDisplayToken, vdTokenMissingText } from './vd-shot.js'
 
@@ -836,6 +837,16 @@ function tools(ctx: Context, priv: PrivilegeFace) {
    * 「一样」的第一层是**输出同形**：两个入口给同一套字段、同一套行格式，模型换通道不必换读法。
    * 复制两份必然漂移（本仓先例：op 清单、家族表），故 schema 与行渲染都只留一份。
    */
+  const SNAPSHOT_SCOPE_PROP = { oneOf: [{ type: 'null' }, {
+    type: 'object', additionalProperties: false, properties: {
+      v: { type: 'number', const: 1, required: true },
+      kind: { type: 'string', const: 'selected-root', required: true },
+      displayId: { type: 'number', required: true },
+      selectedWindowId: { type: 'string', required: true },
+      windowIds: { type: 'array', items: { type: 'string' }, required: true },
+      inventoryComplete: { type: 'boolean', required: true },
+    },
+  }] }
   const TREE_SCHEMA = {
 type: 'object',
 additionalProperties: false,
@@ -846,6 +857,9 @@ properties: {
   count: { type: 'number', required: true },
   rawCount: { type: 'number', required: true },
   nodes: { type: 'array', required: true },
+  truncated: { oneOf: [{ type: 'boolean' }, { type: 'null' }] },
+  snapshotScope: SNAPSHOT_SCOPE_PROP,
+  strictInputIdentity: { oneOf: [{ type: 'number', const: 1 }, { type: 'null' }] },
   // FX-204.1 + FX-204.2（B0，必须同批）：两条返回路径的键集合都必须在声明面内——
   // 完整抓取发 detailHandle/detailPath，未变快路径发 unchanged/gen。漏声明 = 引擎
   // validateJsonSchemaValue 有任一 violation 就整条 ToolOutputError，模型拿不到任何数据。
@@ -1183,9 +1197,9 @@ return String(value.text ?? '') + (lines.length > 0 ? '\n' + lines.join('\n') : 
   const DETAIL_HINT_MIN_NODES = 60
   const publishDetail = (
     nodes: UiNode[],
-    meta: { gen: number; protocol: string; view: string; screen: { w: number; h: number }; rotation: number; rawCount: number },
+    meta: { gen: number; protocol: string; view: string; screen: { w: number; h: number }; rotation: number; rawCount: number; truncated?: boolean | null; snapshotScope?: V2Decoded['snapshotScope']; strictInputIdentity?: 1 | null },
   ): { handle: string; path: string; hint: string } => {
-    const handle = treeFingerprint(nodes)
+    const handle = treeFingerprint(nodes, meta)
     let path = ''
     try {
       path = writeDetailStore(detailDir(), handle, nodes.map((n) => detailRecord(n)), { ...meta, count: nodes.length, handle })
@@ -1211,25 +1225,6 @@ return String(value.text ?? '') + (lines.length > 0 ? '\n' + lines.join('\n') : 
   let detailPath = ''
 
   /**
-   * 0.13.8 P0-4：树结构指纹（FNV-1a）——「界面未变」快路径的判定依据。
-   * 覆盖定位所需字段（文本/描述/类型/几何/交互性）；任一变化 → 指纹翻转 → 完整重抓。
-   * 纯追加语义：指纹相同只回一行「未变」摘要，绝不改写历史结果（L1）。
-   */
-  const treeFingerprint = (nodes: UiNode[]): string => {
-    let h = 0x811c9dc5
-    for (const n of nodes) {
-      const s = `${n.id}|${n.parentId}|${n.text}|${n.desc}|${n.rid}|${n.type}|${n.cx},${n.cy},${n.w},${n.h}|${n.clickable ? 1 : 0}${n.editable ? 1 : 0}${n.scrollable ? 1 : 0}${n.checked ? 1 : 0}${n.visible ? 1 : 0}`
-      for (let i = 0; i < s.length; i++) {
-        h ^= s.charCodeAt(i)
-        h = Math.imul(h, 0x01000193) >>> 0
-      }
-      h ^= 0xff
-      h = Math.imul(h, 0x01000193) >>> 0
-    }
-    return 'fp' + h.toString(16).padStart(8, '0')
-  }
-
-  /**
    * 「界面未变」快路径（P0-4）：指纹一致直接回紧凑摘要，模型可复用上次引用。
    * D3：`gen` 只有在**确实是 number** 时才发键——`{type:'number'}` 收 null/undefined 都会整值拒绝，
    * 而含 undefined 成员的对象更不是 lossless JSON（引擎直接抛错）。
@@ -1243,6 +1238,9 @@ return String(value.text ?? '') + (lines.length > 0 ? '\n' + lines.join('\n') : 
     count: uiCache!.nodes.length,
     rawCount: uiCache!.rawCount ?? uiCache!.nodes.length,
     nodes: [] as JsonValue[],
+    truncated: uiCache!.v2?.truncated ?? null,
+    snapshotScope: (uiCache!.v2?.snapshotScope ?? null) as unknown as JsonValue,
+    strictInputIdentity: uiCache!.v2?.strictInputIdentity ?? null,
     ...(typeof gen === 'number' ? { gen } : {}),
     note: '界面未变（结构指纹一致）：上次 dump 的引用（n0..nN）与坐标仍然有效，可直接复用；需完整清单请带 fresh:true 重新 dump',
     text: `界面未变（gen=${gen ?? '未知'}，结构指纹 ${fp}）：上次 dump 的 ${uiCache!.nodes.length} 个节点引用仍有效——直接用 android_ui_click/id:nN 等引用继续，无需重新阅读清单（fresh:true 可强制完整重抓）`,
@@ -1436,6 +1434,7 @@ return String(value.text ?? '') + (lines.length > 0 ? '\n' + lines.join('\n') : 
         // 这里给到 15s；仍失败则明确指引「先 android_ui_global back 退出重页面再 dump」。
         const r = await a11yExec('snapshot', { ...scoped }, 15_000)
         if (!r.ok) {
+          uiCache = null
           // 通道受限（纯 Shizuku / 虚拟屏无窗口）时，壳侧会带 actionMode=coordinate + guidance：
           // 原样带出，让模型在同一轮改用坐标路径，而不是停在「取树失败」。
           return {
@@ -1464,6 +1463,7 @@ return String(value.text ?? '') + (lines.length > 0 ? '\n' + lines.join('\n') : 
         if (isV2Payload(data)) {
           const dec = decodeV2(data)
           if (!dec.ok) {
+            uiCache = null
             return {
               ok: false, denied: false, screen: { w: 0, h: 0 }, rotation: 0, count: 0, rawCount: 0, nodes: [],
               text: `无障碍载荷解码失败（协议 V2，拒绝产出不可信清单）：${dec.error}——请更新 APK，或改用 android_ui_tree（uiautomator，无需无障碍，返回同形节点清单）`,
@@ -1475,7 +1475,8 @@ return String(value.text ?? '') + (lines.length > 0 ? '\n' + lines.join('\n') : 
         } else {
           pruned = pruneNodes(data.nodes ?? [])
         }
-        const fp = treeFingerprint(pruned.nodes)
+        const fp = treeFingerprint(pruned.nodes, [v2 ? 'v2' : 'v1', v2?.truncated ?? null,
+          v2?.snapshotScope ?? null, v2?.strictInputIdentity ?? null, v2?.view ?? 'all', pruned.rawCount, v2?.screen ?? data.screen ?? null, v2?.rotation ?? data.rotation ?? 0])
         // 0.13.8 P0-4：「界面未变」快路径——结构指纹一致且缓存新鲜 → 纯追加一行摘要（L1）
         if (!forceFresh && uiCache && uiCache.fingerprint === fp && Date.now() - uiCache.ts <= UI_CACHE_TTL) {
           const gen = v2?.gen ?? data.gen ?? uiCache.gen
@@ -1484,7 +1485,8 @@ return String(value.text ?? '') + (lines.length > 0 ? '\n' + lines.join('\n') : 
           // 命中即续期：时间戳前移、代次对齐本次载荷。
           uiCache.ts = Date.now()
           if (typeof gen === 'number') uiCache.gen = gen
-          if (v2) uiCache.v2 = v2
+          uiCache.v2 = v2
+          uiCache.rawCount = pruned.rawCount
           return unchangedResponse(fp, gen)
         }
         // 0.14 D11：显式重建 screen——老壳 V1 载荷的 data.screen 可能多带键，按引用返回会让整条
@@ -1521,6 +1523,9 @@ return String(value.text ?? '') + (lines.length > 0 ? '\n' + lines.join('\n') : 
         const detail = publishDetail(pruned.nodes, {
           gen: v2?.gen ?? data.gen ?? -1,
           protocol: v2 ? 'v2' : 'v1',
+          truncated: v2?.truncated ?? null,
+          snapshotScope: v2?.snapshotScope ?? null,
+          strictInputIdentity: v2?.strictInputIdentity ?? null,
           view: v2?.view ?? 'all',
           screen,
           rotation: v2?.rotation ?? data.rotation ?? 0,
@@ -1534,12 +1539,15 @@ return String(value.text ?? '') + (lines.length > 0 ? '\n' + lines.join('\n') : 
           count: pruned.nodes.length,
           rawCount: pruned.rawCount,
           nodes: pruned.nodes as unknown as JsonValue[],
+          truncated: v2?.truncated ?? null,
+          snapshotScope: (v2?.snapshotScope ?? null) as unknown as JsonValue,
+          strictInputIdentity: v2?.strictInputIdentity ?? null,
           detailHandle: detail.handle,
           detailPath: detail.path,
           note: `无障碍通道（backend=a11y，协议 ${v2 ? 'V2 列式' : 'V1'}）：id 仅在最近一次 dump 内有效；页面变化后请重新 dump`,
           // FX-206.4：截断状态按壳侧载荷真值渲染（V2 带 truncated 列）；V1 载荷不带该信息，
           // 如实标「未知」而不是写死「未截断」——半棵树被说成完整比没有信息更危险。
-          text: `控件清单（无障碍通道，${v2 ? (v2.truncated ? '已截断：壳侧建树预算耗尽，仅含部分子树，缺失区域请重新 dump' : '未截断') : '截断状态未知（V1 载荷不带该字段）'}）：${pruned.nodes.length} 个节点（原始 ${pruned.rawCount}，剔除 ${pruned.rawCount - pruned.nodes.length} 个零尺寸/完全重复节点，屏幕 ${screen.w}x${screen.h}；前台 ${fg?.pkg ?? '?'}/${fg?.activity ?? '?'}）`
+          text: `控件清单（无障碍通道，${completenessText(v2?.truncated)}）：${pruned.nodes.length} 个节点（原始 ${pruned.rawCount}，剔除 ${pruned.rawCount - pruned.nodes.length} 个零尺寸/完全重复节点，屏幕 ${screen.w}x${screen.h}；前台 ${fg?.pkg ?? '?'}/${fg?.activity ?? '?'}）`
             + warn + webHint + detail.hint,
         }
       }
@@ -1906,6 +1914,9 @@ return String(value.text ?? '') + (lines.length > 0 ? '\n' + lines.join('\n') : 
     },
   })
 
+  interface StrictIdentity {
+    v: 1; packageName: string; windowId: string; resourceId: string; className: string; password: false
+  }
   const uiInput = defineTool({
     name: 'android_ui_input',
     description:
@@ -1914,10 +1925,15 @@ return String(value.text ?? '') + (lines.length > 0 ? '\n' + lines.join('\n') : 
       'clear: true 先原子清空聚焦框（全选+删除，可单独使用）。channel: "input" 可强制走 input text（仅 ASCII，不推荐）。' +
       '长度 ≤500。需设备控制授权（无障碍服务已开启，或 ADB 三道门齐备）+ 会话档位 danger-full-access。',
     parameters: {
-      text: { type: 'string', description: '要输入的文本（≤500 字符；与 clear 至少其一）' },
-      clear: { type: 'boolean', description: '先清空当前聚焦输入框（ADBKeyboard ADB_CLEAR_TEXT 广播；可单独使用）' },
-      channel: { type: 'string', enum: ['auto', 'adbkeyboard', 'input'], description: '输入通道（默认 auto=ADBKeyboard 优先）' },
-      ref: { type: 'string', description: '无障碍通道的目标输入框引用（id:n3 / text:… / desc:…；缺省用当前聚焦框）' },
+      text: { type: 'string', description: '文本≤500字；与 clear 至少其一' },
+      clear: { type: 'boolean', description: '先清空聚焦框；可单独使用' },
+      channel: { type: 'string', enum: ['auto', 'adbkeyboard', 'input'], description: '通道；auto 默认优先 ADBKeyboard' },
+      ref: { type: 'string', description: '无障碍输入框引用：id:n3/text:…/desc:…；默认聚焦框' },
+      strictIdentity: { type: 'object', additionalProperties: false, properties: {
+        v: { type: 'number', const: 1, required: true }, packageName: { type: 'string', required: true },
+        windowId: { type: 'string', required: true }, resourceId: { type: 'string', required: true },
+        className: { type: 'string', required: true }, password: { type: 'boolean', const: false, required: true },
+      }, description: '严格原生输入身份；需要原生能力版本 1，禁止 Web/ADB/容器回退' },
       screenId: SCREEN_PARAM,
     },
     output: {
@@ -1926,6 +1942,7 @@ return String(value.text ?? '') + (lines.length > 0 ? '\n' + lines.join('\n') : 
         additionalProperties: false,
         properties: {
           ok: { type: 'boolean', required: true },
+          strictIdentityVerified: { type: 'boolean' },
           channel: { type: 'string' },
           text: { type: 'string' },
           denied: { type: 'boolean' },
@@ -1940,12 +1957,41 @@ return String(value.text ?? '') + (lines.length > 0 ? '\n' + lines.join('\n') : 
         { type: 'text', text: String(v.text ?? (v.guidance as string | undefined) ?? '') },
       ],
     },
-    execute: async (args: { text?: string; clear?: boolean; channel?: string; ref?: string; screenId?: string }, exec) => {
+    execute: async (args: { text?: string; clear?: boolean; channel?: string; ref?: string; screenId?: string; strictIdentity?: StrictIdentity }, exec) => {
       const { text, clear, channel, ref, screenId } = args ?? {}
       const a = await guard('ui_input', args as Record<string, unknown>, exec as { agent?: { session?: unknown } })
       if (!a.ok) return { ok: false, denied: true, text: a.guidance }
       const raw = typeof text === 'string' ? text : ''
-      if (!clear && (raw.length === 0 || raw.length > 500)) return { ok: false, denied: false, text: 'text 长度需为 1-500，或传 clear: true 单独清空' }
+      if (raw.length > 500 || (!clear && raw.length === 0)) return { ok: false, denied: false, text: 'text 长度需为 1-500，或传 clear: true 单独清空' }
+      if (Object.hasOwn(args ?? {}, 'strictIdentity')) {
+        const q = args.strictIdentity
+        const deny = (reason: string) => ({ ok: false, denied: true, text: '严格输入拒绝：' + reason })
+        if (!q || typeof q !== 'object' || Array.isArray(q) ||
+          Object.keys(q).sort().join(',') !== 'className,packageName,password,resourceId,v,windowId' ||
+          q.v !== 1 || q.password !== false || [q.packageName, q.windowId, q.resourceId, q.className].some(s => typeof s !== 'string' || !s)) return deny('身份对象畸形')
+        if ((screenId !== undefined && screenId !== 'real') || (channel !== undefined && channel !== 'auto') ||
+          controlDecision('setText', exec as { agent?: { session?: unknown } }).backend !== 'a11y') return deny('只支持真实屏无障碍原生通道')
+        const cache = uiCache
+        const v2 = cache?.v2
+        const proof = v2?.snapshotScope
+        if (!cache || Date.now() - cache.ts > UI_CACHE_TTL || v2?.strictInputIdentity !== 1 || v2.truncated !== false ||
+          !proof || !proof.inventoryComplete || proof.displayId !== 0 || proof.windowIds.length !== 1 ||
+          proof.selectedWindowId !== q.windowId || proof.windowIds[0] !== q.windowId || cache.gen === undefined) return deny('缺少新鲜能力/完整性/单窗口证明')
+        if (typeof ref !== 'string' || !/^id:n[0-9]+$/.test(ref)) return deny('必须绑定原始节点 id 引用')
+        const hit = resolveRef(cache.byId, cache.nodes, ref, scopePoolFor())
+        if (!hit.ok) return deny(hit.error)
+        const node = hit.node
+        if (cache.nodes.some(n => n.windowId !== q.windowId) || cache.nodes.filter(n => n.rid === q.resourceId).length !== 1 ||
+          node.pkg !== q.packageName || node.windowId !== q.windowId || node.rid !== q.resourceId || node.type !== q.className ||
+          node.password !== false || !node.editable || !node.enabled || !node.visible || node.w <= 0 || node.h <= 0) return deny('节点身份与原始快照不匹配')
+        const payload: Record<string, unknown> = { text: raw, clear: clear === true, gen: cache.gen, screenId: 'real', strictIdentity: q }
+        if (!putTargetRef(payload, node) || typeof payload.row !== 'number') return deny('缺少原始 row 句柄')
+        const r = await a11yExec('setText', payload)
+        if (!r.ok) return { ...semanticFail(r, '严格输入失败：'), channel: 'a11y' } as never
+        const receipt = r.data as { strictIdentityVerified?: unknown } | undefined
+        if (receipt?.strictIdentityVerified !== true) return deny('原生端没有返回严格身份验证回执')
+        return { ok: true, denied: false, channel: 'a11y', strictIdentityVerified: true, text: '严格身份已验证并写入' }
+      }
       // #128 L1：WebView DOM 引用（wN / css: / text: / role:）→ 自有 WebView 通道直接写值
       // （原生 value setter + input/change 事件，兼容 React 受控组件），不经 IME、不会汉字化。
       const webRef = typeof ref === 'string' ? ref.trim() : ''

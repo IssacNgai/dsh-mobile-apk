@@ -66,7 +66,11 @@ available for offline mode`，22s 即 break），且该行把 gradle 输出重�
 
 **来源审计构建（ARM64）**：固定官方Harness 639ed015397290b3745d163aafe02ffee4aa3f84 / 0.2.0-rc.2，workflow检查packageManager pnpm11.7.0及Node范围 ^22.19.0 || >=24.0.0（来源runner使用Node24）。不启用LFS、不读旧base快照；第一方产物由固定源码构建并记录manifest/commit/hash。Electron桌面bundle不属于Android CLI部署闭包，构建脚本临时排除并留provenance；Cordis依赖按本次官方源码，不回退旧版源码伪装新pin。Termux bootstrap固定SHA认证、官方InRelease验签与逐deb哈希仍执行；node-pty源码/NDK与上游原生二进制输入分别披露，不声称全部本地编译。固定debug签名与apksigner自证沿用，真实APK/hash/provenance待构建后记录；source后缀与artifact名不代表另一签名。
 
-**同工作区复跑**：两处源码 clone 可复用，但固定 commit 的 fetch/detach/assert 仍执行；bootstrap 与 NDK 只在固定哈希命中时复用，损坏/半包重下，解包前校验不省略。Harness 阶段从本次 `GITHUB_SHA` 恢复权威 overlay，先复位专用源码 checkout（保留 ignored 依赖），deploy 只清理验证过的专用目标。`source-chain-rerun.test.mjs` 使用本 workflow 的实际守卫和本地假输入覆盖 cache-hit/miss、下载中断、坏字节拒绝解包、依赖保留与清理边界；CI 与本地预检均调用。来源链两次完整运行的证据不得由局部守卫测试代替。
+**同工作区复跑**：两处源码 clone 可复用，但固定 commit 的 fetch/detach/assert 仍执行；bootstrap 与 NDK 只在固定哈希命中时复用，损坏/半包重下，解包前校验不省略。Harness 取源与阶段单独续跑均先拒绝 Git 环境重定向、专用路径/`.git`/index 链接和外部 worktree/gitdir，再直接 `checkout --force --detach` 到固定 commit，最后 `clean -fdq`（不带 `-x`，保留 ignored 依赖）。这不依赖当前 HEAD/index，覆盖 fresh `--no-checkout` 空 index、unborn HEAD、暂存与未暂存改动；禁止恢复自暂存 index 或回落可变 HEAD。Harness 阶段仍从本次 `GITHUB_SHA` 恢复权威 overlay，deploy 只清理验证过的专用目标。`source-chain-rerun.test.mjs` 执行实际 workflow 守卫，真实临时 Git 仓库仅替换固定 commit 为 fixture commit、上游 URL 为本地文件路径（协议限制为 file，不联网）；覆盖取源/阶段入口、中断与二次复跑、失败前保全、ignored 依赖与清理边界。CI 与本地预检均调用；Android 宿主可用 `node --test --test-isolation=none scripts/source-build/source-chain-rerun.test.mjs` 避开 linker64 子进程限制，fixture 保留宿主 loader 环境。来源链两次完整运行的证据不得由局部守卫测试代替；新鲜空 index 根因见坑 266。
+
+**页面兼容组件的来源 pin**：`host-web-compat` 固定组件仓合并 commit `5349432481f8a2b865b8671bf49383c657ece0d1`（客户端插件失败契约与就绪判据已同步到 APK 镜像），fetch、detach、HEAD 断言与 provenance 必须指向同一不可变 commit。继续逐字节 `cmp lib/index.js`，manifest 只允许绑定本次 engine overlay 的 Cordis 依赖差异；不得因为旧 pin 判红而忽略 payload 差异、读可变分支或把镜像退回缺契约的旧源码。`source-chain-rerun.test.mjs` 抽实际 `cmp` 与 manifest/provenance 脚本离线执行，锁定已比对的组件 payload 哈希，并反证字节漂移、额外 manifest 改动及错误/缺失 overlay。完整源件比较与旧 pin 根因见坑 268；局部门禁通过不等于 APK/设备验收。
+
+**来源包归档形态**：源码 tarball 注入后、原生绑定核验后，在 bootstrap 复制 deploy 树之前执行 `materialize-dsh-pnpm-packages.mjs`，输入固定来源 manifest，输出原有 `pnpm-package-materialization.json` artifact；不得移回快照构建成功分支。bootstrap 保留软链，构建器返回前已用严格 tar 成员读取核验当前 phase 探针，晚物化无法修复这道门禁。后置 patch-copy reconciliation 与最终来源/依赖门禁不变，也不再次覆盖转换报告。实际 workflow shell 的离线回归在 bootstrap 边界断言输入为普通文件，真实 patcher 与 tar 覆盖链接归档判红、物化判绿、markerless/缺 phase 判红、依赖优先级及幂等；Android 仅在 fixture 启动 unchanged checker 时把 `process.execPath` 归一为实际 Node 以执行真实子进程。日志证据与限制见坑 269；不代表失败实际归档或完整 APK 已验收。
 
 **派发前必须本地预检**：`node scripts/source-build/preflight-source-chain.mjs`。远程 `build-apk-source` 一次 60-90 分钟，而近期判红的几类问题（市场补丁锚点失配、期望补丁集过期、与上游脱钩）**都能在本地提前复现**。预检覆盖五面：① 是否落后 `upstream/main`（合并会换掉链的输入，坑 204/204 都出在合并之后）② 登记表补丁对仓库镜像自洽（`apply-patches --check`）③ 市场插件链按 workflow 里钉的 URL+sha256 取发布产物、解包、打补丁，再与 `vendor/dshmarketplace-plugin/` 逐字节比对 ④ 来源链单测 ⑤ `check-code-map`。版本与哈希都从 workflow 读，不在脚本里重复钉。`--no-network` 可跳过取件与 `git fetch`（此时发布产物必须已在 `.deploy-tmp/component-sources/` 缓存里）。
 
@@ -125,6 +129,10 @@ Harness按固定0.2.0-rc.2源码完成全仓构建；prepare-harness-vendor-over
    ```
 
    未装时的行为是**如实 SKIP 并计数**（`SKIP(#n) 宿主缺 peer 依赖：…`），`--require`（本地链/发布链）下判红——不允许用 SKIP 冒充绿。
+
+8. **输出 schema 门禁的输入样本与 wire 预算（strictIdentity 回归）**：`check-tool-output-schema.mjs` 在执行每个分支前，先用引擎同一校验器验证其输入；通用样本模块 `scripts/lib/tool-schema-samples.mjs` 递归填必填子对象，优先保留 `const`，区分作者 `required:true` 与编译后对象的 `required:[keys]`。可选对象用独立分支覆盖，不能因其子字段必填而误当根参数必填。回归在 manage 的 `test/tool-output-schema.test.mjs`，随输出门禁自动运行；strictIdentity 样本只证明 schema 合法和缺证据时拒绝，不证明 native 成功写入。
+   - 本地先构建插件，再跑 `node scripts/check-tool-output-schema.mjs --require` 和 `node scripts/check-tool-surface-budget.mjs`；`--update` 不用于文案修复。预算按 `JSON.stringify({name,description,parameters}).length` 的 UTF-16 码元计量，不等于 UTF-8 字节或 token，既有基线与阈值保持不变。
+   - Termux 宿主的子进程 `node --test <相对路径>` 如报 `expected absolute path`，必须单列为宿主 wrapper 限制；可直接 `node <测试文件>` 验证套件，但不能冒称标准聚合门禁通过。构建产物/依赖缺席也要单列，不能以计算出的文案节省替代完整 gate 结果。
 
 ### 3.3 改动流程规范（改哪个仓库、改完必做三件事）
 

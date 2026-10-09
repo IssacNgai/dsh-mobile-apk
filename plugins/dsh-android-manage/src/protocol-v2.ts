@@ -25,6 +25,15 @@ export const FLAG = {
 
 export type V2View = 'all' | 'target'
 
+export interface SnapshotScope {
+  v: 1
+  kind: 'selected-root'
+  displayId: number
+  selectedWindowId: string
+  windowIds: string[]
+  inventoryComplete: boolean
+}
+
 export interface V2Decoded {
   gen: number
   rotation: number
@@ -32,7 +41,9 @@ export interface V2Decoded {
   rawCount: number
   view: V2View
   /** 壳侧建树预算耗尽（E2 的 `truncated`）：真值透出，呈现面据此渲染，不再写死「未截断」。 */
-  truncated: boolean
+  truncated: boolean | null
+  strictInputIdentity: 1 | null
+  snapshotScope: SnapshotScope | null
   /** 与 V1 公开节点同形（resolveRef / render / 工具面零改动）。 */
   rows: UiNode[]
   /** 载荷行下标 → 原始行号（壳侧 walk 全量行表下标）。动作回指的 row 句柄取此列（FX-206.1）。 */
@@ -52,7 +63,7 @@ export function isV2Payload(data: unknown): boolean {
 }
 
 const isIntArray = (v: unknown): v is number[] =>
-  Array.isArray(v) && v.every((x) => typeof x === 'number' && Number.isFinite(x))
+  Array.isArray(v) && Array.from(v).every((x) => typeof x === 'number' && Number.isSafeInteger(x))
 
 /** 常数广播取值（§S2.3）：长度 1 且 n>1 ⇒ 整列同值。 */
 const pick = (arr: number[], i: number, n: number): number => (arr.length === 1 && n > 1 ? arr[0] : arr[i])
@@ -72,22 +83,50 @@ export function decodeV2(data: unknown): DecodeResult {
   if (!isIntArray(scr) || scr.length !== 2) return { ok: false, error: 'scr 必须是 [宽, 高]' }
 
   const str = d.str
-  if (!Array.isArray(str) || !str.every((s) => typeof s === 'string')) return { ok: false, error: 'str 必须是字符串数组' }
+  if (!Array.isArray(str) || !Array.from(str).every((s) => typeof s === 'string')) return { ok: false, error: 'str 必须是字符串数组' }
   const S = str as string[]
 
   const n = Number(d.n)
   if (!Number.isInteger(n) || n < 0) return { ok: false, error: 'n 必须是非负整数' }
   const view: V2View = d.view === 'target' ? 'target' : 'all'
-  const truncated = d.truncated === true
+  if (Object.hasOwn(d, 'truncated') && typeof d.truncated !== 'boolean') return { ok: false, error: 'truncated 必须是布尔值' }
+  const truncated = typeof d.truncated === 'boolean' ? d.truncated : null
+  // Extension validation precedes the empty-tree shortcut. Sparse arrays are invalid too.
+  let passwords: Array<boolean | null> | null = null
+  if (Object.hasOwn(d, 'pwv') || Object.hasOwn(d, 'pw')) {
+    if (d.pwv !== 1 || !Array.isArray(d.pw) ||
+        !Array.from(d.pw).every((v) => v === true || v === false || v === null) ||
+        (n === 0 ? d.pw.length !== 0 : d.pw.length !== 1 && d.pw.length !== n)) {
+      return { ok: false, error: 'pwv/pw 必须是版本 1 与 true/false/null 密集列（n 项或非空广播 1 项）' }
+    }
+    passwords = d.pw as Array<boolean | null>
+  }
+  if (Object.hasOwn(d, 'strictInputIdentity') && d.strictInputIdentity !== 1) return { ok: false, error: 'strictInputIdentity 只支持版本 1' }
+  const strictInputIdentity = d.strictInputIdentity === 1 ? 1 : null
+  let snapshotScope: SnapshotScope | null = null
+  if (Object.hasOwn(d, 'snapshotScope')) {
+    const q = d.snapshotScope as Record<string, unknown> | null
+    const windowId = (s: unknown) => typeof s === 'string' && /^(0|[1-9][0-9]*)(?![\s\S])/.test(s) && Number.isSafeInteger(Number(s))
+    if (!q || typeof q !== 'object' || Array.isArray(q) ||
+        ['v', 'kind', 'displayId', 'selectedWindowId', 'windowIds', 'inventoryComplete'].some(k => !Object.hasOwn(q, k)) ||
+        q.v !== 1 || q.kind !== 'selected-root' || !Number.isSafeInteger(q.displayId) || (q.displayId as number) < 0 ||
+        (q.selectedWindowId !== '' && !windowId(q.selectedWindowId)) || typeof q.inventoryComplete !== 'boolean' ||
+        !Array.isArray(q.windowIds) || !Array.from(q.windowIds).every(windowId) || new Set(q.windowIds).size !== q.windowIds.length ||
+        (q.inventoryComplete && (q.displayId !== 0 || q.windowIds.length !== 1 || q.windowIds[0] !== q.selectedWindowId))) {
+      return { ok: false, error: 'snapshotScope 必须是版本 1 的严格窗口证据' }
+    }
+    snapshotScope = { v: 1, kind: 'selected-root', displayId: q.displayId as number,
+      selectedWindowId: q.selectedWindowId as string, windowIds: [...q.windowIds] as string[], inventoryComplete: q.inventoryComplete }
+  }
   const rawCount = Number(d.raw ?? n)
-  if (!Number.isInteger(rawCount) || rawCount < n) {
+  if (!Number.isInteger(rawCount) || rawCount < n || rawCount > 2147483647) {
     return { ok: false, error: `raw 必须是不小于 n=${n} 的整数（收到 ${String(d.raw)}）` }
   }
   if (n === 0) {
     return {
       ok: true,
       value: {
-        gen, rotation: rot, screen: { w: scr[0], h: scr[1] }, rawCount, view, truncated,
+        gen, rotation: rot, screen: { w: scr[0], h: scr[1] }, rawCount, view, truncated, snapshotScope, strictInputIdentity,
         rows: [], origRow: new Int32Array(0), actionableAncestor: new Int32Array(0), subtreeEnd: new Int32Array(0),
       },
     }
@@ -99,6 +138,9 @@ export function decodeV2(data: unknown): DecodeResult {
     if (!isIntArray(col)) return { ok: false, error: `${key} 必须是整数数组` }
     if (col.length !== 1 && col.length !== n) {
       return { ok: false, error: `${key} 长度 ${col.length} 既不是 1（广播）也不是 n=${n}` }
+    }
+    if (['c', 'k', 'r', 'w', 't', 's'].includes(key) && col.some((v) => v < -1 || v >= S.length)) {
+      return { ok: false, error: `${key} 符号索引越界` }
     }
     cols[key] = col
   }
@@ -147,6 +189,8 @@ export function decodeV2(data: unknown): DecodeResult {
       scrollable: (flag & FLAG.scrollable) !== 0,
       editable: (flag & FLAG.editable) !== 0,
       checked: (flag & FLAG.checked) !== 0,
+      enabled: (flag & FLAG.enabled) !== 0,
+      password: passwords === null ? null : passwords[passwords.length === 1 ? 0 : i],
       visible: (flag & FLAG.visible) !== 0,
       pkg: sym(S, pick(cols.k, i, n)),
       windowId: sym(S, pick(cols.w, i, n)),
@@ -169,7 +213,7 @@ export function decodeV2(data: unknown): DecodeResult {
   return {
     ok: true,
     value: {
-      gen, rotation: rot, screen: { w: scr[0], h: scr[1] }, rawCount, view, truncated,
+      gen, rotation: rot, screen: { w: scr[0], h: scr[1] }, rawCount, view, truncated, snapshotScope, strictInputIdentity,
       rows, origRow, actionableAncestor, subtreeEnd,
     },
   }
@@ -214,6 +258,7 @@ const attrFlag = (at: Record<string, string>, key: string): boolean =>
 export interface EncRow {
   text: string; desc: string; cls: string; pkg: string; rid: string; windowId: string
   depth: number; x: number; y: number; w: number; h: number; flag: number
+  password?: boolean | null
 }
 
 /** XML 原始节点 → 编码行（含零尺寸节点；与壳侧 Kotlin 的 walk 逐字同规则）。 */
@@ -238,6 +283,7 @@ export function rowsFromRaw(raw: EncRawNode[]): EncRow[] {
       pkg: at.package ?? '',
       rid: decodeEntities(at['resource-id'] ?? ''),
       windowId: at['window-id'] ?? '',
+      password: at.password === 'true' ? true : at.password === 'false' ? false : null,
       depth,
       x: box.x, y: box.y, w: box.w, h: box.h, flag,
     }
@@ -267,11 +313,15 @@ export function encodeV2(
   rotation: number,
   width: number,
   height: number,
+  truncated = false,
 ): Record<string, unknown> {
   const rows = rowsIn
   const n = rows.length
   const actionable = (r: EncRow): boolean =>
     (r.flag & (FLAG.clickable | FLAG.editable | FLAG.scrollable)) !== 0
+
+  const identityRelevant = (r: EncRow): boolean =>
+    r.rid !== '' || (r.flag & FLAG.editable) !== 0 || r.password === true
 
   // 2. 行集：骨架闭包
   const keep = new Array<boolean>(n).fill(false)
@@ -282,7 +332,7 @@ export function encodeV2(
     const inSet = view === 'target'
       ? hasArea && (actionable(rows[i]) || rows[i].text !== '' || rows[i].desc !== '')
       : hasArea
-    if (inSet) {
+    if (inSet || identityRelevant(rows[i])) {
       keep[i] = true
       for (const a of ancStack) keep[a] = true
     }
@@ -309,7 +359,7 @@ export function encodeV2(
   for (let i = 0; i < n; i++) {
     if (!keep[i]) continue
     const leafInSet = nextKept[i] >= subtreeEnd[i]
-    if (leafInSet) {
+    if (leafInSet && !identityRelevant(rows[i])) {
       const r = rows[i]
       const key = [r.text, r.desc, r.cls, r.x + Math.floor(r.w / 2), r.y + Math.floor(r.h / 2)].join('\u0000')
       if (seen.has(key)) continue
@@ -346,7 +396,7 @@ export function encodeV2(
     f.push(row.flag)
     c.push(symOf(row.cls.split('.').pop() ?? '')); k.push(symOf(row.pkg))
     r.push(symOf(row.rid)); w.push(symOf(row.windowId))
-    t.push(symOf(row.text)); s.push(symOf(row.desc))
+    t.push(symOf(row.flag & FLAG.editable ? row.text : row.text.trim())); s.push(symOf(row.desc.trim()))
     stk.push(fi)
   }
 
@@ -362,11 +412,14 @@ export function encodeV2(
     d: broadcast(d), p: broadcast(p), b, o: broadcast(out), f: broadcast(f),
     c: broadcast(c), k: broadcast(k), r: broadcast(r), w: broadcast(w),
     t: broadcast(t), s: broadcast(s),
+    pwv: 1,
+    pw: broadcast(out.map((i) => typeof rows[i].password === 'boolean' ? rows[i].password! : null)),
+    truncated,
   }
 }
 
 /** 常数广播（§S2.3 D3）：整列同值且 n>1 时只发 1 个元素。`b` 不参与（长度固定 4n）。 */
-function broadcast(col: number[]): number[] {
+function broadcast<T>(col: T[]): T[] {
   if (col.length > 1 && col.every((v) => v === col[0])) return [col[0]]
   return col
 }

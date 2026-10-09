@@ -39,6 +39,7 @@ import { join, dirname, relative } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { spawnSync } from 'node:child_process'
 import { stalenessTrigger, arbitrateFreshness } from './lib/product-freshness.mjs'
+import { argsFromSchema, optionalObjectVariants } from './lib/tool-schema-samples.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = dirname(HERE)
@@ -148,23 +149,6 @@ if (typeof validateJsonSchemaValue !== 'function') fail('@deepseek-ai/dsh-tools 
 console.log('校验器: ' + rel(validatorFile))
 
 const problems = []
-const SAMPLE = { string: 'sample', number: 1, integer: 1, boolean: false, array: [], object: {} }
-const propSample = (prop) => {
-  if (!prop || typeof prop !== 'object') return undefined
-  if (Array.isArray(prop.enum) && prop.enum.length > 0) return prop.enum[0]
-  if ('default' in prop) return prop.default
-  return SAMPLE[prop.type]
-}
-/** 由参数 schema 造一个「填满 required + 每个可选键各出现一次」的实参集合。 */
-const argsFromSchema = (schema) => {
-  const props = schema?.properties ?? {}
-  const requiredArray = Array.isArray(schema?.required) ? new Set(schema.required) : null
-  const out = {}
-  for (const [key, prop] of Object.entries(props)) {
-    if (prop?.required || requiredArray?.has(key)) out[key] = propSample(prop)
-  }
-  return out
-}
 const VARIANTS = {
   android_ui_dump: [{}, {}],
   android_ui_detail: [{ all: true }, {}],
@@ -426,9 +410,15 @@ async function drivePlugin(pluginDir, mode) {
     }
     const base = argsFromSchema(tool.parameters)
     const variants = (VARIANTS[tool.name] ?? [{}]).map((v) => ({ ...base, ...v }))
+    variants.push(...optionalObjectVariants(tool.parameters, variants[0]))
     let i = 0
     for (const args of variants) {
       i += 1
+      const inputViolations = validateJsonSchemaValue(tool.parameters, args, 'args') ?? []
+      if (inputViolations.length > 0) {
+        local.push(tool.name + ' 分支#' + i + '：门禁输入样本不符合参数 schema：' + inputViolations.join('; '))
+        continue
+      }
       let value
       try {
         value = await tool.execute(args, { agent: { session: 'schema-gate' } })

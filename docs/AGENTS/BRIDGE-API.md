@@ -42,7 +42,40 @@ exportConfig返回实际path与可能含provider密钥的共享目录警告hint�
 
 页面恢复由ForegroundPageRecoveryPolicy限定前台generation和一次quiet retry/recreate，不把destroyed WebView重新reload；Activity recreation重绑所有holder且保留userClosed/userShutdown，不重启共享引擎。新增fixture仅登记、未执行；详见 [外部测试需求](<docs/0.14.3-TEST-REQUIREMENTS.md>)。
 
-## 3. 历史增量（不作为当前构建或验收证据）
+## 3. 0.14.5 Jev 无障碍快照与严格输入（源码契约，尚待同产物设备验收）
+
+这是既有 `snapshot` / `setText` 控制队列载荷增量，不是新增 `@JavascriptInterface`、HTTP 路由或模型工具；通用用户指定输入仍保留原有 WebView、a11y、ADBKeyboard 与容器/聚焦框回退。Jev 严格输入必须显式选择以下 opt-in 路径。
+
+### 3.1 原生生产者与快照证据
+
+- `ControlProtocolV2.Row.password` 为 `true/false/null`；只有平台明确 false 支持非密码断言，读取失败/旧载荷缺失为 null，不从文本、RID、class 或 absent bit 推断。V2 扩展 `pwv:1` 与 `pw` 必须成对；`pw` 是 true/false/null 密集列，零节点为 `[]`，非零为 n 项或 1 项广播。解码在空树捷径之前校验扩展，不接受未知版本/稀疏列/非法值。
+- `o` 仍是壳侧 walk 全量行号，不是过滤后载荷下标。all/target 视图保留 RID、editable、password=true 身份行与必要祖先，含隐藏/零面积行；RID 只取平台 `viewIdResourceName`，XML 兼容只取 `resource-id`，不从标签/路径制造身份。RID 行不按视觉重复去重。
+- `truncated` 显式布尔；旧载荷缺失解码为 null/未知。`SnapshotTraversalBudget` 的访问预算包含隐藏节点；advertised child 为 null、walk 中 getter/遍历异常、节点/深度/时间耗尽、建树中已送达事件均使结果不完整。password getter 单独失败被捕获为 null，不会由此自动标 truncated，但同样不能支持严格输入。false 仅证明所选根子树遍历完整，不证明全屏/其他窗口。
+- 原生附加 `snapshotScope:{v:1,kind:"selected-root",displayId,selectedWindowId,windowIds,inventoryComplete}`，与权限范围字符串 `scope` 无关。`SnapshotWindowScope` 的完整证明要求 display 0、前后窗口库存完全一致、有效且唯一的非负窗口 ID、同事件纪元，且库存只有被选中的 `TYPE_APPLICATION` 窗口；IME/系统/覆盖窗口不被过滤掉以制造单窗口证明。其它/虚拟屏情况仍可读树，但不能作严格输入的单窗口证明。
+- `DeviceControlService.handleSnapshot` 原生生产 `strictInputIdentity:1`。旧 V1/V2 缺握手解码为 null，未知值拒绝；JS 不默认补 1，不以新字段可解码/输出 schema 存在来替代生产者能力。完整树、明细元数据、「界面未变」响应与缓存都保留 completeness/scope/capability。[tree-fingerprint.ts](../../plugins/dsh-android-manage/src/tree-fingerprint.ts) 将这些元数据、password、窗口/RID、原始行映射与节点状态纳入指纹，视觉未变不能掩盖安全证据变化。
+- 原生 V2 编码与 TS 参考编码保留 editable 的原始 text（包括前后空白）；非 editable text 与 desc 仍按呈现规则 trim。严格字段验收不以格式化清单或旧 XML 剪枝路径替代原始值。
+
+### 3.2 严格 setText 的 opt-in 绑定
+
+工具 `android_ui_input` 接收闭合嵌套对象 `strictIdentity:{v:1,packageName,windowId,resourceId,className,password:false}`；字段全必需，className 是 V2 短类名（例如 EditText）。`defineTool` 的根参数 schema 是开放的，不能声称未知根参数会在派发前被拒；闭合 output 的回执校验发生在执行后，同样不能单独阻止旧工具体忽略严格参数。安全边界因此是已解码/已缓存的原生能力握手加执行体显式 strict 分支。
+
+1. manage 在 guard 后、任何 Web/ADB/普通输入路径前识别 own `strictIdentity`；对象畸形直接拒绝。只允许 real + a11y、缺省/auto channel、精确 `ref:"id:nN"`；不接受文字/RID 模糊选择、聚焦框或容器回退。
+2. 派发前检查最新缓存 TTL、原生能力版本 1、`truncated:false`、display 0 单窗口库存、gen；原节点必须与请求的 package/window/RID/短 class/password:false 一致且 editable/enabled/visible/正面积。所有行同窗口、同 RID 总数恰好 1（含隐藏/非 editable 重复行）。`putTargetRef` 必须产出原始 row；载荷带原始 row/gen 与 strictIdentity，不再重建/解释旧引用。
+3. native `handleSetText` 发现该键即走 `handleStrictSetText`，要求原始 row/gen、真实屏、原始完整单窗口快照与上述唯一身份。`StrictInputIdentity.matchesRequest` 用原生完整 class 提取短类名对照 wire，live 比较仍用完整原生 class。
+4. `StrictInputIdentity.resolve` 每次从新根与前后窗口库存开始做 bounded 全量 walk，在可见性、可编辑性、package、geometry 过滤之前统计所有同 RID；任一未知/异常/截断/重复/错窗口/错属性/过期均拒绝。先验证再按需 `ACTION_FOCUS`，之后保持原 gen 再从新根完整验证一次，最后 `requireFresh` 复查再 `ACTION_SET_TEXT`。不使用 generic stored node → childPath → fingerprint 恢复链，不回落 Web/ADB/IME。
+5. native 只有严格路径 `ACTION_SET_TEXT` 返回 true 才产出 `strictIdentityVerified:true`；manage 必须收到真值才报告严格输入成功。它是身份验证与动作被接受的回执，不是文字精确回读、消息发送或支付成功证明；Jev 的字段等值验收须另做新鲜观察。
+
+### 3.3 新鲜度边界与验收限制
+
+`SnapshotFreshness` 在读取库存/遍历前 capture 事件纪元，仅同纪元 publish 才接受新快照，不能清掉遍历中发生的失效。`requireFresh` 检查失效→加锁读取 gen→再次检查失效，动作紧前再复查；带旧 gen 的调用不自动建树复活原目标。服务重连/中断/断连、窗口/内容/滚动/文本/窗口集合事件均失效。
+
+XML `notificationTimeout="200"` 仍存在；未送达事件、live traversal 与动作之间、最终复查与动作之间不是原子事务。严格聚焦后的事件/IME 窗口可使第二次验证拒绝，这是 fail-closed 行为，不可放宽库存/纪元条件掩盖。当前源码、host TS 构建/测试和静态门禁不能替代最终 APK 的 native 编译、CDP、ADB 两方向及真机证明；实际缺口和 CI draft-PR 授权例外见 [known-gaps.md](known-gaps.md)。
+
+### 3.4 外部 Jev 消费者的部署边界
+
+工作区另有 proposed `dsh-jev-local` 源码，不在本 fork 的 APK/runtime 打包树内，也未因这次 native/manage 修订而安装或部署。该消费者的 observation 要求完整 V2、显式非截断和唯一窗口证据，把隐藏行保留为身份计数；runtime 在新鲜观察后仅用 explicit texts 的值，绑定 id 引用与上述 strictIdentity，要求 a11y 真回执并另做新鲜精确回读；field_equals 还要求同范围、唯一 RID、editable、显式 password:false 与原始文本等值。以上只是已审读源码的消费者契约，不是当前设备模型工具已升级或 fork APK 已包含 Jev 的声明。
+
+## 4. 历史增量（不作为当前构建或验收证据）
 
 ## 0.13.3 W2/W3/W10 桥协议增量
 

@@ -46,6 +46,8 @@ export function detailRecord(n: UiNode, extra: Record<string, unknown> = {}): Re
     editable: n.editable,
     checked: n.checked,
     visible: n.visible,
+    enabled: n.enabled,
+    password: n.password,
     parentId: n.parentId,
     ...extra,
   }

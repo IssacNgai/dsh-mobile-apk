@@ -278,12 +278,13 @@ class DeviceControlService : AccessibilityService() {
      * 实测同一份快照内浅层节点可点、深层「显示」行报「行 57 已不存在」，连文本/几何特征匹配
      * 也失败（那一行在活树里已经不是当时的样子）。
      *
-     * 所以动作直接复用建树时抓到的 `AccessibilityNodeInfo`（必要时 `refresh()` 一次），
+     * 普通动作可复用建树时抓到的 `AccessibilityNodeInfo`，但不调用 refresh；严格输入完全绕过它，
      * 不再依赖任何「重走」假设。重走只作为兜底，保留给节点已被回收的情形。
      */
     val rowNodes: List<AccessibilityNodeInfo?> = emptyList(),
     // 0.13.8 E2：建树时间预算触发 → 部分树 + 显式标注（宁可标注过的半棵树，不给一句超时）
     val truncated: Boolean = false,
+    val scope: JSONObject? = null,
   )
 
   private val lock = Any()
@@ -292,11 +293,8 @@ class DeviceControlService : AccessibilityService() {
   private val generation = java.util.concurrent.atomic.AtomicLong(System.currentTimeMillis() / 1000)
   /** issue #127 一次性迁移标记：旧截图目录 files/control-shots 只清一次。 */
   private val legacyShotDirCleaned = java.util.concurrent.atomic.AtomicBoolean(false)
-  @Volatile
-  private var invalidated = true
-
-  @Volatile
-  private var lastInvalidateAt = 0L
+  private val freshness = SnapshotFreshness()
+  private val invalidated: Boolean get() = freshness.isInvalidated()
 
   /** Last user-owned range observed by a screen operation; a change invalidates all real refs. */
   @Volatile
@@ -445,7 +443,7 @@ class DeviceControlService : AccessibilityService() {
     instance = this
     setEnabledFlag(this, true)
     token(this)
-    invalidated = true
+    freshness.invalidate()
     // 0.14.0 承载拆离：轮询由 ControlCarrier 持有（随前台引擎服务起停）；本服务只登记为
     // 语义/输入类 op 的处理器。a11y 关闭时队列照跑，browser*/vd* 不再随之不可达。
     ControlCarrier.a11y = this
@@ -457,18 +455,16 @@ class DeviceControlService : AccessibilityService() {
     // 只做失效标记：窗口/内容变化后旧快照的路径与坐标都不再可信。
     val type = event?.eventType ?: return
     if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED || type == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
-      type == AccessibilityEvent.TYPE_VIEW_SCROLLED
+      type == AccessibilityEvent.TYPE_VIEW_SCROLLED || type == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED ||
+      type == AccessibilityEvent.TYPE_WINDOWS_CHANGED
     ) {
-      val now = System.currentTimeMillis()
-      if (now - lastInvalidateAt >= 200) {
-        lastInvalidateAt = now
-        invalidated = true
-      }
+      // A second event after an intervening dump must not be dropped.
+      freshness.invalidate()
     }
   }
 
   override fun onInterrupt() {
-    // 系统要求实现；本服务不响应中断语义。
+    freshness.invalidate()
   }
 
   override fun onUnbind(intent: Intent?): Boolean {
@@ -482,6 +478,7 @@ class DeviceControlService : AccessibilityService() {
   }
 
   private fun teardown() {
+    freshness.invalidate()
     if (ControlCarrier.a11y === this) ControlCarrier.a11y = null
     instance = null
     synchronized(lock) { snapshot = null }
@@ -492,30 +489,36 @@ class DeviceControlService : AccessibilityService() {
 
   // ── 快照 ──────────────────────────────────────────────────────────────
 
+  /** Complete interactive-window inventory for the real display; no type exclusions. */
+  private fun inventoryWindows(): List<SnapshotWindowScope.WindowFact>? = try {
+    if (activeDisplayId != ScreenTargets.REAL_DISPLAY_ID) null else {
+      val inventory = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        getWindowsOnAllDisplays()[ScreenTargets.REAL_DISPLAY_ID]
+      } else windows
+      inventory?.map { SnapshotWindowScope.WindowFact(it.id, it.type) }
+    }
+  } catch (_: Exception) { null }
+
   private fun buildSnapshot(force: Boolean): Snapshot? {
     synchronized(lock) {
       val current = snapshot
       if (!force && !invalidated && current != null) return current
       // 重建即重钉：旧 pin 属于旧树，留着会让新树误用旧窗口的坐标系。
       snapshotWindowId = -1
+      val observedEpoch = freshness.capture()
+      val beforeWindows = inventoryWindows()
       val root = rootFor(activeDisplayId) ?: return null
       val nodes = LinkedHashMap<String, AccessibilityNodeInfo>()
       val bounds = HashMap<String, Rect>()
       val rows = ArrayList<ControlProtocolV2.Row>(512)
       // 与 rows 同下标的建树期节点句柄（见 Snapshot.rowNodes 说明）。
       val rowNodes = ArrayList<AccessibilityNodeInfo?>(512)
-      var count = 0
       // 0.13.8 E2：建树时间预算（3s）——超预算返回部分树并显式标注 truncated，
       // 宁可给一棵标注过的半棵树，也不给一句超时（V2 §4.1）。
-      var truncated = false
-      val deadline = android.os.SystemClock.uptimeMillis() + TREE_BUDGET_MS
+      val budget = SnapshotTraversalBudget(MAX_NODES, MAX_DEPTH, android.os.SystemClock.uptimeMillis() + TREE_BUDGET_MS)
       fun walk(node: AccessibilityNodeInfo?, path: String, childPath: IntArray, depth: Int) {
-        if (node == null || depth > MAX_DEPTH || count >= MAX_NODES) return
-        if (!truncated && android.os.SystemClock.uptimeMillis() > deadline) {
-          truncated = true
-          return
-        }
-        if (truncated) return
+        if (!budget.enter(node != null, depth, android.os.SystemClock.uptimeMillis())) return
+        if (node == null) return // enter already marked this incomplete.
         val rect = Rect()
         node.getBoundsInScreen(rect)
         var flag = 0
@@ -537,29 +540,42 @@ class DeviceControlService : AccessibilityService() {
             flag = flag,
             cls = node.className?.toString() ?: "",
             pkg = node.packageName?.toString() ?: "",
-            rid = node.viewIdResourceName ?: "",
+            rid = node.viewIdResourceName ?: "", // Platform identity only; never derive from label/path.
             windowId = node.windowId.toString(),
             text = node.text?.toString() ?: "",
             desc = node.contentDescription?.toString() ?: "",
+            password = try { node.isPassword } catch (_: Exception) { null },
           ),
         )
         if (rect.width() > 0 && rect.height() > 0) {
           nodes[path] = node
           bounds[path] = rect
-          count++
         }
         for (i in 0 until node.childCount) {
+          if (budget.truncated) break
           walk(node.getChild(i), if (path.isEmpty()) i.toString() else "$path.$i", childPath + i, depth + 1)
         }
       }
-      walk(root, "", IntArray(0), 0)
+      try {
+        walk(root, "", IntArray(0), 0)
+      } catch (_: Exception) {
+        // A disappearing/recycled node does not prove the remaining tree empty.
+        budget.incomplete()
+      }
+      budget.finish(android.os.SystemClock.uptimeMillis())
       val metrics = screenSize()
+      val afterWindows = inventoryWindows()
+      val selectedWindow = try { root.windowId } catch (_: Exception) { null }
+      val snapshotRotation = rotation()
+      budget.finish(android.os.SystemClock.uptimeMillis())
+      val stable = freshness.publish(observedEpoch)
+      if (!stable) budget.incomplete()
+      val scope = SnapshotWindowScope.evidence(activeDisplayId, selectedWindow, beforeWindows, afterWindows, stable)
       val fresh = Snapshot(
-        generation.incrementAndGet(), rotation(), metrics.first, metrics.second,
-        nodes, bounds, rows, rowNodes, truncated,
+        generation.incrementAndGet(), snapshotRotation, metrics.first, metrics.second,
+        nodes, bounds, rows, rowNodes, budget.truncated, scope,
       )
       snapshot = fresh
-      invalidated = false
       return fresh
     }
   }
@@ -714,7 +730,7 @@ class DeviceControlService : AccessibilityService() {
     if (observedScreenScope == scope) return
     observedScreenScope = scope
     synchronized(lock) { snapshot = null }
-    invalidated = true
+    freshness.invalidate()
   }
 
   /**
@@ -750,6 +766,10 @@ class DeviceControlService : AccessibilityService() {
           .put("reason", "screen-not-found")
           .put("screenId", requested)
           .put("scope", scope.wire)
+      if (activeDisplayId != displayId || activeScreenId != requested) {
+        freshness.invalidate()
+        synchronized(lock) { snapshot = null }
+      }
       activeScreenId = requested
       activeDisplayId = displayId
       return null
@@ -761,6 +781,10 @@ class DeviceControlService : AccessibilityService() {
         .put("reason", "screen-display-mismatch")
         .put("screenId", ScreenTargets.REAL)
         .put("displayId", ScreenTargets.REAL_DISPLAY_ID)
+    }
+    if (activeDisplayId != ScreenTargets.REAL_DISPLAY_ID || activeScreenId != ScreenTargets.REAL) {
+      freshness.invalidate()
+      synchronized(lock) { snapshot = null }
     }
     activeScreenId = ScreenTargets.REAL
     activeDisplayId = ScreenTargets.REAL_DISPLAY_ID
@@ -958,21 +982,17 @@ class DeviceControlService : AccessibilityService() {
       width = snap.width,
       height = snap.height,
       truncated = snap.truncated,
-    )
+    ).put("snapshotScope", snap.scope ?: JSONObject.NULL).put("strictInputIdentity", 1)
   }
 
-  /** 校验 gen（页面已变化时失败关闭）并返回目标节点。0.13.8 E4：-1 自愈重建 + Long gen。 */
+  /** Check delivered-event epoch and generation; never rebuild/reinterpret the original target. */
   private fun requireFresh(args: JSONObject): JSONObject? {
     val requested = if (args.has("gen")) args.optLong("gen", -1L) else -1L
     if (requested >= 0) {
-      var current = synchronized(lock) { snapshot?.gen ?: -1L }
-      if (current == -1L) {
-        // 0.13.8 E4（V2 §4.4）：「无快照」≠「过期」——当场重建，路径仍在就继续执行；
-        // 原实现两者混为一谈且唯一补救恰是会超时的 dump → 死锁。
-        val rebuilt = buildSnapshot(force = true)
-        if (rebuilt == null) return error("无可用快照且当场重建失败（无障碍服务可能未连接）——请稍后重试或检查设备控制服务")
-        current = rebuilt.gen
-      }
+      if (invalidated) return error("控件清单已失效（窗口/内容/文本变化）——请重新 android_ui_dump")
+      val current = synchronized(lock) { snapshot?.gen ?: -1L }
+      // The generation read may wait on a traversal; check its delivered-event epoch again.
+      if (invalidated) return error("控件清单已失效（窗口/内容/文本变化）——请重新 android_ui_dump")
       if (current != requested) {
         return error("控件清单已过期（gen=$requested，当前=$current）——界面已变化，请重新 android_ui_dump；不要按旧引用猜测性点击")
       }
@@ -1085,6 +1105,7 @@ class DeviceControlService : AccessibilityService() {
           hops++
         }
         if (node.isClickable) {
+          requireFresh(args)?.let { return it }
           val ok = node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
           if (ok) {
             val rect = Rect()
@@ -1096,7 +1117,8 @@ class DeviceControlService : AccessibilityService() {
         }
         val rect = Rect()
         node.getBoundsInScreen(rect)
-        return tapAt(rect.exactCenterX(), rect.exactCenterY(), "gesture-fallback")
+        requireFresh(args)?.let { return it }
+        return tapAt(rect.exactCenterX(), rect.exactCenterY(), "gesture-fallback", args)
       }
       Target.None -> Unit
     }
@@ -1105,19 +1127,20 @@ class DeviceControlService : AccessibilityService() {
       val basis = coordBasis()
       val x = (args.optDouble("nx") * basis.width).toFloat()
       val y = (args.optDouble("ny") * basis.height).toFloat()
-      return withBasis(tapAt(x, y, "gesture-norm"), basis)
+      return withBasis(tapAt(x, y, "gesture-norm", args), basis)
     }
     return error("需要 row（行句柄）或 nx/ny")
   }
 
   /** 手势长按（0.13.8 E6）：路径不移动、时长 durationMs——区别于 tapAt 的 60ms 点按。 */
-  private fun pressAt(x: Float, y: Float, durationMs: Long, via: String): JSONObject {
+  private fun pressAt(x: Float, y: Float, durationMs: Long, via: String, args: JSONObject): JSONObject {
     val path = Path().apply { moveTo(x, y) }
     val gesture = GestureDescription.Builder()
       .addStroke(GestureDescription.StrokeDescription(path, 0, durationMs))
       .build()
     val latch = java.util.concurrent.CountDownLatch(1)
     var ok = false
+    requireFresh(args)?.let { return it }
     val dispatched = dispatchGesture(gesture, object : GestureResultCallback() {
       override fun onCompleted(description: GestureDescription?) { ok = true; latch.countDown() }
       override fun onCancelled(description: GestureDescription?) { latch.countDown() }
@@ -1148,6 +1171,7 @@ class DeviceControlService : AccessibilityService() {
           hops++
         }
         if (node.isLongClickable) {
+          requireFresh(args)?.let { return it }
           val ok = node.performAction(AccessibilityNodeInfo.ACTION_LONG_CLICK)
           if (ok) {
             val rect = Rect()
@@ -1158,7 +1182,8 @@ class DeviceControlService : AccessibilityService() {
         }
         val rect = Rect()
         node.getBoundsInScreen(rect)
-        return pressAt(rect.exactCenterX(), rect.exactCenterY(), durationMs, "gesture-longclick")
+        requireFresh(args)?.let { return it }
+        return pressAt(rect.exactCenterX(), rect.exactCenterY(), durationMs, "gesture-longclick", args)
       }
       Target.None -> Unit
     }
@@ -1167,18 +1192,19 @@ class DeviceControlService : AccessibilityService() {
       val basis = coordBasis()
       val x = (args.optDouble("nx") * basis.width).toFloat()
       val y = (args.optDouble("ny") * basis.height).toFloat()
-      return withBasis(pressAt(x, y, durationMs, "gesture-norm-longclick"), basis)
+      return withBasis(pressAt(x, y, durationMs, "gesture-norm-longclick", args), basis)
     }
     return error("需要 row（行句柄）或 nx/ny")
   }
 
-  private fun tapAt(x: Float, y: Float, via: String): JSONObject {
+  private fun tapAt(x: Float, y: Float, via: String, args: JSONObject): JSONObject {
     val path = Path().apply { moveTo(x, y) }
     val gesture = GestureDescription.Builder()
       .addStroke(GestureDescription.StrokeDescription(path, 0, 60))
       .build()
     val latch = java.util.concurrent.CountDownLatch(1)
     var ok = false
+    requireFresh(args)?.let { return it }
     val dispatched = dispatchGesture(gesture, object : GestureResultCallback() {
       override fun onCompleted(description: GestureDescription?) { ok = true; latch.countDown() }
       override fun onCancelled(description: GestureDescription?) { latch.countDown() }
@@ -1211,7 +1237,63 @@ class DeviceControlService : AccessibilityService() {
     } catch (_: Throwable) { /* 忽略 */ }
   }
 
+  private fun strictFact(node: AccessibilityNodeInfo): StrictInputIdentity.Fact {
+    val rect = Rect()
+    node.getBoundsInScreen(rect)
+    return StrictInputIdentity.Fact(node.packageName?.toString() ?: "", node.windowId.toString(),
+      node.viewIdResourceName ?: "", node.className?.toString() ?: "", node.isPassword,
+      node.isEditable, node.isEnabled, node.isVisibleToUser, rect.width(), rect.height())
+  }
+
+  /** Separate opt-in route: never reinterpret a row through the generic fallback resolver. */
+  private fun handleStrictSetText(args: JSONObject): JSONObject {
+    val request = args.opt("strictIdentity") as? JSONObject ?: return error("strictIdentity 必须是版本 1 的身份对象")
+    val rowNumber = args.opt("row") as? Number ?: return error("严格输入需要原始 row")
+    val genNumber = args.opt("gen") as? Number ?: return error("严格输入需要原始 gen")
+    if (rowNumber.toDouble() != rowNumber.toInt().toDouble() || rowNumber.toInt() < 0 ||
+      genNumber.toDouble() != genNumber.toLong().toDouble() || genNumber.toLong() < 0 ||
+      activeDisplayId != ScreenTargets.REAL_DISPLAY_ID) return error("严格输入只支持真实屏原始 row/gen")
+    requireFresh(args)?.let { return it }
+    val snap = synchronized(lock) { snapshot } ?: return error("没有原始快照")
+    val row = snap.rows.getOrNull(rowNumber.toInt()) ?: return error("原始行不存在")
+    val expected = StrictInputIdentity.Fact(row.pkg, row.windowId, row.rid, row.cls, row.password,
+      row.flag and ControlProtocolV2.F_EDITABLE != 0, row.flag and ControlProtocolV2.F_ENABLED != 0,
+      row.flag and ControlProtocolV2.F_VISIBLE != 0, row.w, row.h)
+    if (snap.gen != genNumber.toLong() || snap.truncated || snap.scope?.optBoolean("inventoryComplete") != true ||
+      snap.scope?.optString("selectedWindowId") != row.windowId || !StrictInputIdentity.matchesRequest(request, expected) ||
+      snap.rows.count { it.rid == row.rid } != 1 || snap.rows.any { it.windowId != row.windowId }) return error("原始快照不满足严格输入身份条件")
+    val source = object : StrictInputIdentity.Source<AccessibilityNodeInfo> {
+      override fun root(): AccessibilityNodeInfo? = rootFor(ScreenTargets.REAL_DISPLAY_ID)
+      override fun inventory(): List<SnapshotWindowScope.WindowFact>? = inventoryWindows()
+      override fun fact(node: AccessibilityNodeInfo): StrictInputIdentity.Fact = strictFact(node)
+      override fun childCount(node: AccessibilityNodeInfo): Int = node.childCount
+      override fun child(node: AccessibilityNodeInfo, index: Int): AccessibilityNodeInfo? = node.getChild(index)
+      override fun now(): Long = android.os.SystemClock.uptimeMillis()
+      override fun fresh(): Boolean = activeDisplayId == ScreenTargets.REAL_DISPLAY_ID && requireFresh(args) == null
+    }
+    try {
+      val first = StrictInputIdentity.resolve(expected, source, MAX_NODES, MAX_DEPTH, TREE_BUDGET_MS)
+        ?: return error("严格输入实时身份验证失败（重复/不完整/窗口或属性变化）")
+      if (!first.isFocused) {
+        requireFresh(args)?.let { return it }
+        if (!first.performAction(AccessibilityNodeInfo.ACTION_FOCUS)) return error("严格输入聚焦失败")
+      }
+      // Focus may change identity/window state; re-walk from a new root, keeping the original gen.
+      val target = StrictInputIdentity.resolve(expected, source, MAX_NODES, MAX_DEPTH, TREE_BUDGET_MS)
+        ?: return error("严格输入聚焦后身份已变化")
+      val text = args.optString("text", "")
+      val clear = args.optBoolean("clear", false)
+      val value = if (clear) text else (target.text?.toString() ?: "") + text
+      val bundle = Bundle().apply { putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, value) }
+      requireFresh(args)?.let { return it }
+      val ok = target.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, bundle)
+      return if (ok) JSONObject().put("setText", value.length).put("cleared", clear).put("strictIdentityVerified", true)
+      else error("严格输入 ACTION_SET_TEXT 被目标拒绝")
+    } catch (_: Exception) { return error("严格输入属性读取或动作失败") }
+  }
+
   private fun handleSetText(args: JSONObject): JSONObject {
+    if (args.has("strictIdentity")) return handleStrictSetText(args)
     requireFresh(args)?.let { return it }
     val text = args.optString("text", "")
     val clear = args.optBoolean("clear", false)
@@ -1224,17 +1306,19 @@ class DeviceControlService : AccessibilityService() {
       // 允许在容器上尝试一次（部分实现把 editable 标在子节点）
       val child = (0 until node.childCount).mapNotNull { node.getChild(it) }.firstOrNull { it.isEditable }
       if (child == null) return error("目标不是可编辑节点")
-      return commitText(child, text, clear)
+      return commitText(child, text, clear, args)
     }
-    return commitText(node, text, clear)
+    return commitText(node, text, clear, args)
   }
 
-  private fun commitText(node: AccessibilityNodeInfo, text: String, clear: Boolean): JSONObject {
+  private fun commitText(node: AccessibilityNodeInfo, text: String, clear: Boolean, args: JSONObject): JSONObject {
+    requireFresh(args)?.let { return it }
     node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
     val value = if (clear) text else (node.text?.toString() ?: "") + text
     val bundle = Bundle().apply {
       putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, value)
     }
+    requireFresh(args)?.let { return it }
     val ok = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, bundle)
     return if (ok) JSONObject().put("setText", value.length).put("cleared", clear)
     else error("ACTION_SET_TEXT 被目标拒绝")
@@ -1280,6 +1364,7 @@ class DeviceControlService : AccessibilityService() {
         "up" -> AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
         else -> null
       }
+      requireFresh(args)?.let { return it }
       if (legacy != null && target.performAction(legacy)) {
         return JSONObject().put("scrolled", direction).put("via", "ACTION_SCROLL")
       }
@@ -1291,6 +1376,7 @@ class DeviceControlService : AccessibilityService() {
         "right" -> AccessibilityNodeInfo.AccessibilityAction.ACTION_SCROLL_RIGHT.id
         else -> null
       }
+      requireFresh(args)?.let { return it }
       if (directional != null && target.performAction(directional)) {
         return JSONObject().put("scrolled", direction).put("via", "ACTION_SCROLL_DIRECTIONAL")
       }
@@ -1312,6 +1398,7 @@ class DeviceControlService : AccessibilityService() {
       .build()
     val latch = java.util.concurrent.CountDownLatch(1)
     var ok = false
+    requireFresh(args)?.let { return it }
     val dispatched = dispatchGesture(gesture, object : GestureResultCallback() {
       override fun onCompleted(description: GestureDescription?) { ok = true; latch.countDown() }
       override fun onCancelled(description: GestureDescription?) { latch.countDown() }
