@@ -6,7 +6,7 @@ import { createHash } from 'node:crypto'
 import { spawnSync, execFileSync } from 'node:child_process'
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 const ROOT = resolve(import.meta.dirname, '../..')
 const yaml = readFileSync(join(ROOT, '.github/workflows/build-apk-source.yml'), 'utf8').replaceAll('\r\n', '\n')
 function step(name, workflow = yaml) {
@@ -23,7 +23,8 @@ const android = process.platform === 'android'
 const BASH = android ? join(process.env.PREFIX, 'bin/bash') : '/bin/bash'
 const NODE = android ? join(process.env.PREFIX, 'bin/node') : process.execPath
 const PYTHON = android ? join(process.env.PREFIX, 'bin/python3') : '/usr/bin/python3'
-const HOST_PATH = android ? process.env.PATH : '/usr/bin:/bin'
+// setup-node lives outside /usr/bin on CI: retain the exact running Node, not arbitrary host PATH.
+const HOST_PATH = android ? process.env.PATH : dirname(NODE) + ':/usr/bin:/bin'
 function environment(root, extra = {}) {
   return { PATH: join(root, 'bin') + ':' + HOST_PATH, HOME: root, TMPDIR: root, LC_ALL: 'C',
     ...(android ? Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith('LD_') || key.startsWith('TERMUX_'))) : {}),

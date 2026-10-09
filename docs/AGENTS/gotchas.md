@@ -1550,3 +1550,5 @@
     **真因**：路径 checkout 从 index 恢复，不会用 HEAD 填充空 index；已暂存的替换也会被当作恢复来源，构建阶段同一命令在中断复跑时同样不可靠。对当前 HEAD 做 reset 还可能保留错误来源版本。
     **修法**：取源和 Harness 阶段入口独立验证专用物理目录、普通 `.git`、Git toplevel/gitdir/common-dir 与 index 链接，先拒绝已设置的 Git 重定向环境（空值也拒绝，不悄悄清空），再 `checkout --force --detach` 到原有固定 commit，最后 `clean -fdq` 清非忽略残留；不带 `-x`，不改 tag/contract/manifest 断言，也不以 `|| true` 或可变版本绕过。守卫在复用仓 fetch 之前执行；阶段入口在恢复项目 overlay 和安装依赖之前执行。
     **复验证据与边界**：`source-chain-rerun.test.mjs` 抽实际 workflow 命令，用本地 fixture repo/no-checkout clone 重现原失败，并覆盖空 index、unborn HEAD、暂存/未暂存/删除/新增/冲突、中断后两次运行、ignored 依赖保留、缺 commit 和路径/gitdir/worktree/环境重定向拒绝。fixture 仅替换 URL 和 SHA，不联网；命令与结果由本轮报告记录。局部 Git/静态门禁不代表远端完整来源构建、APK、设备或发布已通过。
+
+267. **隔离 fixture 的 PATH 不能遗漏 setup-node toolcache（PR Gate 37967473053）**：新增完整取源回归执行真实 `node -e` contract/manifest 断言，但 Linux fixture 原本只有 `/usr/bin:/bin`，云端这两处没有 Node，七项回归报 `node: command not found`；Android 保留宿主 PATH 因而本地通过不能覆盖该错误。修法只把当前 `process.execPath` 所在目录加入 Linux fixture PATH 前缀，仍保留隔离 HOME/Git 配置及 file-only 协议，不引入任意宿主 PATH 或跳过断言。复验证据由修复提交的 PR Gate 记录；不代表 APK 或设备已通过。
