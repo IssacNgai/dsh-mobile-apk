@@ -217,7 +217,11 @@
 
 | 文件 | 职责 | 关键函数 |
 |---|---|---|
-| `DeviceControlService.kt` | 无障碍服务（语义控制面）：能力声明、树快照（路径 id + 与 uiautomator XML 同构的 attrs）、动作执行 | `buildSnapshot()` / `nodeAtPath()` / `handleClick/setText/scroll/global/screenshot()` / `token()` / `statusJson()` / `heartbeat()`；每个 real-screen op 在执行点重查 ScreenScope，范围切换会丢弃旧 snapshot/ref。 |
+| [DeviceControlService.kt](../../app/src/main/java/com/dsharnessmobile/shell/DeviceControlService.kt) | 无障碍服务（语义控制面）：原生 V2 快照/生产者握手、范围与事件纪元复查、普通动作与 opt-in 严格输入 | `buildSnapshot()` / `handleSnapshot()` / `requireFresh()` / `handleStrictSetText()` / `handleClick/setText/scroll/global/screenshot()`；每个 real-screen op 执行点重查 ScreenScope，范围切换丢旧 snapshot/ref；严格输入保持原始 row/gen、两次 live 唯一身份验证，不走普通恢复/ADB/Web 回退。 |
+| [SnapshotTraversalBudget.kt](../../app/src/main/java/com/dsharnessmobile/shell/SnapshotTraversalBudget.kt) | 有界遍历完整性判据：所有访问（含隐藏/零面积）计数，null advertised child、深度/节点/时间耗尽失败关闭 | `enter()` / `incomplete()` / `finish()`；`truncated:false` 只覆盖所选根子树。 |
+| [SnapshotFreshness.kt](../../app/src/main/java/com/dsharnessmobile/shell/SnapshotFreshness.kt) | 已送达无障碍事件纪元；防止建树发布清掉期间的新失效 | `capture()` / `invalidate()` / `isInvalidated()` / `publish()`；与 gen 共同复查，不声称消除未送达事件/检查到动作竞态。 |
+| [SnapshotWindowScope.kt](../../app/src/main/java/com/dsharnessmobile/shell/SnapshotWindowScope.kt) | 真实屏前后完整窗口库存证据；不预过滤 IME/系统/覆盖窗口 | `WindowFact` / `valid()` / `evidence()`；只给稳定且唯一选中 TYPE_APPLICATION 的 display 0 产 `inventoryComplete:true`。 |
+| [StrictInputIdentity.kt](../../app/src/main/java/com/dsharnessmobile/shell/StrictInputIdentity.kt) | 严格原生输入纯判据与可注入 fresh live traversal；区别 wire 短 class 与 native 完整 class | `Fact` / `matchesRequest()` / `safe()` / `Source` / `resolve()`；同 RID 在可见性/可编辑性等过滤前计数，前后库存完整且唯一才能返回节点。 |
 | `ControlPoller.kt` | 引擎队列客户端：长轮询取活（空闲 5s / 有活即时）、执行、回填、退避 | `loop()` / `execute()` / `post()` |
 
 相关壳侧改动：`AndroidBridge.a11yStatus()/openA11ySettings()/unlockRestrictedSettings()`；`AdbState.unlockRestrictedSettings()`（appops 一键解锁）；`MainActivity.openAccessibilitySettings()`；`EngineManager.snapshotSettingsBackup()`（换树前 settings 备份，issue #126 P1 兜底）。

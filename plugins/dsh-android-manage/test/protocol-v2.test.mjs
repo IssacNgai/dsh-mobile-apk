@@ -144,6 +144,7 @@ test('目标口径（view=target）收窄后仍结构自洽', () => {
  */
 function expectedOrigRows(rows, view = 'all') {
   const n = rows.length
+  const identity = (r) => r.rid !== '' || (r.flag & 4) !== 0 || r.password === true
   const actionable = (r) => (r.flag & (1 | 2 | 4)) !== 0   // clickable | scrollable | editable
   const keep = new Array(n).fill(false)
   const ancStack = []
@@ -151,7 +152,7 @@ function expectedOrigRows(rows, view = 'all') {
     while (ancStack.length > 0 && rows[ancStack[ancStack.length - 1]].depth >= rows[i].depth) ancStack.pop()
     const hasArea = rows[i].w > 0 && rows[i].h > 0
     const inSet = view === 'target' ? hasArea && (actionable(rows[i]) || rows[i].text !== '' || rows[i].desc !== '') : hasArea
-    if (inSet) {
+    if (inSet || identity(rows[i])) {
       keep[i] = true
       for (const a of ancStack) keep[a] = true
     }
@@ -173,7 +174,7 @@ function expectedOrigRows(rows, view = 'all') {
   const seen = new Set()
   for (let i = 0; i < n; i++) {
     if (!keep[i]) continue
-    if (nextKept[i] >= subtreeEnd[i]) {
+    if (nextKept[i] >= subtreeEnd[i] && !identity(rows[i])) {
       const r = rows[i]
       const key = [r.text, r.desc, r.cls, r.x + Math.floor(r.w / 2), r.y + Math.floor(r.h / 2)].join('\u0000')
       if (seen.has(key)) continue
@@ -244,9 +245,11 @@ test('FX-206.1：o 列缺失/越界/非递增一律失败关闭（宁可不给�
   assert.equal(decodeV2({ ...payload, o: [0, 2, 3, 5] }).ok, true)
 })
 
-test('FX-206.4：truncated 真值透出（缺列 = false，不再静默丢弃）', () => {
+test('FX-206.4：truncated 真值透出（缺列 = unknown，不再静默丢弃）', () => {
   const payload = encodeV2(MAPPING_ROWS, 'all', 1, 0, 100, 100)
   assert.equal(decodeV2(payload).value.truncated, false)
+  const legacy = { ...payload }; delete legacy.truncated
+  assert.equal(decodeV2(legacy).value.truncated, null)
   assert.equal(decodeV2({ ...payload, truncated: true }).value.truncated, true)
 })
 

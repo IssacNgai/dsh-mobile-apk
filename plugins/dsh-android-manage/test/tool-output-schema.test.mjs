@@ -58,7 +58,7 @@ function applyManage(face) {
  * `o: [0, 3, 5]` = 载荷行下标 → 原始行号——载荷第 2 行（id:n2，文本「设置」）对应**原始行 5**，
  * 用来钉死「句柄取映射而不是载荷下标」（FX-206.1）。
  */
-function v2Payload({ gen = 7, truncated = false } = {}) {
+function v2Payload({ gen = 7, truncated = undefined } = {}) {
   const p = {
     v: 2, gen, rot: 0, scr: [1080, 2400], raw: 6, view: 'all', n: 3,
     str: ['FrameLayout', 'com.android.settings', 'LinearLayout', 'Button', '设置'],
@@ -74,7 +74,7 @@ function v2Payload({ gen = 7, truncated = false } = {}) {
     t: [-1, -1, 4],
     s: [-1, -1, -1],
   }
-  if (truncated) p.truncated = true
+  if (truncated !== undefined) p.truncated = truncated
   return p
 }
 
@@ -192,10 +192,12 @@ test('FX-206.4：截断状态按载荷真值渲染（不再写死「未截断」
   })()
   assert.match(on.text, /已截断/, 'truncated=true 必须显式告知模型清单不完整')
   const off = await (async () => {
-    const { face } = makeFace({ snapshot: v2Payload() })
+    const { face } = makeFace({ snapshot: v2Payload({ truncated: false }) })
     return applyManage(face).byName('android_ui_dump').execute({}, EXEC)
   })()
   assert.match(off.text, /未截断/)
+  const legacy = await applyManage(makeFace({ snapshot: v2Payload() }).face).byName('android_ui_dump').execute({}, EXEC)
+  assert.match(legacy.text, /截断状态未知/)
   const v1 = await (async () => {
     const { face } = makeFace({ snapshot: v1Snapshot() })
     return applyManage(face).byName('android_ui_dump').execute({}, EXEC)

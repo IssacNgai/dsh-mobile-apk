@@ -1532,3 +1532,9 @@
     ② `ConvertFrom-Json` 的日期字段**默认就是 DateTime**，要字符串比较就显式 `.ToString('yyyy-MM-dd')`；
     ③ **执行输出与计划不一致时必须当场停手查**——我这次看到了 `62 ≠ 49` 却继续，这正是本仓反复出现的
        「输出看起来正常，但它证明的事情是假的」同一形态，只不过这次是我自己造的。
+
+264. **Jev 严格输入不能把“画面完整/参数 schema 新了”当成原生身份已验证（0.14.5 源码修订，设备验收待补）**：
+    **现象**：旧 V2 没有明确 password 元数据时，absent bit 容易被当 false；隐藏/零面积节点被呈现剪掉，重复 RID 看似唯一；遍历超预算却仍报完整、建树清掉期间事件，旧目标可能获得假新鲜度。更隐蔽的是 `defineTool` 根参数开放，旧工具体可忽略 strictIdentity，output 的未知回执拒绝发生在动作后，不能保护派发。
+    **真因**：呈现裁剪不是身份库存，所选根完整不是全屏窗口完整；缓存/代次不是绝对实时性；消费者支持新字段不是旧 native 能力握手，动作被接受也不是文字等值回读。RID 必须来自平台，不能由文本/路径派生。
+    **修法**：native 保留 `true/false/null` password 与原始行号/隐藏身份行；budget 统计全部访问，getter/null child/节点深度时间耗尽失败关闭；capture/publish 事件纪元不覆盖建树中失效；前后未过滤窗口库存只证明唯一选中 application。manage 从缓存检查 native `strictInputIdentity:1`、完整证据和原始节点后才派发闭合 strict 对象；native 保持原 row/gen，在聚焦前后各从新根全量计同 RID，校验完整 native class/password:false，不走存储节点/路径/指纹恢复与 Web/ADB 回退。严格写入需 `strictIdentityVerified:true`；editable V2 text 保留前后空白。
+    **复验证据与边界**：本轮按保存的 `SnapshotTraversalBudget` / `SnapshotFreshness` / `SnapshotWindowScope` / `StrictInputIdentity`、service 与 manage/protocol 源码对账；门禁执行结果由本轮报告记录，不能借旧 host 绿或旧 APK 冒称完成。200ms 事件通知节流、未送达事件、检查→动作非原子竞态、最终 native/同产物 CDP/ADB/真机均仍需验证。详见 `BRIDGE-API.md` 当前契约与 `known-gaps.md` 验收入口。

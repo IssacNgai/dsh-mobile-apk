@@ -194,7 +194,7 @@ sequenceDiagram
 - [K03] 5. `app/src/main/java/com/dsharnessmobile/shell/SnapshotExtractor.kt:81` 与 `:142` —— 同一条目把 `entry.size` 累加进 `done` 两次（一次用于上限判定、一次用于进度），于是总量上限 `maxTotalBytes = 8 GiB` 实际在约 4 GiB 处触发，`onProgress` 上报的解压字节数约翻倍（解压条在解压到一半时即报满）。后果：S-10 想要的「快照真实体量 3–5 倍余量」实际只剩约 1.6 倍，偏大的合法快照会被判成「解压炸弹」中止（错误文案指向超限而真因是重复计数）。进度口径同时失真——EngineStartFlow 的「已写入 N MB」由它派生。
 - [K04] 1. 【已修·本轮，见 §3.1】 （已证实，机制层）`jsString` 的 U+2028/U+2029「修复」编译成恒等替换：`AndroidBridge.kt:423-425` 源码是 `.replace(<裸 U+2028 字符>, "<单个反斜杠>u2028")`，第二个实参在 Kotlin 里是同一个字符（`\uXXXX` 是转义，不是六个字符）——编译产物 `app/build/tmp/kotlin-classes/debug/com/dsharnessmobile/shell/AndroidBridgeKt.class` 常量池里只有裸 U+2028/U+2029 两条字符串常量（`\x01\x00\x03 E2 80 A8`），没有 `\u2028` 转义串，两个实参去重成同一条 ⇒ 该行不做任何转义。为什么单测还是绿的（现场反证）：JVM 单测类路径显式引入了另一份实现 `org.json:json:20240303`（`app/build.gradle.kts:126-127` 注释自陈「本地单测用真实 org.json，android.jar 桩在 JVM 里抛 Stub!」）；`BrowserHostNavigationPolicyTest.kt:129-141` 在恒等替换下仍判绿（`app/build/tmp/kotlin-classes/debugUnitTest/.../BrowserHostNavigationPolicyTest.class` 的常量池含断言用 `\u20` 字面量，`app/build/test-results/testDebugUnitTest/TEST-…BrowserHostNavigationPolicyTest.xml` 现场读到 tests=9 failures=0），只可能是这份 jar 的 `quote` 自己转义了 U+2028/U+2029（其 `JSONObject.class` 内含写 `\u` 的字符串字面量，与该区间转义实现相符）。设备运行时用的是 Android 框架 `org.json`，与单测类路径不是同一实现 ⇒ 这条绿的判据测不到设备行为，是假保证。设备侧是否真需要该转义（审查 §3.1-C3 / F-3 断言 `JSONObject.quote` 不转义该区间）本轮无本机复算手段，未证实。
 - [K04] 2. （已证实）审计语义：真实结果被塞进 args，`result` 恒 `ok`，拒绝完全不落账：`ControlAudit.kt:34` 硬编码 `.put("result","ok")`，而调用方把真值放进参数里（`ShellOps.kt:588-597` 传 `"ok" to ok`）⇒ `audit.ndjson` 出现 `result:"ok"` 与 `args.ok:false` 自相矛盾；`ShellOps.kt:94` 的范围拒绝 `return` 早于 `audit(...)`（四族审计点只在 `:101/:110/:119/:127`），安全事件（`screen-out-of-scope`）零留痕。事后复盘不可信（审查 §5.3）。
-- [K04] 3. （已证实，潜伏）跨语言「逐字同规则」在带空白文本上不成立：壳侧编码器在符号表阶段就 trim（`ControlProtocolV2.kt:196-197` `sym(row.text.trim())`），参考实现 `protocol-v2.ts:349` 直接 `symOf(row.text)`，trim 只发生在 XML 入口 `rowsFromRaw`（`protocol-v2.ts:235-236`）；而跨语言 fixture `app/src/test/resources/protocol-v2/canonical-rows.json` 现场数出 393 行里 0 行 text/desc 带前后空白 ⇒ 门禁看不见这条差异（任一侧 trim 口径回归都不会红），`ControlProtocolV2.kt:21-22` 的「逐字同规则」声明比实际成立范围宽。
+- [K04] 3. 历史空白差异已作源码对齐：native V2 与 TS 参考编码均只对非 editable text 做 trim，editable 原始 text 保留前后空白，desc 仍 trim。旧 canonical fixture 没有带边界空白的样例，不能单独证明修复；XML rowsFromRaw/ui-tree 兼容入口仍按旧呈现规则 trim，不作为 Jev 严格输入/等值验收来源。同产物 native 与设备精确回读证据仍待补。
 - [K04] 4. （代码路径已证实，设备后果未证实）返回键的「观测不到」方向与硬约束相反：`BackGate.kt:16-17` 的硬约束写「观测不到/关不掉的层一律消费，不得误退应用」，但 `parseDepth` 解析不出即回 0（`:70-73`，注释还自称「与观测不到不消费同向」），`onPageFinished(0)` → `available=false` → `decide` 落 `FINISH_ACTIVITY`（`:52-56`）⇒ 页面侧 `window.__dshBackDepth` 缺席（注入层/页面版本不匹配，正是审查 §7.7 那类「注册了但不真实可用」）时，返回键会退出应用而不是被消费。触发路径：`MainActivity.kt:502` 拉平拿 `undefined` → `parseDepth` 0；`:638` 只对引擎源页面拉平。
 - [K04] 5. （已证实、审查 §5.7 未修）`MuxClient` 文本帧重组缓冲无总量上限：`MAX_FRAME` 只管单帧（`MuxClient.kt:45`、`:167`），`textBuf` 是唯一的跨帧累积器（`:56`），`0x1` 起始帧持续 `fin=0` + 无限 `0x0` continuation 即可无界增长（`:172-173`）→ OOM；缓解措施只有「引擎不可信」这一条的威胁模型判断，没有代码兜底。
 - [K04] 备注（登记面而非代码缺陷）：`scripts/bridge-symmetry-baseline.json` 的 `preferenceGetters` 里 `getOverlayEnabled` 条目已过期，见下方漂移行。
@@ -205,7 +205,7 @@ sequenceDiagram
 - [K05] 5. 【未证实】`global` op 没有屏维度却按屏回执。`performGlobalAction(entry.id)`（:1330）不接受 displayId，但 `global ∈ REAL_SCREEN_OPS`，成功后回执被补上 `screenId`/`displayId`/`actionMode=a11y`（:669-674）。于是 `android_ui_global {screenId:"virtual-1", action:"back"}` 会回「已在 virtual-1 执行」，而 BACK 实际落在持有输入焦点的屏（通常是真实屏）。未证实：本轮为只读排查，未在设备上验证虚拟屏 active 时 `performGlobalAction` 的真实落点。
 - [K05] 漂移：`docs/AGENTS/ARCHITECTURE.md:68` 说 `DeviceControlService.kt` 是 1094 行、能力面到「屏幕范围执行点复查」为止，源码 `app/src/main/java/com/dsharnessmobile/shell/DeviceControlService.kt` 现场为 1333 行（`wc -l`），且含该表未列的虚拟屏窗口选择面 `rootProbe`/`WindowPick`（:353-434）与 browser*/vd*/sh* 分支（:634-664）。
 - [K05] 漂移：`docs/AGENTS/ARCHITECTURE.md:65` 说 ShizukuProbe.kt 被 MainActivity、DeviceControlService、VdisplayController 依赖，源码零引用——`grep -rl ShizukuProbe app/src/main` 只命中 `app/src/main/java/com/dsharnessmobile/shell/ShizukuProbe.kt` 自身（main 与 test 均无其它引用）。
-- [K05] 漂移：`docs/AGENTS/ACCESSIBILITY-API.md:167` 说「⑤ 多窗口 `getWindows()` 的窗口选择面未接」，源码已接：`getWindowsOnAllDisplays()` + `WindowPick.order`（`app/src/main/java/com/dsharnessmobile/shell/DeviceControlService.kt:353-434`，回归 `app/src/test/java/com/dsharnessmobile/shell/WindowPickTest.kt`）。
+- [K05] 已对齐：`docs/AGENTS/ACCESSIBILITY-API.md` 的旧「多窗口选择未接」已改为 `rootProbe/getWindowsOnAllDisplays/WindowPick.order` 已接；窗口选择、所选根完整性与唯一窗口库存证据是不同层，不可把钉住一个窗口写成全屏合并树。
 - [K05] 漂移：`docs/AGENTS/ACCESSIBILITY-API.md:99` 说 `MENU` / `MEDIA_PLAY_PAUSE` 为 API 36，源码 `app/src/main/java/com/dsharnessmobile/shell/GlobalActionCatalog.kt:33-34` 写 minSdk=31（SDK `api-versions.xml` 两个 android-36 平台均 `since="36"`，支持文档口径，影响见可疑点 2）。
 - [K06] 1. 双引号内的命令替换不被扫描 → 范围门 fail-open（S-1/S-2 家族的残留面，已确认）。`ShellOps.kt:319-338` 的 `"` 分支整段吞掉引号区域且不递归；`decideScreenCommand` 再经 `stripQuotedText` 抹白引号，于是该段既无命令词也无目标屏参数 → `ALLOW`。引擎侧 `plugins/dsh-android-bridge/src/screen-scope.ts:242-250` 同一形态（跨语言 fixture 因此恒绿，`test/fixtures/screen-scope-cases.json` 只覆盖裸 `` ` ``/`$()`）。触发：scope=virtual-only 时 `shExec('echo "$(screencap -p /sdcard/real.png)"')`（或 `sh -c 'echo "$(input -d 0 tap 1 2)"'`）→ 放行且内层真实执行，随后 `shPull` 取回（`shPull` 无范围门）→ 范围门被绕过的净效果。
 - [K06] 2. `capture`/spool 面无任何生产调用方，大输出被 16 KiB 内联路径截断（S-6 面，已确认）。`ShellOps.exec` 的 `capture = args.optBoolean("capture", false)`（`ShellOps.kt:99`）在引擎 `execAdbShell`/`execAdbLine` 的投递参数里都不存在（`index.ts:1052-1055`、`:1092`），故走 `ShizukuUserService.exec`：读满 16 KiB 即 `break` 并关闭管道（`ShizukuUserService.kt:70-75`、`:29`）。总输出超过约 64 KiB 管道缓冲时子进程会被提前关闭的读端打死 → `ok=false` 而引擎却按 128 KiB 承诺（`index.ts:1063`）；AIDL 注释与 `ShizukuTransport.kt:269` 都按「capture 在用」措辞。
@@ -746,7 +746,7 @@ sequenceDiagram
 - **可疑点**：
   1. **（已证实，机制层）`jsString` 的 U+2028/U+2029「修复」编译成恒等替换**：`AndroidBridge.kt:423-425` 源码是 `.replace(<裸 U+2028 字符>, "<单个反斜杠>u2028")`，第二个实参在 Kotlin 里是**同一个字符**（`\uXXXX` 是转义，不是六个字符）——编译产物 `app/build/tmp/kotlin-classes/debug/com/dsharnessmobile/shell/AndroidBridgeKt.class` 常量池里只有裸 U+2028/U+2029 两条字符串常量（`\x01\x00\x03 E2 80 A8`），**没有** `\u2028` 转义串，两个实参去重成同一条 ⇒ 该行不做任何转义。**为什么单测还是绿的（现场反证）**：JVM 单测类路径显式引入了另一份实现 `org.json:json:20240303`（`app/build.gradle.kts:126-127` 注释自陈「本地单测用真实 org.json，android.jar 桩在 JVM 里抛 Stub!」）；`BrowserHostNavigationPolicyTest.kt:129-141` 在恒等替换下仍判绿（`app/build/tmp/kotlin-classes/debugUnitTest/.../BrowserHostNavigationPolicyTest.class` 的常量池含断言用 `\u20` 字面量，`app/build/test-results/testDebugUnitTest/TEST-…BrowserHostNavigationPolicyTest.xml` 现场读到 tests=9 failures=0），只可能是这份 jar 的 `quote` 自己转义了 U+2028/U+2029（其 `JSONObject.class` 内含写 `\u` 的字符串字面量，与该区间转义实现相符）。设备运行时用的是 Android 框架 `org.json`，与单测类路径**不是同一实现** ⇒ 这条绿的判据测不到设备行为，是假保证。设备侧是否真需要该转义（审查 §3.1-C3 / F-3 断言 `JSONObject.quote` 不转义该区间）本轮无本机复算手段，**未证实**。
   2. **（已证实）审计语义：真实结果被塞进 args，`result` 恒 `ok`，拒绝完全不落账**：`ControlAudit.kt:34` 硬编码 `.put("result","ok")`，而调用方把真值放进参数里（`ShellOps.kt:588-597` 传 `"ok" to ok`）⇒ `audit.ndjson` 出现 `result:"ok"` 与 `args.ok:false` 自相矛盾；`ShellOps.kt:94` 的范围拒绝 `return` 早于 `audit(...)`（四族审计点只在 `:101/:110/:119/:127`），安全事件（`screen-out-of-scope`）零留痕。事后复盘不可信（审查 §5.3）。
-  3. **（已证实，潜伏）跨语言「逐字同规则」在带空白文本上不成立**：壳侧编码器在符号表阶段就 trim（`ControlProtocolV2.kt:196-197` `sym(row.text.trim())`），参考实现 `protocol-v2.ts:349` 直接 `symOf(row.text)`，trim 只发生在 XML 入口 `rowsFromRaw`（`protocol-v2.ts:235-236`）；而跨语言 fixture `app/src/test/resources/protocol-v2/canonical-rows.json` 现场数出 393 行里 **0 行** text/desc 带前后空白 ⇒ 门禁看不见这条差异（任一侧 trim 口径回归都不会红），`ControlProtocolV2.kt:21-22` 的「逐字同规则」声明比实际成立范围宽。
+  3. **空白口径已作源码对齐，验收不可借旧 fixture**：native V2 与 TS 参考编码保留 editable 原始 text（含前后空白），非 editable text / desc 仍 trim。XML 兼容入口仍采用旧呈现 trim，不是严格等值来源；旧 canonical fixture 缺边界空白不能替代新增反例与最终同产物 native/设备证明。当前严格消费者契约见 [BRIDGE-API.md](BRIDGE-API.md)。
   4. **（代码路径已证实，设备后果未证实）返回键的「观测不到」方向与硬约束相反**：`BackGate.kt:16-17` 的硬约束写「观测不到/关不掉的层一律消费，不得误退应用」，但 `parseDepth` 解析不出即回 0（`:70-73`，注释还自称「与观测不到不消费同向」），`onPageFinished(0)` → `available=false` → `decide` 落 `FINISH_ACTIVITY`（`:52-56`）⇒ 页面侧 `window.__dshBackDepth` 缺席（注入层/页面版本不匹配，正是审查 §7.7 那类「注册了但不真实可用」）时，返回键会退出应用而不是被消费。触发路径：`MainActivity.kt:502` 拉平拿 `undefined` → `parseDepth` 0；`:638` 只对引擎源页面拉平。
   5. **（已证实、审查 §5.7 未修）`MuxClient` 文本帧重组缓冲无总量上限**：`MAX_FRAME` 只管单帧（`MuxClient.kt:45`、`:167`），`textBuf` 是唯一的跨帧累积器（`:56`），`0x1` 起始帧持续 `fin=0` + 无限 `0x0` continuation 即可无界增长（`:172-173`）→ OOM；缓解措施只有「引擎不可信」这一条的威胁模型判断，没有代码兜底。
   - 备注（登记面而非代码缺陷）：`scripts/bridge-symmetry-baseline.json` 的 `preferenceGetters` 里 `getOverlayEnabled` 条目已过期，见下方漂移行。
@@ -782,14 +782,14 @@ flowchart TD
 - **一句话**：无障碍服务是设备的语义控制面——按需把当前窗口的节点树编成 V2 列式行表（行句柄 = 建树期下标），用「建树期节点句柄 → childPath → 文本几何特征」三级回指执行 click/longClick/setText/scroll/global 与 takeScreenshot，并给引擎提供 gen/invalidated 的便宜校验读数；ADB 键盘 IME 是它的文本注入补面（走广播而非 a11y）。
 - **入口/触发**：
   - 队列取活：`ControlPoller.loop()`（`ControlPoller.kt:96`）向 `127.0.0.1:3080/api/android/ui/pending` 长轮询 → `ControlCarrier.handle`（`ControlCarrier.kt:86`）→ `DeviceControlService.handle`（`DeviceControlService.kt:607`）。
-  - 服务生命周期：系统绑定 → `onServiceConnected`（:444，登记 `ControlCarrier.a11y` 并 `ensureStarted`）；`onAccessibilityEvent`（:457）只做失效标记；`onInterrupt`（:471）空实现；`onUnbind`/`onDestroy` → `teardown`（:485）。
+  - 服务生命周期：系统绑定 → `onServiceConnected`（登记 `ControlCarrier.a11y` 并失效旧纪元）；`onAccessibilityEvent` 只做纪元失效标记、不遍历；`onInterrupt` 同样失效；`onUnbind`/`onDestroy` → `teardown`（失效、注销处理器、丢快照）。
   - 键盘：`AdbKeyboardReceiver.onReceive`（`AdbKeyboardReceiver.kt:23`）← `am broadcast -a ADB_INPUT_TEXT/ADB_CLEAR_TEXT --es msg/--es auth`（引擎 manage 的 `android_ui_input`，`plugins/dsh-android-manage/src/index.ts:1889`）。
   - 设置页只读：`statusJson`（:214）/`token`（:235）经 `AndroidBridge.a11yStatus`（`MainActivity.kt:793`）。
 - **运行顺序**：
   1. 引擎工具面 → bridge `controlExec`（`plugins/dsh-android-bridge/src/index.ts:949`）→ 控制队列 enqueue（单在途；档位门、`A11Y_OPS` 门、`REAL_SCREEN_CONTROL_OPS` 范围门都在这一步）。
   2. `ControlPoller` 取活后在后台线程执行：`ControlCarrier.handle` 先分流 neverA11y 三组（`BROWSER_OPS`/`VD_OPS`/`SHELL_OPS` 直连各 Holder），其余交给已连接的无障碍服务；无连接 → `a11y-unavailable` 结构化拒绝（`ControlCarrier.kt:110`）。
   3. `handle` 先过第二道范围门 `realScreenScopeError`（:701）：未知屏 → `screen-not-found`；范围不含 → `screen-out-of-scope`；真实屏带非 0 displayId → `screen-display-mismatch`；虚拟屏经 `VdisplayController.displayIdForAlias`（`VdisplayController.kt:133`）取动态 displayId 并固定 `activeScreenId/activeDisplayId`（绝不回退 display 0）。
-  4. `snapshot` → `buildSnapshot(force=true)`（:496，3s 预算）→ `ControlProtocolV2.encode`（`ControlProtocolV2.kt:96`）回 V2 载荷（gen/rotation/尺寸/truncated）；动作 op 先 `requireFresh` 校验 gen（:935，无快照则当场重建而不是报过期），再 `resolveTarget`（:964）三级回指 → `performAction`，失败退 `dispatchGesture`（`tapAt` :1143 / `pressAt` :1083）。
+  4. `snapshot` → `buildSnapshot(force=true)`：先捕获 `SnapshotFreshness` 事件纪元，再读窗口库存与所选根，用 `SnapshotTraversalBudget` 在 4000 节点/40 深度/3s 内计入所有访问（含隐藏/零面积），末尾重读库存并发布同纪元证据；超预算、空 advertised child、walk 中未捕获的 getter/遍历异常、建树中事件使 `truncated=true`；password getter 单独失败保留 null，不自动标截断，但不能支持严格输入。`ControlProtocolV2.encode` 回 V2 载荷及 `pwv/pw`，`handleSnapshot` 附 `snapshotScope`。带 gen 的动作先 `requireFresh` 校验代次与失效，缺失/过期快照不自动重建或重新解释旧目标；通用动作仍 `resolveTarget` 三级回指，且每次 `performAction/dispatchGesture` 前再复查；严格输入另走完整 live 身份验证，不用该宽松恢复链。
   5. 结果经 `ControlPoller.envelope`（:168）带 `pv`+`caps` 回填 `/api/android/ui/result`；413 时 snapshot 自动改 `view=target` 重跑一次；跑完控制权回到 `ControlPoller.loop` 继续长轮询。
   6. 键盘路径独立：广播 → 来源校验 → `commitText`，注入是否落地由引擎侧 260ms 后的 `nodeText` 回读断言闭环（`index.ts:1899-1917`）。
 - **嵌套与线程**：
@@ -816,7 +816,7 @@ flowchart TD
 - **不变量**：
   1. 语义/输入/截屏 op 一律先过范围门，范围不含目标屏即结构化拒绝，绝不静默回退 display 0；范围切换（`observeScreenScope` :683）立即丢快照并置 `invalidated`，旧 ref 不得再复活。违反症状：用户在 virtual-only 下看到真实屏被点。
   2. childPath/row 只在**建树那一棵树**里有意义：`snapshotWindowId` 被钉住（`WindowPick` 优先恒选 pin），换树即 stale。违反症状：dump 刚给出的 row 立刻报「行 N 已不存在」（坑 136 实测形态）。
-  3. `AccessibilityNodeInfo` 只在同一快照内有效；解析不到就报 stale，不做猜测性点击。快照代次 `gen`（Long，秒级时间戳播种 + 自增）是唯一新鲜度判据。
+  3. `gen` 与已送达事件纪元失效共同判新鲜度：窗口/内容/滚动/文本/交互窗口集合变化、interrupt、重连/断连均失效；纪元在库存读取前捕获，建树不得清掉更新的失效。带旧 gen 的动作不通过自动重建复活，动作紧前复查；200ms 平台事件通知节流与复查→动作的非原子窗口仍存在，不得把无已送达事件当绝对实时证明。
   4. 截图必须落在引擎可读根（`filesDir/home/tmp/dsh-tmp` ≡ `TMPDIR`）；换目录 → 引擎 `read_image` 打不开（issue #127）。LRU 只兜底保留 8 份，工具层读完即删。
   5. ADB 键盘只在 IME 实例活跃时提交（`canCommit()`，`AdbKeyboardService.kt:106`）——注入面封闭；竞态是 `ime set` 后广播可能早于 `onCreate`，此时 `handle` 返回 false 且**无日志**，只靠引擎的 `nodeText` 回读断言兜底。
   6. 引擎判定「a11y 在线」只看心跳新鲜（20s）不看 `a11yEnabled` 裸标记（force-stop 会留僵尸 true）；注意注释里的 `serviceEpoch`（:436-439 声称 onServiceConnected 递增）**实际全仓零递增、零读取**，重连观测目前只能靠 `gen` 时间戳播种与日志。
@@ -835,7 +835,7 @@ flowchart TD
 
 漂移：`docs/AGENTS/ARCHITECTURE.md:68` 说 `DeviceControlService.kt` 是 1094 行、能力面到「屏幕范围执行点复查」为止，源码 `app/src/main/java/com/dsharnessmobile/shell/DeviceControlService.kt` 现场为 1333 行（`wc -l`），且含该表未列的虚拟屏窗口选择面 `rootProbe`/`WindowPick`（:353-434）与 browser*/vd*/sh* 分支（:634-664）。
 漂移：`docs/AGENTS/ARCHITECTURE.md:65` 说 ShizukuProbe.kt 被 MainActivity、DeviceControlService、VdisplayController 依赖，源码零引用——`grep -rl ShizukuProbe app/src/main` 只命中 `app/src/main/java/com/dsharnessmobile/shell/ShizukuProbe.kt` 自身（main 与 test 均无其它引用）。
-漂移：`docs/AGENTS/ACCESSIBILITY-API.md:167` 说「⑤ 多窗口 `getWindows()` 的窗口选择面未接」，源码已接：`getWindowsOnAllDisplays()` + `WindowPick.order`（`app/src/main/java/com/dsharnessmobile/shell/DeviceControlService.kt:353-434`，回归 `app/src/test/java/com/dsharnessmobile/shell/WindowPickTest.kt`）。
+已对齐：`docs/AGENTS/ACCESSIBILITY-API.md` 的旧「多窗口选择未接」已改为 `rootProbe/getWindowsOnAllDisplays/WindowPick.order` 已接；窗口选择、所选根完整性与唯一窗口库存证据是不同层，不可把钉住一个窗口写成全屏合并树。
 漂移：`docs/AGENTS/ACCESSIBILITY-API.md:99` 说 `MENU` / `MEDIA_PLAY_PAUSE` 为 API 36，源码 `app/src/main/java/com/dsharnessmobile/shell/GlobalActionCatalog.kt:33-34` 写 minSdk=31（SDK `api-versions.xml` 两个 android-36 平台均 `since="36"`，支持文档口径，影响见可疑点 2）。
 
 ```mermaid
@@ -1214,7 +1214,7 @@ flowchart TD
 
 #### P02 管理插件（dsh-android-manage）
 
-- **一句话**：引擎侧 14 个 `android_*` 工具的实现——把模型意图经「屏幕范围门 + 会话档位门」翻译成壳侧无障碍队列 op 或特权 shell 命令，再把壳侧载荷剪枝成紧凑语义清单（含两级披露与「界面未变」快路径）。本块 5 个源文件在协调仓 `plugins/dsh-android-manage/src/` 是权威源，apk 仓为逐字节镜像（本轮 diff 逐文件一致）。
+- **一句话**：引擎侧 14 个 `android_*` 工具的实现——把模型意图经「屏幕范围门 + 会话档位门」翻译成壳侧无障碍队列 op 或特权 shell 命令，再把壳侧载荷剪枝成紧凑语义清单（含两级披露与「界面未变」快路径）。管理插件源码位于 `plugins/dsh-android-manage/src/`；子仓镜像一致性必须由当前门禁实际验证，不沿用旧文件数或旧 diff 结论。
 - **入口/触发**：
   - 装配期（一次性）：`apply`（`plugins/dsh-android-manage/src/index.ts:2286`）取 `ctx.androidPrivilege`（`inject` 声明在 `:53`，要求 android-bridge 先装配），调用 `tools(ctx, face)`（`:105`）并把返回的 14 个工具逐个 `ctx.tools.register`（`:2295`）。服务缺失时退化为 fail-closed 桩（`:2291`）并 warn（`:2289`）。
   - 运行期（每次调用）：模型发起一次 tool call → 该工具的 `execute(args, exec)`；`exec.agent.session` 是档位判定的会话来源。
@@ -1234,11 +1234,11 @@ flowchart TD
 | `android_ui_tree` | 仅特权 shell（`adbChannelOnly` 提前门） | `execAdbLine` 的 `uiautomator dump` + `pull`（dump 前后关/还原动画） | `treeXmlPath` `denied` `text` |
 | `android_device_info` | 仅特权 shell | `execAdbShell` 的 `getprop`/`dumpsys window` + `execAdbLine` 的 `adb devices -l` | `model` `androidVersion` `frontApp` `resolution` `devices[]` `denied` `text` |
 | `android_act_input` | 仅特权 shell | `execAdbShell` 的 `input tap/swipe/keyevent/text` | `ok` `denied` `text` |
-| `android_ui_dump` | a11y `snapshot`（15s）优先，否则 ADB 回落 | `controlExec('snapshot')` / `execAdbLine` 的 `uiautomator dump` + `wm size` | `ok` `screen{w,h}` `rotation` `count` `rawCount` `nodes[]` `detailHandle` `detailPath` `note` `text` `denied` `unchanged?` `gen?` `screenId` `displayId` `scope` `actionMode` `guidance` |
+| `android_ui_dump` | a11y `snapshot`（15s）优先，否则 ADB 回落 | `controlExec('snapshot')` / `execAdbLine` 的 `uiautomator dump` + `wm size` | `ok` `screen{w,h}` `rotation` `count` `rawCount` `nodes[]` `truncated` `snapshotScope` `strictInputIdentity`（三者旧路径为 null）`detailHandle` `detailPath` `note` `text` `denied` `unchanged?` `gen?` `screenId` `displayId` `scope` `actionMode` `guidance` |
 | `android_ui_detail` | 无壳侧调用（本地缓存 + 明细文件） | 无（ref 走 `resolveRef`，`all` 走 `pageRows`） | `ok` `denied` `handle` `path` `node?` `rows?` `total` `offset` `omitted` `text` |
 | `android_ui_click` | ① WebView DOM `webAction`（wN/css:/role:）② 虚拟屏 x/y → `vdInput` ③ a11y `click`/`longClick` ④ ADB `input tap` | `webAction` / `vdInput` / `controlExec` / `execAdbShell` | `ok` `ref` `id` `label` `x` `y` `text` `denied` `screenId` `displayId` `scope` `actionMode` |
 | `android_ui_scroll` | a11y `scroll` 优先，否则 ADB `input swipe` | `controlExec('scroll')` / `execAdbShell` | `ok` `from[]` `to[]` `text` `denied` `screenId` `displayId` `scope` `actionMode` `guidance` |
-| `android_ui_input` | ① WebView DOM `webAction setText` ② a11y `setText` ③ ADBKeyboard 广播（注入后经 a11y `nodeText` 回读）④ `input text` | `webAction` / `controlExec('setText')` + `nodeText` / `execAdbShell` 的 `am broadcast` | `ok` `channel` `text` `denied` `screenId` `displayId` `scope` `actionMode` `guidance` |
+| `android_ui_input` | own `strictIdentity` 先走 real/a11y 专支：cap1 + 完整单窗口缓存 + 精确 id 原始 row/gen → native 两次 live 验证 → 必需真回执；否则保留普通 ① WebView DOM ② a11y ③ ADBKeyboard + nodeText 回读 ④ input text | 严格仅 `controlExec('setText')`，禁止 Web/ADB/聚焦框/容器回退；普通路径仍 `webAction` / `controlExec` + `nodeText` / `execAdbShell` | `ok` `strictIdentityVerified?` `channel` `text` `denied` `screenId` `displayId` `scope` `actionMode` `guidance` |
 | `android_web_dump` | a11y 队列 `webSnapshot`（读壳自有 WebView，刻意不进 `SCREEN_ACTIONS`，无 screenId） | `controlExec('webSnapshot')` | `ok` `denied` `count` `url?` `title?` `nodes[]` `text` |
 | `android_env_prepare` | 仅特权 shell | `execAdbShell` 的 `settings put global` + `ime enable/list` | `ok` `denied` `text` |
 | `android_app_launch` | 虚拟屏 → `vdLaunchApp`；真实屏 → ADB `monkey` | `controlExec('vdLaunchApp')` / `execAdbShell` | `ok` `denied` `pkg` `foreground` `text` |
@@ -1272,7 +1272,7 @@ flowchart TD
   3. 范围门与投递必须成对：`guard` 判范围 + `screenArgs` 把 screenId 投到壳侧执行。只判不投的后果是「门按 virtual-N 放行、执行落真实屏」，比直接拒绝更难排查。
   4. 协议 V2 失败关闭：`o` 列缺失或非严格递增 → 拒绝产出清单；句柄语义是「壳侧 walk 全量行表的原始行号」，不是载荷行下标（FX-206.1）。
   5. 虚拟屏截图 fail-closed：反查不到 SF token 只返回专用文案，绝不回落 displayId 硬试、也不回落无参 `screencap`；token 全程字符串（超 2^53 与 2^63-1，数值化即失真）。
-  6. `uiCache` 单槽 + 10 分钟 TTL + 结构指纹：ref 只对最近一次 dump 有效（`android_ui_dump` 的 `note` 明说）；「页面真的变了」的权威判据是壳侧 `gen` 校验，不是墙钟（TTL 放宽到 10 分钟的理由见 `:892`）。
+  6. `uiCache` 单槽 + 10 分钟 TTL + 含安全元数据/原始句柄的指纹：ref 只对最近一次 dump 有效；TTL 与相同画面不替代壳侧 gen + 事件纪元复查。`password:false` 必须来自显式平台/XML 值；缺失为 null，`truncated` 缺失为未知，所选根完整不等于窗口库存完整。严格输入还需原生生产者握手及 live 唯一身份重查（契约见 `BRIDGE-API.md`）。
   7. 授权与档位失败关闭：未授权或非 `danger-full-access` 时全部工具返回引导，不静默降级、不绕行；服务面（bridge）会再查一次，工具层只是 UX 快速路径。
 - **症状 → 排查**：
   - 模型说「拿不到数据 / 结果被拒」→ 跑 `node scripts/check-tool-output-schema.mjs`（源码级 `defineTool({name})` 名集合 vs 运行时注册名集合 + 引擎同款校验器）；grep `additionalProperties` 与三个返回分支的键集合。
@@ -2089,6 +2089,10 @@ app/src/main/java/com/dsharnessmobile/shell/MuxClient.kt
 app/src/main/java/com/dsharnessmobile/shell/ShellState.kt
 app/src/main/AndroidManifest.xml
 app/src/main/java/com/dsharnessmobile/shell/DeviceControlService.kt
+app/src/main/java/com/dsharnessmobile/shell/SnapshotFreshness.kt
+app/src/main/java/com/dsharnessmobile/shell/SnapshotTraversalBudget.kt
+app/src/main/java/com/dsharnessmobile/shell/SnapshotWindowScope.kt
+app/src/main/java/com/dsharnessmobile/shell/StrictInputIdentity.kt
 app/src/main/java/com/dsharnessmobile/shell/CoordBasisPolicy.kt
 app/src/main/java/com/dsharnessmobile/shell/GlobalActionCatalog.kt
 app/src/main/java/com/dsharnessmobile/shell/AdbKeyboardService.kt
@@ -2154,6 +2158,7 @@ plugins/dsh-android-manage/src/ui-tree.ts
 plugins/dsh-android-manage/src/protocol-v2.ts
 plugins/dsh-android-manage/src/vd-shot.ts
 plugins/dsh-android-manage/src/detail-store.ts
+plugins/dsh-android-manage/src/tree-fingerprint.ts
 glob:plugins/dsh-android-manage/test/*.test.mjs
 glob:plugins/dsh-android-manage/test/*.mjs
 plugins/dsh-android-browser/src/tools.ts
@@ -2280,7 +2285,7 @@ scripts/verify-state-sync-modep.test.mjs
 - [K02] 漂移：`docs/AGENTS/ARCHITECTURE.md:76` 给 LogCollector.kt 记 332 行（2026-09-14 实测），现为 931 行；同表 EngineService.kt 记 201 行，现为 246 行。
 - [K05] 漂移：`docs/AGENTS/ARCHITECTURE.md:68` 说 `DeviceControlService.kt` 是 1094 行、能力面到「屏幕范围执行点复查」为止，源码 `app/src/main/java/com/dsharnessmobile/shell/DeviceControlService.kt` 现场为 1333 行（`wc -l`），且含该表未列的虚拟屏窗口选择面 `rootProbe`/`WindowPick`（:353-434）与 browser*/vd*/sh* 分支（:634-664）。
 - [K05] 漂移：`docs/AGENTS/ARCHITECTURE.md:65` 说 ShizukuProbe.kt 被 MainActivity、DeviceControlService、VdisplayController 依赖，源码零引用——`grep -rl ShizukuProbe app/src/main` 只命中 `app/src/main/java/com/dsharnessmobile/shell/ShizukuProbe.kt` 自身（main 与 test 均无其它引用）。
-- [K05] 漂移：`docs/AGENTS/ACCESSIBILITY-API.md:167` 说「⑤ 多窗口 `getWindows()` 的窗口选择面未接」，源码已接：`getWindowsOnAllDisplays()` + `WindowPick.order`（`app/src/main/java/com/dsharnessmobile/shell/DeviceControlService.kt:353-434`，回归 `app/src/test/java/com/dsharnessmobile/shell/WindowPickTest.kt`）。
+- [K05] 已对齐：`docs/AGENTS/ACCESSIBILITY-API.md` 的旧「多窗口选择未接」已改为 `rootProbe/getWindowsOnAllDisplays/WindowPick.order` 已接；窗口选择、所选根完整性与唯一窗口库存证据是不同层，不可把钉住一个窗口写成全屏合并树。
 - [K05] 漂移：`docs/AGENTS/ACCESSIBILITY-API.md:99` 说 `MENU` / `MEDIA_PLAY_PAUSE` 为 API 36，源码 `app/src/main/java/com/dsharnessmobile/shell/GlobalActionCatalog.kt:33-34` 写 minSdk=31（SDK `api-versions.xml` 两个 android-36 平台均 `since="36"`，支持文档口径，影响见可疑点 2）。
 - [K06] 漂移：`历史 BRIDGE-API 副本（当前契约见§6 K04）` 说 ShizukuTransport/ShizukuUserService 是「固定 argv、16KB 输出上限；页面/引擎拿不到原始 binder 或任意 shell 面」（AIDL v1），源码 `ShizukuUserService.kt:30` 是 `PROTOCOL_VERSION = 2`（execCapture 落盘面 + 单文件 256 MiB），`ShizukuTransport.kt:271-301` 与 `ShellOps.kt:91-103` 交给引擎的正是任意 `sh -c` 命令面。
 - [K06] 漂移：`历史 BRIDGE-API 副本（当前契约见§6 K04）` 说 ScreenScope「执行点复查在 DeviceControlService」，源码 `ShellOps.kt:132`（scopeDenied）才是特权 shell 通道的执行点复查，`DeviceControlService.kt:703`（realScreenScopeError）只管无障碍 op 面。
