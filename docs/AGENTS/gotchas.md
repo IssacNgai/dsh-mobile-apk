@@ -1235,7 +1235,7 @@
 222. **Harness 构建步不复位固定 checkout：中途被杀后复跑会在全仓类型检查处假红（2026-09-29，本地链实测）**：
     **现象**：本地链复跑时 Harness 构建步报 `packages/llm/llm-deepseek/src/host.ts(41,10): error TS2345: ... '"loader/volatile-update"' ...`（`llm-pi-ai` 同型），看着像上游源码不兼容。
     **真因**：该步的顺序是「先全仓 `tsc -b tsconfig.host.json` → 再替换五个旧版 Cordis 源码 → 再单独编译旧版包」（坑 187 定的口径）。上一轮若在**替换之后**被杀，工作区就停在替换态；这一轮的全仓检查于是拿**当前**源码去配**旧版** loader，`loader/volatile-update` 之类事件自然不在旧版 `Events` 里 ⇒ 假红。CI 每轮全新检出，所以从未暴露。
-    **修法**：取源 detach 前与构建步首都复位专用 checkout（`git checkout -- .` + `git clean -fdq`，不带 `-x`，保留忽略依赖缓存）；构建步同时从本次 `GITHUB_SHA` 恢复权威 overlay 输入，避免上轮停在第一方 pin 已摘除的阶段而无法续跑。清理前验证 realpath 未脱离专用工作区。
+    **修法**：取源与构建步首都复位专用 checkout（现为验证物理路径/Git 归属后 `git checkout --force --detach <固定 commit>` + `git clean -fdq`，不带 `-x`，保留忽略依赖缓存；空 index 与已暂存覆盖的补充根因见坑 266）；构建步同时从本次 `GITHUB_SHA` 恢复权威 overlay 输入，避免上轮停在第一方 pin 已摘除的阶段而无法续跑。清理前验证 realpath 未脱离专用工作区。
     **为什么记进坑位**：与坑 220/221 同族——**「可被杀」是本地跑链的常态**（关机、换盘、手停），因此每个「先改后还原」的步骤都要自带复位；判据仍是「同一工作区连跑两次都绿」。此坑尤其阴：报错文本指向源码不兼容，容易误导人去查上游。
 
 223. **`pnpm deploy` 目标目录非空，本地复跑必判红（2026-09-29，本地链实测）**：
@@ -1544,3 +1544,9 @@
     **真因**：通用生成器把编译后对象的 `required:[keys]` 当 truthy 的根字段必填标记，却只为对象生成 `{}`，还忽略 `const`。因此可选 strictIdentity 被意外加入，再被引擎输入校验拒绝；正确的闭合 schema 反而暴露了门禁自身的 bug。预算计算是序列化 UTF-16 码元代理量，必须按现有口径压缩重复文案。
     **修法**：共享样本模块递归填必填子字段，`const` 优先于 enum/default，严格区分 `required:true` 与父对象必填数组；显式增加可选对象分支，并在 execute 前用引擎校验器验证每组输入。只缩短 android_ui_input 参数说明，保留闭合身份对象、native 能力/回执要求与原预算。helper 纳入镜像清单，不代表对端仓已经同步。
     **复验证据与边界**：manage 输出 schema 套件新增通用深层对象、常量优先级、真实 strictIdentity 合法/缺字段/错类型/错常量/额外键反证，以及缺原生证据时零动作拒绝回执；直接执行该套件通过。标准 gate 的宿主 wrapper 限制与其余执行结果由本轮报告分列，不作设备/native 成功声明。运行入口见 `build-and-env.md` §3.2。
+
+266. **`--no-checkout` 新仓的空 index 不能用路径 checkout 复位，已暂存覆盖也不会恢复上游（来源 run 37965315800）**：
+    **现象**：首轮 ARM64 来源链 clone/fetch 固定 commit/tag 后，`git checkout -- .` 报 `pathspec '.' did not match any file(s) known to git`，构建尚未开始即退出 1。旧回归只造已提交且未暂存变更的工作树，没覆盖真实 no-checkout 空 index。
+    **真因**：路径 checkout 从 index 恢复，不会用 HEAD 填充空 index；已暂存的替换也会被当作恢复来源，构建阶段同一命令在中断复跑时同样不可靠。对当前 HEAD 做 reset 还可能保留错误来源版本。
+    **修法**：取源和 Harness 阶段入口独立验证专用物理目录、普通 `.git`、Git toplevel/gitdir/common-dir 与 index 链接，先拒绝已设置的 Git 重定向环境（空值也拒绝，不悄悄清空），再 `checkout --force --detach` 到原有固定 commit，最后 `clean -fdq` 清非忽略残留；不带 `-x`，不改 tag/contract/manifest 断言，也不以 `|| true` 或可变版本绕过。守卫在复用仓 fetch 之前执行；阶段入口在恢复项目 overlay 和安装依赖之前执行。
+    **复验证据与边界**：`source-chain-rerun.test.mjs` 抽实际 workflow 命令，用本地 fixture repo/no-checkout clone 重现原失败，并覆盖空 index、unborn HEAD、暂存/未暂存/删除/新增/冲突、中断后两次运行、ignored 依赖保留、缺 commit 和路径/gitdir/worktree/环境重定向拒绝。fixture 仅替换 URL 和 SHA，不联网；命令与结果由本轮报告记录。局部 Git/静态门禁不代表远端完整来源构建、APK、设备或发布已通过。
