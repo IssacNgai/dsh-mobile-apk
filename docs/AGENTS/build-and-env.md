@@ -126,6 +126,10 @@ Harness按固定0.2.0-rc.2源码完成全仓构建；prepare-harness-vendor-over
 
    未装时的行为是**如实 SKIP 并计数**（`SKIP(#n) 宿主缺 peer 依赖：…`），`--require`（本地链/发布链）下判红——不允许用 SKIP 冒充绿。
 
+8. **输出 schema 门禁的输入样本与 wire 预算（strictIdentity 回归）**：`check-tool-output-schema.mjs` 在执行每个分支前，先用引擎同一校验器验证其输入；通用样本模块 `scripts/lib/tool-schema-samples.mjs` 递归填必填子对象，优先保留 `const`，区分作者 `required:true` 与编译后对象的 `required:[keys]`。可选对象用独立分支覆盖，不能因其子字段必填而误当根参数必填。回归在 manage 的 `test/tool-output-schema.test.mjs`，随输出门禁自动运行；strictIdentity 样本只证明 schema 合法和缺证据时拒绝，不证明 native 成功写入。
+   - 本地先构建插件，再跑 `node scripts/check-tool-output-schema.mjs --require` 和 `node scripts/check-tool-surface-budget.mjs`；`--update` 不用于文案修复。预算按 `JSON.stringify({name,description,parameters}).length` 的 UTF-16 码元计量，不等于 UTF-8 字节或 token，既有基线与阈值保持不变。
+   - Termux 宿主的子进程 `node --test <相对路径>` 如报 `expected absolute path`，必须单列为宿主 wrapper 限制；可直接 `node <测试文件>` 验证套件，但不能冒称标准聚合门禁通过。构建产物/依赖缺席也要单列，不能以计算出的文案节省替代完整 gate 结果。
+
 ### 3.3 改动流程规范（改哪个仓库、改完必做三件事）
 
 | 改动面 | 落点 | 约束 |

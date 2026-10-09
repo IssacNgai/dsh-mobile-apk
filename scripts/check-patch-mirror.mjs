@@ -304,6 +304,7 @@ if (peer) {
     'scripts/check-runtime-assets.mjs',
     'scripts/check-snapshot-fingerprint.mjs',
     'scripts/check-tool-output-schema.mjs',
+    'scripts/lib/tool-schema-samples.mjs',
     'scripts/check-control-ops.mjs',
     'scripts/check-release-gates.mjs',
     'scripts/control-ops-known-gaps.json',

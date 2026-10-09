@@ -1925,10 +1925,10 @@ return String(value.text ?? '') + (lines.length > 0 ? '\n' + lines.join('\n') : 
       'clear: true 先原子清空聚焦框（全选+删除，可单独使用）。channel: "input" 可强制走 input text（仅 ASCII，不推荐）。' +
       '长度 ≤500。需设备控制授权（无障碍服务已开启，或 ADB 三道门齐备）+ 会话档位 danger-full-access。',
     parameters: {
-      text: { type: 'string', description: '要输入的文本（≤500 字符；与 clear 至少其一）' },
-      clear: { type: 'boolean', description: '先清空当前聚焦输入框（ADBKeyboard ADB_CLEAR_TEXT 广播；可单独使用）' },
-      channel: { type: 'string', enum: ['auto', 'adbkeyboard', 'input'], description: '输入通道（默认 auto=ADBKeyboard 优先）' },
-      ref: { type: 'string', description: '无障碍通道的目标输入框引用（id:n3 / text:… / desc:…；缺省用当前聚焦框）' },
+      text: { type: 'string', description: '文本≤500字；与 clear 至少其一' },
+      clear: { type: 'boolean', description: '先清空聚焦框；可单独使用' },
+      channel: { type: 'string', enum: ['auto', 'adbkeyboard', 'input'], description: '通道；auto 默认优先 ADBKeyboard' },
+      ref: { type: 'string', description: '无障碍输入框引用：id:n3/text:…/desc:…；默认聚焦框' },
       strictIdentity: { type: 'object', additionalProperties: false, properties: {
         v: { type: 'number', const: 1, required: true }, packageName: { type: 'string', required: true },
         windowId: { type: 'string', required: true }, resourceId: { type: 'string', required: true },

@@ -11,7 +11,8 @@ import { tmpdir } from 'node:os'
 import { pathToFileURL } from 'node:url'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
+import { parameterSchemaSpecToJsonSchema, validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
+import { argsFromSchema, optionalObjectVariants, propSample } from '../../../scripts/lib/tool-schema-samples.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const mod = await import(pathToFileURL(join(HERE, '..', 'lib', 'index.js')).href)
@@ -378,6 +379,98 @@ test('D9：明细落盘失败时句柄不得停留在上一轮（detailHandle/de
     else process.env.TMPDIR = prevTmp
     rmSync(okTmp, { recursive: true, force: true })
   }
+})
+
+test('schema gate samples recurse through required objects in author and compiled schemas', () => {
+  const spec = {
+    envelope: { type: 'object', required: true, additionalProperties: false, properties: {
+      nested: { type: 'object', required: true, additionalProperties: false, properties: {
+        version: { type: 'number', const: 7, required: true },
+        enabled: { type: 'boolean', const: true, required: true },
+        optional: { type: 'string' },
+      } },
+    } },
+    optionalObject: { type: 'object', additionalProperties: false, properties: {
+      zero: { type: 'number', const: 0, required: true },
+      no: { type: 'boolean', const: false, required: true },
+    } },
+  }
+  const compiled = parameterSchemaSpecToJsonSchema(spec)
+  const expected = { envelope: { nested: { version: 7, enabled: true } } }
+  for (const schema of [{ properties: spec }, compiled]) {
+    const base = argsFromSchema(schema)
+    assert.deepEqual(base, expected)
+    assert.deepEqual(validateJsonSchemaValue(compiled, base), [])
+    const variants = optionalObjectVariants(schema, base)
+    assert.deepEqual(variants, [{ ...expected, optionalObject: { zero: 0, no: false } }])
+    for (const args of variants) assert.deepEqual(validateJsonSchemaValue(compiled, args), [])
+  }
+  assert.deepEqual(undefinedPaths(argsFromSchema(compiled)), [])
+})
+
+test('schema gate samples honor const before enum/default, including false, zero and null', () => {
+  for (const [schema, expected] of [
+    [{ type: 'boolean', const: false, enum: [false, true], default: true }, false],
+    [{ type: 'number', const: 0, default: 9 }, 0],
+    [{ type: 'null', const: null }, null],
+    [{ type: 'string', const: '', default: 'other' }, ''],
+    [{ type: 'string', enum: ['first', 'second'], default: 'second' }, 'first'],
+    [{ type: 'number', default: 8 }, 8],
+    [{ type: 'array', items: { type: 'string' } }, []],
+  ]) {
+    const sample = propSample(schema)
+    assert.deepEqual(sample, expected)
+    assert.deepEqual(validateJsonSchemaValue(schema, sample), [])
+  }
+})
+
+test('actual strictIdentity schema accepts generated nested sample and rejects invalid identities', () => {
+  const { byName } = applyManage(makeFace().face)
+  const tool = byName('android_ui_input')
+  const identitySchema = tool.parameters.properties.strictIdentity
+  const keys = ['v', 'packageName', 'windowId', 'resourceId', 'className', 'password']
+  assert.equal(identitySchema.additionalProperties, false)
+  assert.deepEqual(identitySchema.required, keys)
+  assert.equal(identitySchema.properties.v.const, 1)
+  assert.equal(identitySchema.properties.password.const, false)
+  assert.deepEqual(argsFromSchema(tool.parameters), {}, 'child required array must not require parent')
+  const [args] = optionalObjectVariants(tool.parameters, { text: 'sample' })
+  assert.deepEqual(args.strictIdentity, {
+    v: 1, packageName: 'sample', windowId: 'sample', resourceId: 'sample', className: 'sample', password: false,
+  })
+  assert.deepEqual(validateJsonSchemaValue(tool.parameters, args), [])
+  assert.deepEqual(undefinedPaths(args), [])
+  const invalid = [{}]
+  for (const key of keys) {
+    const missing = { ...args.strictIdentity }
+    delete missing[key]
+    invalid.push(missing)
+  }
+  for (const [key, value] of [
+    ['v', 2], ['v', '1'], ['password', true], ['password', null], ['password', 'false'],
+    ['packageName', 1], ['windowId', 1], ['resourceId', 1], ['className', 1], ['extra', 'unknown'],
+  ]) invalid.push({ ...args.strictIdentity, [key]: value })
+  invalid.push(null, [])
+  for (const strictIdentity of invalid) {
+    assert.ok(validateJsonSchemaValue(tool.parameters, { ...args, strictIdentity }).length > 0,
+      'invalid identity accepted: ' + JSON.stringify(strictIdentity))
+  }
+})
+
+test('schema-valid optional strict sample returns a closed denial without native/ADB mutation', async () => {
+  const { face, calls } = makeFace()
+  const { byName } = applyManage(face)
+  const tool = byName('android_ui_input')
+  await assert.rejects(tool.execute({ text: 'sample', strictIdentity: {} }, EXEC), /missing required property/)
+  const [args] = optionalObjectVariants(tool.parameters, { text: 'sample' })
+  const value = await tool.execute(args, EXEC)
+  assert.equal(value.ok, false)
+  assert.equal(value.denied, true)
+  assert.match(value.text, /严格输入拒绝：缺少新鲜能力/)
+  assert.equal(Object.hasOwn(value, 'strictIdentityVerified'), false)
+  assert.deepEqual(violations(tool, value), [])
+  assert.ok(tool.output.render(args, value).length > 0)
+  assert.deepEqual(calls, { control: [], adbShell: [], adbLine: [] })
 })
 
 test('output.schema 自洽：14 个工具都是 object 且 additionalProperties=false（拼写错误防线）', async () => {

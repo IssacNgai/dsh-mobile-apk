@@ -1538,3 +1538,9 @@
     **真因**：呈现裁剪不是身份库存，所选根完整不是全屏窗口完整；缓存/代次不是绝对实时性；消费者支持新字段不是旧 native 能力握手，动作被接受也不是文字等值回读。RID 必须来自平台，不能由文本/路径派生。
     **修法**：native 保留 `true/false/null` password 与原始行号/隐藏身份行；budget 统计全部访问，getter/null child/节点深度时间耗尽失败关闭；capture/publish 事件纪元不覆盖建树中失效；前后未过滤窗口库存只证明唯一选中 application。manage 从缓存检查 native `strictInputIdentity:1`、完整证据和原始节点后才派发闭合 strict 对象；native 保持原 row/gen，在聚焦前后各从新根全量计同 RID，校验完整 native class/password:false，不走存储节点/路径/指纹恢复与 Web/ADB 回退。严格写入需 `strictIdentityVerified:true`；editable V2 text 保留前后空白。
     **复验证据与边界**：本轮按保存的 `SnapshotTraversalBudget` / `SnapshotFreshness` / `SnapshotWindowScope` / `StrictInputIdentity`、service 与 manage/protocol 源码对账；门禁执行结果由本轮报告记录，不能借旧 host 绿或旧 APK 冒称完成。200ms 事件通知节流、未送达事件、检查→动作非原子竞态、最终 native/同产物 CDP/ADB/真机均仍需验证。详见 `BRIDGE-API.md` 当前契约与 `known-gaps.md` 验收入口。
+
+265. **闭合嵌套输入揭示输出门禁的样本生成缺陷，不能放宽 schema 或预算遮掉（strictIdentity CI 修复）**：
+    **现象**：输出 schema 门禁在工具执行前报 strictIdentity 六个必填子字段缺席；wire 门禁同时超限。工具/native 单测通过不等于这些集成门禁通过。
+    **真因**：通用生成器把编译后对象的 `required:[keys]` 当 truthy 的根字段必填标记，却只为对象生成 `{}`，还忽略 `const`。因此可选 strictIdentity 被意外加入，再被引擎输入校验拒绝；正确的闭合 schema 反而暴露了门禁自身的 bug。预算计算是序列化 UTF-16 码元代理量，必须按现有口径压缩重复文案。
+    **修法**：共享样本模块递归填必填子字段，`const` 优先于 enum/default，严格区分 `required:true` 与父对象必填数组；显式增加可选对象分支，并在 execute 前用引擎校验器验证每组输入。只缩短 android_ui_input 参数说明，保留闭合身份对象、native 能力/回执要求与原预算。helper 纳入镜像清单，不代表对端仓已经同步。
+    **复验证据与边界**：manage 输出 schema 套件新增通用深层对象、常量优先级、真实 strictIdentity 合法/缺字段/错类型/错常量/额外键反证，以及缺原生证据时零动作拒绝回执；直接执行该套件通过。标准 gate 的宿主 wrapper 限制与其余执行结果由本轮报告分列，不作设备/native 成功声明。运行入口见 `build-and-env.md` §3.2。

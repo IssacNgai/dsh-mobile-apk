@@ -1797,7 +1797,7 @@ flowchart LR
 | check-bounded-io.mjs | 壳侧子进程与连接流输出必须走 `ProcIo.readBounded` | CI/链 | 新写的流读取绕过有界读（超时失效/死锁） | 否 |
 | check-api-route-auth.mjs | mobile-owned `/api` exact/prefix 路由必须有登记行 + 本地 auth guard（公开白名单需理由） | CI（源码档）/链与发布（`--snapshot` 注入后 tar） | 新路由未登记，或注册本身不鉴权 → 绕过 browser auth | 注入后档需快照 |
 | check-snapshot-fingerprint.mjs | `sha256(assets/snapshot.tar.xz) == assets/snapshot.sha256` | CI（净检出 SKIP）/链 `--require` | 手工替换 tar；两个 ABI 各自写入声明值 | 需 assets 内 tar |
-| check-tool-output-schema.mjs | 工具各分支返回值过引擎同一 `validateJsonSchemaValue` + `lib` 不陈旧 | CI（先 build manage）/链 | 成功分支多返回未声明键；lib 落后 src（旧产物判绿） | 需 plugins/*/lib |
+| check-tool-output-schema.mjs | 分支输入与返回值都过引擎同一 `validateJsonSchemaValue` + `lib` 不陈旧；样本与回归见下方 | CI（先 build 装配清单中插件）/链 | 样本不合法导致 execute 前抛错；成功分支返回未声明键；lib 落后 src | 需 plugins/*/lib |
 | check-protocol-v2.mjs | 协议 V2 往返等价 + 报文体量基线 | CI（先 build manage）/链 | 列式化多带字段、去重口径变宽致报文回涨 | 需 plugins/*/lib |
 | check-control-ops.mjs | 控制 op 六处登记集合一致 | CI/链 | 新增 op 漏一处 → a11y 通道静默 deny | 否 |
 | check-runtime-assets.mjs | `assets/patched/*` 与快照逐字节同源 + 行为回归 | 仅链（`--require`） | 快照重出后 `assets/patched` 未重生成 → 设备上补丁被改回 | 需快照 |
@@ -1825,6 +1825,8 @@ flowchart LR
 | check-third-party.mjs（未进声明集合） | dpkg 矩阵完整 + copyleft 许可证全文随包 | 仅链/发布 | 新增包未登记许可；缺 copyright 全文 | 需快照 |
 | elf-check.mjs（未进声明集合） | 归档内 ELF 的 `e_machine` 与目标 ABI 一致 | 仅链 | 拿错 ABI 的 node/base 归档 | 需快照 |
 | check-code-map.mjs | 执行地图覆盖完整 + 锚点有效 + 编号一致 + 无 emoji | **无任何调用点**（本轮唯一） | 地图文档未写或锚点漂移 | 否 |
+
+- [B02] 输出门禁样本链：`scripts/check-tool-output-schema.mjs` → `scripts/lib/tool-schema-samples.mjs:5`（const 优先、递归必填子对象）→ `:16`（两种 required 语法）→ `:26`（可选对象独立分支）→ 引擎输入校验 → execute → 输出校验/render。manage 的 `plugins/dsh-android-manage/test/tool-output-schema.test.mjs` 实际注册 schema 正反例由该门禁末尾自动执行；strict 样本缺证据时只验拒绝，不能算原生写入成功。wire 修复只缩参数文案，预算/基线不升档；宿主 wrapper、缺依赖及镜像对端缺席均单列。
 
 - **CI 与打包链的顺序**（含依赖：`npm` = 必须先构建插件 `lib/`，`快照` = 需要注入后 tar 或快照资产）
 
@@ -2249,6 +2251,7 @@ scripts/release-plugin-src-gaps.json
 scripts/third-party-licenses.json
 scripts/tests/boot-pending.test.mjs
 scripts/tests/pi-toolcall.test.mjs
+scripts/lib/tool-schema-samples.mjs
 glob:scripts/patches/tests/**
 plugins/dsh-android-vdisplay/test/tools-callable.test.mjs
 .github/workflows/pr-gate.yml
